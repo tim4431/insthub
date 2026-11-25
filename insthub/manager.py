@@ -581,7 +581,7 @@ class Manager(QtWidgets.QMainWindow):
         if not s.address or s.address.startswith("inproc://"):
             return False, "Only for servers in other programs"
         if importlib.util.find_spec("pyqtgraph") is None:
-            return False, "Live plots need pyqtgraph: pip install 'insthub[gui]'"
+            return False, "Live plots need pyqtgraph, which this Python does not have: pip install pyqtgraph"
         return True, ""
 
     def live_view(self, s: Server, device: str) -> None:

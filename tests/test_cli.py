@@ -132,4 +132,4 @@ def test_gui_without_qt_says_how_to_get_it(capsys, monkeypatch):
         code, _, err = run(capsys, "gui")
         assert code == 1 and "insthub gui needs Qt" in err and fix in err
     monkeypatch.setattr(service, "tool_environment", lambda prefix=None: "uv tool")
-    assert '/insthub[gui,mcp]"' in cli.qt_hint("x")                       # keeps the extras it had
+    assert cli.qt_hint("x").endswith('/insthub"')                         # the checkout it runs

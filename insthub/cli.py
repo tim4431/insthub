@@ -8,7 +8,7 @@
     insthub watch DEVICE [STREAM]                  print frames as they arrive
     insthub release DEVICE                         close the instrument session (to use the vendor's software);
                                                   the next command reopens it.  `insthub reopen DEVICE` does it now
-    insthub view DEVICE                            live plots of its streams (needs insthub[gui])
+    insthub view DEVICE                            live plots of its streams
     insthub gui [--tray | --install | --uninstall] the manager window: every server and device, how each is
                                                   connected, and controls; it stays in the tray when closed.
                                                   --install adds a launcher icon
@@ -263,9 +263,9 @@ def qt_hint(what: str) -> str:
 
     source = Path(__file__).resolve().parent.parent
     kind = tool_environment()
-    if kind == "uv tool":  # the user-wide command: reinstall it with the extra
-        spec = f'--editable "{source}[gui,mcp]"' if (source / "pyproject.toml").is_file() else \
-            '"insthub[gui,mcp] @ git+https://github.com/tim4431/insthub"'
+    if kind == "uv tool":  # the user-wide command, installed before Qt came with insthub: install it again
+        spec = f'--editable "{source}"' if (source / "pyproject.toml").is_file() else \
+            '"insthub @ git+https://github.com/tim4431/insthub"'
         fix = f"uv tool install --force {spec}"
     elif kind == "pipx":
         fix = "pipx inject insthub pyqtgraph PyQt6"

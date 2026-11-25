@@ -9,13 +9,14 @@ description = "Fast command and data exchange between instrument servers, GUIs a
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.24", "msgpack>=1.0"]
+# Qt and pyqtgraph: insthub gui, insthub view and insthub.qt (pyqtgraph also works with PyQt5 or
+# PySide6, if one of them is what the program imports).  matplotlib: plots for AI agents (insthub mcp).
+dependencies = ["numpy>=1.24", "msgpack>=1.0", "PyQt6>=6.5", "pyqtgraph>=0.13", "matplotlib>=3.6"]
 
 [project.optional-dependencies]
-# Live plotting (insthub.qt, `insthub view`). pyqtgraph works with PyQt5, PyQt6 or PySide6.
-gui = ["pyqtgraph>=0.13", "PyQt6>=6.5"]
-# Plots for AI agents (`insthub mcp`, plot=true). The MCP server itself needs nothing extra.
-mcp = ["matplotlib>=3.6"]
+# Everything is installed by default; these two remain so that "insthub[gui,mcp]" still installs.
+gui = []
+mcp = []
 dev = ["pytest>=8"]
 
 [project.urls]

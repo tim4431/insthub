@@ -35,7 +35,8 @@ def _load():
                     importlib.import_module(f"{name}.QtWidgets"))
         except ImportError:
             continue
-    raise ImportError("insthub.qt needs a Qt binding: pip install 'insthub[gui]' (pyqtgraph + PyQt6)")
+    raise ImportError("insthub.qt needs a Qt binding, which insthub installs (PyQt6) but this Python does not "
+                      "have: pip install PyQt6 pyqtgraph")
 
 
 BINDING, QtCore, QtGui, QtWidgets = _load()

@@ -3,7 +3,6 @@ background threads, the Qt GUI in the main thread talks to it in-process
 (frames arrive by reference, nothing is copied or serialized).  Other programs
 can use the same device at the same time over the bus.
 
-    pip install 'insthub[gui]'
     python examples/04_server_with_gui.py        # elsewhere: insthub call scope set_signal 2500
 """
 import numpy as np

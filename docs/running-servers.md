@@ -130,7 +130,7 @@ show from the servers. So besides the copy in each instrument's project,
 install insthub once as a command of your own:
 
 ```bash
-uv tool install --editable "/path/to/insthub[gui,mcp]"     # pipx install --editable works the same
+uv tool install --editable /path/to/insthub     # pipx install --editable works the same
 ```
 
 `uv tool` gives it a private environment and puts the `insthub` command in

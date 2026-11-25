@@ -11,16 +11,18 @@ and talks to through the [Model Context Protocol](https://modelcontextprotocol.i
 just another client, like an experiment script: the servers and drivers do not
 change and do not know it exists.
 
-```
-   agent (Claude Code, ...)
-        │  MCP, on stdin/stdout
-   insthub mcp        six tools, results made cheap to read
-        │  ordinary insthub calls
-   servers            unchanged ──▶ instruments
+```mermaid
+flowchart TB
+    agent["AI agent<br/>(Claude Code, ...)"]
+    mcp["<b>insthub mcp</b><br/>six tools; results made cheap to read"]
+    servers["servers<br/>(unchanged)"]
+    inst(["instruments"])
+    agent -->|"MCP, on stdin/stdout"| mcp
+    mcp -->|"ordinary insthub calls"| servers
+    servers --> inst
 ```
 
-It needs nothing beyond insthub. Plots additionally need matplotlib
-(`pip install "insthub[mcp] @ ..."` or just `pip install matplotlib`).
+It needs nothing beyond insthub, which also brings matplotlib for the plots.
 
 ## Setting it up
 
@@ -28,14 +30,14 @@ Install insthub as a command of your own, then register it with the agent
 once. For Claude Code:
 
 ```bash
-uv tool install --editable "/path/to/insthub[gui,mcp]"  # gui: the manager window too (needs Qt)
+uv tool install --editable /path/to/insthub
 claude mcp add --scope user insthub -- insthub mcp
 ```
 
 - **The command of your own.** `uv tool install` gives insthub a private
   environment and puts the `insthub` command in `~/.local/bin`, so the agent
   can start it by name from any folder. `--editable` makes it run the code of
-  your checkout, the same as your servers. `[mcp]` adds matplotlib for plots.
+  your checkout, the same as your servers.
   `insthub mcp` needs no driver, because it gets everything from the servers.
   See [the insthub command for yourself](running-servers.md#the-insthub-command-for-yourself).
 - **If the agent cannot find it.** The agent starts `insthub` with the
