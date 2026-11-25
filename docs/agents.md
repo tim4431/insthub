@@ -14,7 +14,7 @@ change and do not know it exists.
 ```mermaid
 flowchart TB
     agent["AI agent<br/>(Claude Code, ...)"]
-    mcp["<b>insthub mcp</b><br/>six tools; results made cheap to read"]
+    mcp["<b>insthub mcp</b><br/>seven tools; results made cheap to read"]
     servers["servers<br/>(unchanged)"]
     inst(["instruments"])
     agent -->|"MCP, on stdin/stdout"| mcp
@@ -82,6 +82,17 @@ Options of `insthub mcp`:
 
 ## Seeing what an agent does
 
+A device somebody paused (Pause in the window, `insthub pause`) refuses the
+agent's calls too, and `list_devices` marks it as paused; a snapshot of it
+fails at once instead of waiting for a frame (with `fresh=0`, it returns the
+last frame from before the pause, marked `"paused": true`). The agent is told, in the tool
+descriptions and in each refusal, that a person paused it, usually to use the
+instrument by hand, and to tell the user rather than resume it. A pause the
+agent made itself (`call(device, "$pause")`) is labelled "an AI agent", and
+its refusals say that instead: resume it only if this conversation paused it. Nothing stops
+it from resuming, though: like everything else here, it is a request, not a
+lock.
+
 An agent's `insthub mcp` is an ordinary client, so `insthub gui` shows it like
 any other program, named after the agent that started it: "AI agent (Claude
 Code)" among the programs connected to a server, and among the watchers of the
@@ -104,26 +115,62 @@ There are two steps, and you only set up the first.
    A server you start later is visible at the agent's next call.
 
 The agent's knowledge of each instrument is whatever `describe` returns: the
-signatures and docstrings of your commands and properties, the descriptions
-of your streams, and the state dict. Your docstrings are the agent's manual;
-see [writing devices that agents use well](#writing-devices-that-agents-use-well).
+signatures and docstrings of your commands and properties, their units,
+limits and choices where the device states them, what is dangerous, the
+descriptions of your streams, and the state dict. Your docstrings are the
+agent's manual; see [writing devices that agents use well](#writing-devices-that-agents-use-well).
 
 ## The tools
 
-There are six, whatever the number of instruments, because every device
+There are seven, whatever the number of instruments, because every device
 describes itself. There is no separate tool for each command.
 
 | Tool | Does | Like |
 |---|---|---|
-| `list_devices()` | every device: server, type, connected or not, names of its commands, properties and streams | `insthub list` |
-| `describe(device)` | signature and docstring of each command, properties (settable or read-only), streams with their last frame, periodic tasks, status, state | `insthub info` |
+| `list_devices()` | every device: server, type, connected or not, its extension, `"simulated": true` for a simulator, names of its commands, properties and streams | `insthub list` |
+| `describe(device)` | signature and docstring of each command, with its parameters' units, limits and choices (`params`); properties (settable or read-only, with `meta`); what is `dangerous`; streams with their last frame, periodic tasks, status, state | `insthub info` |
 | `get(device, property)` | read a property | `dev.power` |
-| `set(device, property, value)` | write a property | `dev.power = -10` |
-| `call(device, command, args, kwargs)` | run a command; also the bus commands `$release`, `$open` and `$task` | `dev.measure("VPP", channel=2)` |
+| `set(device, property, value)` | write a property, unless it is marked dangerous | `dev.power = -10` |
+| `call(device, command, args, kwargs)` | run a command, unless it is marked dangerous; also the bus commands `$release`, `$open`, `$task`, `$pause` and `$resume` | `dev.measure("VPP", channel=2)` |
 | `snapshot(device, stream, fresh)` | one frame of a stream, published after the call started | `dev.subscribe("trace").get()` |
+| `call_dangerous(device, command, args, kwargs)` | run a command marked dangerous, or write a property marked dangerous with `"$set"` and `[property, value]` | `dev.fire()` |
 
-`get`, `call` and `snapshot` take `plot=true` to add a picture of the result,
-and `get`, `set` and `call` take a `timeout` in seconds.
+`get`, `call`, `call_dangerous` and `snapshot` take `plot=true` to add a
+picture of the result, and `get`, `set`, `call` and `call_dangerous` take a
+`timeout` in seconds.
+
+### Dangerous commands
+
+A device marks a command dangerous when running it can harm the instrument,
+the sample or a person: firing a laser, switching on a high voltage, a
+self-calibration that takes the instrument away for minutes. A property is
+marked when writing it is (see [saying more about
+values](guide.md#saying-more-about-values-and-what-is-dangerous)). A
+property that `accessors` makes of a driver's `get_output()` and
+`set_output(on)` writes the same setting as the command `set_output`, so
+marking either one marks both, and neither is a way around the other. `set`
+and `call` refuse these, also when the property is written through `call`
+with `$set`, and say to use `call_dangerous`:
+
+```
+PermissionError: laser: its command 'fire' is marked dangerous, so this tool refuses it. If the user wants
+exactly this, use call_dangerous('laser', 'fire', ...); they may be asked first.
+```
+
+So you can allow every tool except `call_dangerous` in Claude Code, and the
+agent works without asking you, except before anything dangerous. With
+`/permissions`, or in `.claude/settings.json`:
+
+```json
+{"permissions": {"allow": ["mcp__insthub__list_devices", "mcp__insthub__describe", "mcp__insthub__get",
+                           "mcp__insthub__snapshot", "mcp__insthub__set", "mcp__insthub__call"]}}
+```
+
+The tool's MCP annotations mark it destructive, for clients that look at
+them. The other bus commands (`$release`, `$open`, `$task`, `$pause`,
+`$resume`) manage the session, not the instrument's settings, so `call` runs
+them as before. Each check asks the device's server, so a server restarted
+with new code is never judged from what the agent saw earlier.
 
 Errors come back as the driver raised them, with the last lines of the
 server's traceback, so the agent can see both what went wrong and where in
@@ -226,6 +273,15 @@ The same things make a device pleasant to use from a notebook:
 - **Docstrings with units and ranges.** `"""Output frequency in MHz (10 to
   24000)."""` tells the agent everything it needs. `"""Set the frequency."""`
   leaves it guessing between Hz and MHz.
+- **Metadata.** `@insthub.prop(unit="MHz", min=10, max=24000)` and
+  `@insthub.command(params={"mhz": {"unit": "MHz"}})` say it in a form the
+  agent and the window both read, and a `Literal[...]` annotation lists the
+  choices (see [saying more about
+  values](guide.md#saying-more-about-values-and-what-is-dangerous)).
+- **Mark what is dangerous** with `dangerous=True`, so that the agent needs
+  `call_dangerous`, which you can keep being asked about.
+- **Mark a simulator** with `simulated = True`, so that the agent never takes
+  its data for a measurement.
 - **Type hints.** They appear in the signatures the agent reads:
   `(hz: float, noise: float | None = None) -> None`.
 - **Check values in the driver** and raise a `ValueError` that says what is
@@ -284,13 +340,16 @@ There are two ways:
 
 ## What it does not do
 
-- **It does not restrict the agent.** The agent can do whatever an
-  experiment script could: every command, every property, `$release`. Limits
-  that protect an instrument, such as a maximum power, belong in its driver,
-  where they apply to every client. Claude Code asks before each tool call
-  unless you allow the tools, and you can allow the read-only ones
-  (`list_devices`, `describe`, `get`, `snapshot`) and keep being asked for
-  `set` and `call`.
+- **It does not restrict the agent beyond the dangerous marks.** The agent
+  can do whatever an experiment script could: every command, every property,
+  `$release`, even `$resume` of a device somebody paused (it is told not to).
+  What a device marks dangerous needs `call_dangerous`, and whether the agent
+  may use that without asking is up to you. Limits that protect an
+  instrument, such as a maximum power, belong in its driver, where they apply
+  to every client; metadata (`max=`) is advice and is not enforced. Claude
+  Code asks before each tool call unless you allow the tools: allow the
+  read-only ones (`list_devices`, `describe`, `get`, `snapshot`), or every
+  tool except `call_dangerous`.
 - **It cannot stop a command once it has started.** If a call outlasts its
   timeout, the agent is told the command may still be running, and later
   calls to that device wait behind it (see
@@ -299,7 +358,7 @@ There are two ways:
 
 ## Why it is built this way
 
-**Why six generic tools and not one per command?** An agent reads the
+**Why seven generic tools and not one per command?** An agent reads the
 description of every tool it has at the start of every session. One tool per
 command would be hundreds of descriptions for a modest lab, most of them
 irrelevant to the task at hand. Generic tools plus `describe` cost the same

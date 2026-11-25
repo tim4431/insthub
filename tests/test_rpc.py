@@ -1,14 +1,18 @@
 import asyncio
+import contextlib
 import os
 import socket
 import threading
 import time
+import tomllib
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 import insthub
-from insthub import sim
+from insthub import codec, sim, wire
+from insthub.server import FEATURES
 
 
 def test_commands_arguments_and_results(client):
@@ -173,9 +177,10 @@ def test_introspection(client):
     scope = client.scope
     info = scope.bus.describe()
     assert info["type"] == "SimScope" and "oscilloscope" in info["doc"]
-    assert info["commands"]["measure"]["signature"] == "(item: str = 'VPP', channel: int = 1) -> float"
+    measure = "(item: Literal['VPP', 'VRMS', 'FREQ'] = 'VPP', channel: int = 1) -> float"
+    assert info["commands"]["measure"]["signature"] == measure
     assert "measure" in dir(scope) and "subscribe" in dir(scope)
-    assert scope.measure.__doc__.startswith("measure(item: str = 'VPP', channel: int = 1) -> float")
+    assert scope.measure.__doc__.startswith(f"measure{measure}")
     text = client.synth.bus.help()
     assert "frequency" in text and "locked  (read-only)" in text and "rf(on: bool = True) -> bool" in text
     assert sorted(client.devices()) == ["camera", "loopback", "sa", "scope", "synth"]
@@ -221,3 +226,57 @@ def test_shortcuts_yield_to_device_commands(server):
     dev = server.device("clash")
     assert dev.subscribe("x") == "device subscribe x"
     dev.bus.subscribe("state").close()               # the bus version is always there
+
+
+def test_the_hello_says_version_and_features(client):
+    assert client.info()["version"] == insthub.__version__
+    assert client.features == FEATURES and client.supports("pause") and not client.supports("teleport")
+
+
+def test_the_version_has_one_source():
+    project = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())
+    assert "version" in project["project"]["dynamic"] and "version" not in project["project"]
+    assert project["tool"]["setuptools"]["dynamic"]["version"] == {"attr": "insthub._version.__version__"}
+
+
+def test_a_server_skips_messages_it_does_not_know(server):
+    sock = wire.open_socket(server.addresses[0], 5.0)
+    with sock:
+        sock.sendall(wire.MAGIC)
+        reader = wire.FrameReader(sock)
+        reader.read_magic()
+        assert reader.read()[0] == wire.HELLO
+        body, buffers = codec.encode({"from": "a newer insthub", "data": np.arange(5000.0)})
+        wire.send_all(sock, wire.frame(99, 7, body, buffers))  # a kind of message this server does not know
+        body, buffers = codec.encode(["loopback", "echo", ["still here"], {}])
+        wire.send_all(sock, wire.frame(wire.CALL, 1, body, buffers))
+        mtype, tag, body, buffers = reader.read()
+        assert (mtype, tag, codec.decode(body, buffers)) == (wire.REPLY, 1, "still here")
+
+
+def test_a_client_skips_messages_it_does_not_know():
+    """A server of another insthub version: its hello has no features (it is older), and it
+    sends a kind of message this client does not know (it is newer), even before the hello."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    body, buffers = codec.encode({"unknown": np.zeros(4000)})
+    unknown = wire.frame(42, 0, body, buffers)
+
+    def serve():
+        sock, _ = listener.accept()
+        with sock, contextlib.suppress(EOFError, OSError):
+            sock.sendall(wire.MAGIC)
+            wire.send_all(sock, unknown)  # without skipping it, the client says: server did not say hello
+            hello, _ = codec.encode({"server": "other", "pid": 1, "protocol": 1, "devices": []})
+            sock.sendall(wire.frame(wire.HELLO, 0, hello)[0])
+            reader = wire.FrameReader(sock)
+            reader.read_magic()
+            _, tag, _, _ = reader.read()
+            wire.send_all(sock, unknown)
+            body, _ = codec.encode(12.5)
+            sock.sendall(wire.frame(wire.REPLY, tag, body)[0])
+            reader.read()  # until the client goes
+
+    threading.Thread(target=serve, daemon=True).start()
+    with listener, insthub.connect(f"tcp://127.0.0.1:{listener.getsockname()[1]}") as client:
+        assert client.features == frozenset() and not client.supports("pause")
+        assert client._t.request("", "ping", (), {}).result(5) == 12.5

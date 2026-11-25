@@ -10,6 +10,7 @@ import pytest
 
 import insthub
 from insthub import cli, registry, service
+from insthub.config import ConfigWarning
 
 
 def test_unit_for_a_config_and_for_a_script(tmp_path):
@@ -155,6 +156,94 @@ def test_check_python_imports_the_drivers(tmp_path):
         service.check_python(script, str(tmp_path / "missing-python"))
 
 
+def test_check_python_reports_every_problem_and_the_warnings(tmp_path):
+    (tmp_path / "PySide2").mkdir()  # a Qt binding, as far as the check can tell
+    (tmp_path / "PySide2" / "__init__.py").write_text("")
+    (tmp_path / "uidrv.py").write_text("import PySide2\n\nclass Box:\n    def __init__(self, port):\n"
+                                       "        pass\n")
+    good = tmp_path / "good.toml"
+    good.write_text('[devices.box]\ndriver = "uidrv:Box"\nport = 1\n')
+    assert service.check_python(good, sys.executable) == [(
+        "[devices.box] driver uidrv:Box imports PySide2; servers often run without a screen: move UI code to "
+        "the extension's UI module (see docs/design.md#rules-inside-an-extension)")]
+    bad = tmp_path / "bad.toml"
+    bad.write_text('[devices.box]\ndriver = "uidrv:Box"\nprot = 1\nlazy = "yes"\n')
+    with pytest.raises(insthub.BusError) as e:
+        service.check_python(bad, sys.executable)
+    lines = str(e.value).splitlines()
+    assert lines[0] == f'{sys.executable} cannot serve bad.toml: [devices.box] lazy: should be true or false, not "yes"'
+    assert lines[1].startswith("[devices.box] prot: not a parameter of uidrv:Box(port)")
+    assert lines[-1] == "Fix bad.toml, then install again."  # not: install packages, or use another Python
+
+
+def test_check_python_is_not_misled_by_what_drivers_print_or_warn(tmp_path):
+    (tmp_path / "noisydrv.py").write_text(
+        "import sys, warnings\n"
+        "sys.stdout.write('loading the driver...')  # no newline\n"
+        "warnings.warn('this library is experimental')  # the library's own business, not the file's\n"
+        "class Box:\n    def __init__(self, port):\n        pass\n")
+    cfg = tmp_path / "lab.toml"
+    cfg.write_text('[devices.box]\ndriver = "noisydrv:Box"\nport = 1\n')
+    assert service.check_python(cfg, sys.executable) == []
+    cfg.write_text('[devices.box]\ndriver = "noisydrv:Box"\n')
+    with pytest.raises(insthub.BusError, match=r"cannot serve lab\.toml: \[devices\.box\] noisydrv:Box\(port\): "
+                                               r"missing a required argument: 'port'\nFix lab\.toml"):
+        service.check_python(cfg, sys.executable)
+
+
+def test_check_python_says_what_would_fix_it(tmp_path):
+    environment = "Install them there, or pass --python"
+    cfg = tmp_path / "lab.toml"
+    cfg.write_text('[devices.box]\ndriver = "nosuchdriver:Box"\n')
+    with pytest.raises(insthub.BusError, match=r"No module named 'nosuchdriver'.*\n.*" + environment):
+        service.check_python(cfg, sys.executable)
+    for folder in ("one", "two"):  # two folders with a module of one name: no other Python fixes that
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / "samedrv.py").write_text("class Box:\n    pass\n")
+    cfg.write_text("".join(f'[devices.{f}]\ndriver = "samedrv:Box"\npath = "{tmp_path / f}"\n' for f in ("one", "two")))
+    with pytest.raises(insthub.BusError) as e:
+        service.check_python(cfg, sys.executable)
+    assert "a module named 'samedrv' is loaded already" in str(e.value) and environment not in str(e.value)
+    (tmp_path / "brokendrv.py").write_text("class Box(:\n")
+    (tmp_path / "numpydrv.py").write_text("raise ValueError('numpy.dtype size changed, may indicate binary "
+                                          "incompatibility')\n")
+    for driver, error in (("brokendrv", "SyntaxError: "), ("numpydrv", "ValueError: numpy.dtype size changed")):
+        cfg.write_text(f'[devices.box]\ndriver = "{driver}:Box"\n')
+        with pytest.raises(insthub.BusError, match=rf"cannot serve lab\.toml: \[devices.box\]: cannot load driver "
+                                                   rf"'{driver}:Box': {error}") as e:
+            service.check_python(cfg, sys.executable)
+        assert "\n" not in str(e.value)  # the driver's own error: neither the file (a ValueError) nor the environment
+
+
+def test_check_python_gives_both_advices_when_both_may_help(tmp_path):
+    cfg = tmp_path / "lab.toml"
+    cfg.write_text('[devices.psu]\ndriver = "mydrvier:PowerSupply"\n\n'
+                   '[devices.scope]\ndriver = "insthub.sim:SimScope"\npionts = 10\n')
+    with pytest.raises(insthub.BusError) as e:
+        service.check_python(cfg, sys.executable)
+    lines = str(e.value).splitlines()
+    assert lines[0].endswith("cannot serve lab.toml: [devices.psu]: cannot load driver 'mydrvier:PowerSupply': "
+                             f"No module named 'mydrvier' (this is {sys.executable}; is it the Python environment "
+                             "that has the driver's dependencies?)")
+    assert lines[1].startswith("[devices.scope] pionts: not a parameter")
+    assert lines[2:] == ["Fix lab.toml, then install again.", service._FIXES["environment"]]
+
+
+def test_install_shows_the_warnings_and_goes_on(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(service, "_systemctl", lambda *a, check=True: subprocess.CompletedProcess(a, 0, "", ""))
+    warning = "[devices.box] driver uidrv:Box imports PyQt6; servers often run without a screen"
+    monkeypatch.setattr(service, "check_python", lambda target, python: [warning])
+    cfg = tmp_path / "lab.toml"
+    cfg.write_text("[server]\n")
+    with pytest.warns(ConfigWarning, match="imports PyQt6"):
+        service.install(cfg, start=False)
+    assert cli.main(["service", "install", str(cfg), "--no-start"]) == 0
+    out = capsys.readouterr()
+    assert f"warning: {warning}\n" in out.err
+    assert "installed" in out.out
+
+
 def test_cli_start_stop_restart(monkeypatch, capsys):
     calls = []
     for action in ("start", "stop", "restart"):
@@ -162,3 +251,34 @@ def test_cli_start_stop_restart(monkeypatch, capsys):
     monkeypatch.setattr(service, "units", lambda: [{"name": "lab", "state": "active"}])
     assert cli.main(["service", "restart", "lab"]) == 0
     assert calls == [("restart", "lab")] and "insthub-lab: active" in capsys.readouterr().out
+
+
+def test_starting_at_login_is_a_choice(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(service, "_systemctl", lambda *a, check=True: calls.append(a) or
+                        subprocess.CompletedProcess(a, 0, "", ""))
+    monkeypatch.setattr(service, "check_python", lambda target, python: [])
+    cfg = tmp_path / "lab.toml"
+    cfg.write_text("[server]\n")
+    unit = "insthub-lab.service"
+    service.install(cfg, "lab")                                         # now, and at every login
+    assert ("enable", unit) in calls and ("start", unit) in calls
+    calls.clear()
+    service.install(cfg, "lab", login=False)                            # again, without login: that holds now
+    assert ("enable", unit) not in calls and ("disable", unit) in calls and ("restart", unit) in calls
+    calls.clear()
+    service.install(cfg, "rf", start=False)                             # only the file
+    assert not any(c[0] in ("enable", "start", "restart") for c in calls)
+    service.enable("lab")
+    service.disable("lab")
+    assert calls[-2:] == [("enable", unit), ("disable", unit)]
+
+    calls.clear()
+    monkeypatch.setattr(service, "units", lambda: [{"name": "lab", "state": "active"}])
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    assert cli.main(["service", "install", str(cfg), "--name", "lab", "--no-login"]) == 0
+    out = capsys.readouterr().out
+    assert ("enable", unit) not in calls and "does not start at login" in out and "service enable lab" in out
+    assert cli.main(["service", "enable", "lab"]) == 0 and "starts at every login" in capsys.readouterr().out
+    assert cli.main(["service", "disable", "lab"]) == 0 and "no longer starts at login" in capsys.readouterr().out

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "insthub"
-version = "0.1.0"
+dynamic = ["version"]   # insthub/_version.py, see [tool.setuptools.dynamic]
 description = "Fast command and data exchange between instrument servers, GUIs and experiment scripts"
 readme = "README.md"
 license = "MIT"
@@ -26,6 +26,9 @@ insthub = "insthub.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["insthub*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "insthub._version.__version__" }   # read from the file, without importing insthub
 
 [tool.setuptools.package-data]
 insthub = ["insthub.svg"]   # the icon of `insthub gui`

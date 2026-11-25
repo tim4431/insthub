@@ -41,18 +41,26 @@ insthub service install lab.toml           # or a .py server script
 
 This writes a small *systemd user service*, starts it, and from then on:
 
-- it starts by itself when you log in,
+- it starts by itself when you log in (unless installed with `--no-login`),
 - it is restarted if it crashes,
 - its output is kept and can be read with `insthub service logs lab`.
 
+An instrument that is not always connected may be better off with
+`--no-login`: installed, with its logs and its buttons in the window, but
+started only when you start it. `insthub service enable lab` and
+`insthub service disable lab` change that later, and so does the **Starts at
+login** switch on the server's page in the window.
+
 | Command | Effect |
 |---|---|
-| `insthub service install TARGET [--name NAME] [--python PATH]` | register and start; run it again to replace the definition |
-| `insthub service list` | what is installed and whether it is running |
+| `insthub service install TARGET [--name NAME] [--python PATH]` | register and start, now and at every login; run it again to replace the definition |
+| `... install TARGET --no-login` | register and start now, but not at login |
+| `insthub service list` | what is installed, whether it is running, and whether it starts at login ("at login") or only when started ("by hand") |
 | `insthub service logs NAME [-f]` | its output; `-f` follows it live |
 | `insthub service restart NAME` | restart, after changing code or config |
-| `insthub service stop NAME` | stop until the next login or `start` |
+| `insthub service stop NAME` | stop it; it starts again with `start`, or, if it starts at login, the next time your user's services start (a login after all your sessions ended, or a boot with lingering on) |
 | `insthub service start NAME` | start it again |
+| `insthub service enable NAME` / `disable NAME` | start it at every login from now on, or no longer |
 | `insthub service remove NAME` | stop it and remove it |
 
 The same controls, and the log, are in the manager window (`insthub gui`): open
@@ -77,8 +85,13 @@ Nothing here needs administrator rights. Two details:
 
   Before it writes anything, `install` checks that this Python can import
   insthub and every driver the config names, from the folder the service
-  will run in. If one is missing, it stops with the import error instead of
-  installing a service that would fail at every start. It refuses the Python
+  will run in, and that every key of the config fits its driver. If
+  something is missing or wrong, it stops with the error (every problem of
+  the file at once) instead of installing a service that would fail at every
+  start, and says what would fix it: the file, the Python environment, or
+  both. A warning, such as a driver that imports Qt, which a service
+  without a screen may not have, is printed, and the install goes on. It
+  refuses the Python
   of [the insthub command for yourself](#the-insthub-command-for-yourself),
   which has insthub but none of your drivers.
 
@@ -138,8 +151,14 @@ uv tool install --editable "/path/to/insthub[gui,mcp]"     # pipx install --edit
 in every folder without activating anything, and AI agents can start it by
 name (see [AI agents](agents.md#setting-it-up)). `--editable` makes it run the
 code of your checkout, like the projects that installed insthub with `-e`.
-After a `git pull` every program runs the same version, so no two of them
-disagree about the message format. To remove it: `uv tool uninstall insthub`.
+After a `git pull` every program runs the same version. Servers started
+before the pull still run the old one until they restart; that works, since
+each server says which version it runs and what it supports, and skips
+messages it does not know ([what travels on a
+connection](architecture.md#what-travels-on-a-connection)). An older server
+just describes its devices with less: no units or limits, nothing marked
+dangerous or simulated, until it restarts. To remove it:
+`uv tool uninstall insthub`.
 
 Servers do not use it. A server needs its driver's packages, and those are
 in its project's environment, not in this one. That is why
@@ -197,7 +216,12 @@ Use **separate servers** when:
 - a driver or its vendor library is prone to crashing, and you do not want it
   to take the others down,
 - one of them has its own window,
-- you want to restart one without interrupting the others.
+- you want to restart one without interrupting the others,
+- their drivers' folders each have a module of the same name, such as two
+  `bus_server.py`: Python keeps one module per name, so insthub refuses to
+  load the second into the same server. It checks only the module that
+  `driver` names: two drivers that each import a helper of the same name
+  (two `utils.py`) silently share the first one's.
 
 Device names must be unique across the servers of one computer, because that
 is how clients find them.
@@ -235,12 +259,18 @@ the instruments, so open a TCP port only on a network you trust.
 1. Make the instrument work with a plain driver class and a test script. Do
    the operating-system setup it needs (permissions, kernel driver) in the
    driver's own project.
-2. Put it on the bus: `insthub.wrap(Driver, "name")`, a few lines of TOML, or a
+2. Put it on the bus: a few lines of TOML, `insthub.wrap(Driver, "name")`, or a
    `Device` subclass if you want streams and state.
 3. Run the server in a terminal and try it: `insthub info name`,
-   `insthub call name ...`.
-4. When it works, `insthub service install` it.
+   `insthub call name ...`. Give its settings units and limits (`meta`), and
+   mark what is dangerous (`dangerous`), so that the window and AI agents
+   handle it well ([every key](adding-a-device.md#every-key)).
+4. When it works, `insthub service install` it (with `--no-login` if it is not
+   always connected).
 5. Use it from experiment scripts with `insthub.device("name")`.
+
+[Adding an instrument](adding-a-device.md) walks through each step, with every
+key of a config file and what to do when something does not work.
 
 ## Where things are kept
 

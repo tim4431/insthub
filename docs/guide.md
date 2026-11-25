@@ -1,7 +1,9 @@
 # Using insthub
 
 How to put an instrument on the bus and how to use it from other programs.
-For what happens underneath, read [how insthub works](architecture.md).
+For what happens underneath, read [how insthub works](architecture.md). For a
+step-by-step walk through adding an instrument, with every key of a config
+file, read [adding an instrument](adding-a-device.md).
 
 - [Writing a device](#writing-a-device)
 - [Putting an existing driver on the bus](#putting-an-existing-driver-on-the-bus)
@@ -62,6 +64,44 @@ The three markers:
 The docstring and signature of a command are what `insthub info lockin` and
 `lockin.bus.help()` show, so they are worth writing.
 
+### Saying more about values, and what is dangerous
+
+A device can say more than its signatures do: units, limits, what to choose
+from, and what is dangerous. Clients read it from `describe()`. The manager
+window picks a control for each setting from it, `insthub info` prints it, and
+AI agents see units and limits instead of guessing them.
+
+```python
+from typing import Literal
+
+class Laser(insthub.Device):
+    extension = "demo-laser"                          # which extension it belongs to (see design.md)
+    poll = {"temperature": 1.0}                       # read every 1.0 s, published on the stream "temperature"
+
+    @insthub.prop(unit="mW", min=0, max=100, step=0.5, dangerous=True)
+    def power(self) -> float: ...
+    @power.setter
+    def power(self, mw): ...
+
+    @insthub.prop
+    def mode(self) -> Literal["CW", "pulsed"]: ...    # its choices come from the annotation
+
+    @insthub.prop
+    def temperature(self) -> float: ...
+
+    @insthub.command(dangerous=True, params={"ms": {"unit": "ms", "min": 0}})
+    def fire(self, ms: float = 10.0): ...
+```
+
+| What | How | What it does |
+|---|---|---|
+| **metadata** | `@insthub.prop(unit=, min=, max=, step=, choices=[...])`; for a command's parameters, `@insthub.command(params={"ms": {...}})` | the window shows a list for choices and a spin box with the unit for a number; `insthub info` and agents show them. It is advice: insthub never checks a value against it, so an instrument that also takes `"auto"` still gets it. |
+| **choices from annotations** | a `Literal[...]` or `Enum` annotation on a property's getter (its return) or on a parameter | the same as `choices=` (what you write explicitly wins). Not a `Flag`, whose members combine, and not a bare `enum.Enum`, which has no members. |
+| **limits that depend on the model** | `self.set_meta("power", max=50)`, or `"fire.ms"` for a parameter, for example in `open()` once the instrument has said what it is | clients see it at their next `describe()`; a value of `None` removes a key |
+| **dangerous** | `dangerous=True` on a command (running it) or a property (writing it, so only one with a setter); or on the class, `dangerous = ("fire",)`, or `True` for every command and every property that can be written. A config file's `dangerous` (or `wrap()`'s) adds to the class's marks, never removes one. | AI agents' `call` and `set` refuse it, and a separate tool runs it (see [agents](agents.md)); the window asks before running or writing it |
+| **what the device is** | `extension = "..."`, `extension_version = "..."`, `simulated = True` | carried in `describe()`. A simulated device is marked SIM in the window, in `insthub info` and for agents, so that its data is never taken for a measurement. |
+| **polling** | `poll = {"temperature": 1.0}`: a property, or a command that needs no argument | a periodic task named `poll:temperature` reads it every 1.0 s and publishes the value on the stream `temperature`, so it gets a tile preview and `insthub view` without a periodic method of your own. A config file's `poll` replaces the class's, intervals included. |
+
 ### What the base class does for you
 
 **One thread.** `open`, `close`, commands, properties and periodic tasks all
@@ -102,8 +142,11 @@ even during a long sweep. It must not use the instrument.
 
 **Names the base class uses.** Do not reuse these for something else: `name`,
 `log`, `open`, `close`, `publish`, `subscribers`, `state`, `set_state`,
-`tasks`, `connected`, `streams`, `link_errors`, `reconnect_interval`,
-`open_on_start`.
+`set_meta`, `tasks`, `connected`, `streams`, `link_errors`,
+`reconnect_interval`, `open_on_start`, `extension`, `extension_version`,
+`simulated`, `poll`, `dangerous`. (A command or property named `poll`,
+`simulated`, `extension` or `dangerous` from before still works; the name then
+just declares nothing.)
 
 A device class also works without any server: `LockIn().open()` and plain
 method calls behave as ordinary Python.
@@ -129,6 +172,11 @@ opens and created again after a link error, so reconnecting comes for free.
 | `close` | name of the driver's closing method (default `"close"`) |
 | `link_errors` | exception classes that mean the connection broke |
 | `lazy=True` | open on first use instead of at server start |
+| `accessors=True` | also make a property `X` of each `get_X()` that needs no argument and has a `set_X(value)` beside it; both stay commands. A getter alone is left alone, so a read-and-clear `get_error()` is never read by the window. `X` and `set_X` write one setting, so marking either one dangerous marks both. |
+| `meta` | metadata, by property or `"command.parameter"`: `meta={"power": {"unit": "dBm"}, "set_level.dbm": {"min": -40}}` |
+| `dangerous` | names of commands and properties that are dangerous, or `True` for every command and every property that can be written; added to what a `Wrapped` subclass marks |
+| `poll` | values to read periodically, `{"temperature": 1.0}` |
+| `extension`, `extension_version`, `simulated` | what the device is (by default `simulated` is what the driver class says, if it has a `simulated` attribute) |
 
 To add streams or extra commands to such a driver, subclass `insthub.Wrapped`.
 The driver object is `self.target`:
@@ -156,6 +204,9 @@ path = "~/Code/mydriver"          # optional: where the module lives
 lazy = true                       # optional: open on first use
 port = "/dev/ttyUSB0"             # every other key is a constructor argument
 ```
+
+Every key, more examples (VISA, GPIB, several devices) and what to do when it
+does not work: [adding an instrument](adding-a-device.md).
 
 ## Using a device from another program
 
@@ -198,15 +249,17 @@ Everything that is about the bus rather than the instrument:
 
 | | |
 |---|---|
-| `dev.bus.help()` | printable list of commands, properties and streams |
+| `dev.bus.help()` | printable list of commands, properties and streams, with units, limits, choices and what is dangerous |
 | `dev.bus.describe()` | the same as a dict |
 | `dev.bus.status()` | is the instrument connected, what is it doing, last error |
 | `dev.bus.state()` | the device's state dict |
 | `dev.bus.subscribe(stream, ...)` | see [Streams](#streams) |
 | `dev.bus.latest(stream)` | the last published frame, without subscribing |
 | `dev.bus.with_timeout(5)` | the same device, but waiting calls give up after 5 s |
-| `dev.bus.release()` | close the instrument session, e.g. to use the vendor's software; the next command reopens it |
+| `dev.bus.release()` | close the instrument session, e.g. to use the vendor's software; the next command, or the next run of a periodic task, reopens it (`pause()` keeps it closed) |
 | `dev.bus.reopen()` | open the session now |
+| `dev.bus.pause()` | refuse its commands and properties (they raise `DevicePaused` at once) and run none of its periodic tasks until `dev.bus.resume()`; returns once the command running now has finished and the session is closed |
+| `dev.bus.resume()` | end a pause; the session opens again if it was open before |
 | `dev.bus.task(name, enabled, interval)` | switch a periodic task of the device |
 
 Most of these also work directly, as `dev.subscribe(...)`, `dev.state()` and
@@ -252,7 +305,8 @@ insthub's own errors:
 |---|---|
 | `DeviceNotFound` | no device of that name |
 | `DeviceNotConnected` | the server is up but could not open the instrument |
-| `UnknownCommand` | the device has no such command, property or task |
+| `DevicePaused` | somebody paused the device (**Pause**, `insthub pause`, `dev.bus.pause()`); a kind of `DeviceNotConnected`, so catch it first if your script retries on `DeviceNotConnected` |
+| `UnknownCommand` | the device has no such command, property, parameter or task |
 | `ConnectionLost` | the server cannot be reached or went away before replying |
 
 **Timeouts.** A waiting call waits as long as the device takes. For a limit,
@@ -262,6 +316,16 @@ not the instrument.
 **Server restarts.** Calls under way fail with `ConnectionLost`. The next call
 reconnects by itself, and open subscriptions resume when the server is back. A
 request is never run twice.
+
+**Servers of another insthub version.** A server says which insthub version it
+runs and what it supports. Before you rely on something new, ask:
+
+```python
+client = insthub.connect("tcp://192.168.1.20:8701")
+client.info().get("version")                # "0.1.0"; None from a server too old to say
+if client.supports("pause"):                # False for a server older than that feature
+    client.psu.bus.pause()
+```
 
 ## What can be sent
 
@@ -316,8 +380,8 @@ devices and servers, and marks the ones that are broken.
 **Devices** shows every device as a tile, in a section per server: the
 servers on this computer, the installed services that are not running, and
 the servers of other computers listed in `devices.toml`. A tile says whether
-its instrument is connected (connected, busy, released, or not connected and
-why). It shows a small live preview of what the device publishes: a trace, an
+its instrument is connected (connected, busy, not opened yet, released, paused
+or pausing, or not connected and why). It shows a small live preview of what the device publishes: a trace, an
 image or a number. A device that publishes nothing shows the figures of its
 state instead. The preview is the stream's last frame, fetched once a second,
 so it never makes an instrument acquire: a scope that only reads out while
@@ -327,21 +391,37 @@ device, class or server.
 Click a tile to see whether its instrument is connected and since when, what
 it is doing, and which programs are watching it. Its tabs show:
 
-- **Settings**: its properties, read from the instrument when the page opens.
-  A settable one is changed in place (a switch for one that is on or off).
+- **Settings**: its properties, read from the instrument when the page opens
+  (not while it is paused), with their units and limits.
+  A settable one is changed in place, with the control its metadata asks for:
+  a list for one of its choices, a spin box with its unit for a number, a
+  switch for one that is on or off, and otherwise a text field, which also
+  takes values like `auto`.
 - **Streams**: how fast each one arrives.
 - **Periodic tasks**: a switch each.
 - **State**: what the device published as its state.
 - **Commands**: run one with arguments typed as on the command line
-  (`VPP channel=2`, `[1, 2]`), and see what it returned.
+  (`VPP channel=2`, `[1, 2]`), and see what it returned. The units, limits and
+  choices of its parameters are shown under it.
+
+Writing a property or running a command that the device marks dangerous asks
+you first. A simulated device has a SIM mark on its tile and on its page, and
+the page shows the extension the device belongs to.
 
 Its buttons open the instrument session now (**Connect now**), close it for
 other software (**Release**), or open its live plots (**Live view**).
+**Pause** closes the session and keeps everything off the instrument (every
+program's commands fail with `DevicePaused`) until **Resume**; the page says
+who paused it and since when. **⋯ → Edit in lab.toml...** (named after the
+server's config file) changes its driver, arguments or **Open at start** there.
 
 **Servers** shows a card per server. Open one to see its process, its
 addresses, its service, its config file, its devices and the programs
 connected to it. A service can be started, stopped, restarted and removed
-there, and its log read. A server started by hand can be stopped.
+there, its log read, and **Starts at login** switched on or off. A server
+started by hand can be stopped. **⋯ → Edit lab.toml...** changes its config
+file in a form: only what you change is written, the file's comments stay,
+and **Save and restart** makes the server use it.
 
 **Add** (on the Devices and Servers pages) sets things up without editing
 files by hand:
@@ -393,17 +473,20 @@ right-click its icon in the dock and pin it to keep it there.
 
 ```
 insthub list                                   servers and devices on this computer
-insthub info DEVICE                            commands, properties, streams, status
+insthub info DEVICE                            commands, properties, streams, status; units, limits, choices,
+                                               what is dangerous, and whether it is simulated
 insthub call DEVICE COMMAND [ARG ...] [KEY=VALUE ...] [--save FILE]
 insthub get DEVICE PROPERTY
 insthub set DEVICE PROPERTY VALUE
 insthub watch DEVICE [STREAM]                  print frames as they arrive
 insthub release DEVICE                         close the instrument session, e.g. for the vendor's software
 insthub reopen DEVICE                          open it again now (any command does so too)
+insthub pause DEVICE                           close it and refuse every command until resumed
+insthub resume DEVICE                          end the pause
 insthub view DEVICE                            live plots
 insthub gui [--tray | --install]               the manager window (stays in the tray); --install adds an icon
 insthub serve CONFIG.toml                      host the devices of a config file
-insthub service install | list | start | stop | restart | remove | logs
+insthub service install | list | start | stop | restart | enable | disable | remove | logs
                                                keep servers running in the background
 insthub sim [--gui]                            simulated instruments to try things on
 insthub bench                                  speed on this computer

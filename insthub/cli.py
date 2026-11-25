@@ -1,13 +1,15 @@
 """Command line.
 
     insthub list                                   servers and devices on this machine
-    insthub info DEVICE                            its commands, properties and streams
+    insthub info DEVICE                            its commands, properties and streams: units, limits, choices,
+                                                  what is dangerous, and whether it is simulated
     insthub call DEVICE COMMAND [ARG ...] [KEY=VALUE ...] [--save FILE]
     insthub get DEVICE PROPERTY
     insthub set DEVICE PROPERTY VALUE
     insthub watch DEVICE [STREAM]                  print frames as they arrive
     insthub release DEVICE                         close the instrument session (to use the vendor's software);
                                                   the next command reopens it.  `insthub reopen DEVICE` does it now
+    insthub pause DEVICE                           close it and refuse every command until `insthub resume DEVICE`
     insthub view DEVICE                            live plots of its streams (needs insthub[gui])
     insthub gui [--tray | --install | --uninstall] the manager window: every server and device, how each is
                                                   connected, and controls; it stays in the tray when closed.
@@ -17,11 +19,13 @@
     insthub bench                                  latency and throughput on this machine
     insthub mcp [--data DIR] [--timeout S]         the bus for AI agents (MCP on stdin/stdout); see docs/agents.md
 
-    insthub service install TARGET [--name NAME] [--python PATH]
+    insthub service install TARGET [--name NAME] [--python PATH] [--no-login]
                                                   keep a server running in the background (systemd user service);
                                                   TARGET is a .toml config or a .py server script.  The service
-                                                  runs this Python (or PATH), which must import its drivers
+                                                  runs this Python (or PATH), which must import its drivers.
+                                                  --no-login: started only by `insthub service start NAME`
     insthub service list | start NAME | stop NAME | restart NAME | remove NAME | logs NAME [-f]
+    insthub service enable NAME | disable NAME     start it at every login, or no longer
 
 Values are parsed as JSON when possible (1e3, true, [1,2], "text"), else taken
 as text.  `-a ADDRESS` talks to a server by address instead of looking the
@@ -35,6 +39,7 @@ import json
 import logging
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -150,8 +155,8 @@ def _cmd_list(args) -> int:
             continue
         for name, d in sorted(described.items()):
             st = d["status"]
-            state = "connected" if st["connected"] else f"NOT CONNECTED ({st['error']})"
-            busy = f", busy: {st['busy']}" if st["busy"] else ""
+            state = _status_text(st)
+            busy = f", busy: {st['busy']}" if st["busy"] and not st.get("paused") else ""  # (pausing says it)
             print(f"    {name:16s} {d['type']:16s} {state}{busy}; {len(d['commands'])} commands, "
                   f"{len(d['properties'])} properties, streams: {', '.join(sorted(d['streams'])) or '-'}")
     return 0
@@ -161,9 +166,8 @@ def _cmd_info(args) -> int:
     dev = _device(args)
     print(dev.bus.help())
     st = dev.bus.status()
-    print(f"\nstatus: {'connected' if st['connected'] else 'NOT CONNECTED'}"
-          + (f", last error: {st['error']}" if st["error"] else "")
-          + f", {st['calls']} calls, {st['errors']} errors, {st['subscribers']} subscribers")
+    print(f"\nstatus: {_status_text(st)}, {st['calls']} calls, {st['errors']} errors, "
+          f"{st['subscribers']} subscribers")
     return 0
 
 
@@ -247,10 +251,70 @@ def _cmd_watch(args) -> int:
     return 0
 
 
+def _status_text(st: dict) -> str:
+    if st.get("paused"):
+        by = f" by {st['paused']['by']}" if st["paused"].get("by") else ""
+        busy = st.get("busy") if st.get("busy") not in (None, "$pause") else None
+        if busy or st["connected"]:  # the pause itself closes the session: until then, what runs finishes
+            what = "the instrument is opened" if busy == "$open" else f"{busy or 'what it is doing'} finishes"
+            return f"pausing{by}: closed once {what}"
+        return f"paused{by} (insthub resume to end it)"
+    if st["connected"]:
+        return "connected"
+    if st["error"] is None:
+        return "not opened yet (it opens on first use)"
+    if st["error"] == "released":
+        return "released (the next command opens it again)"
+    return f"NOT CONNECTED ({st['error']})"
+
+
 def _cmd_release(args) -> int:
+    from .client import PROCESS_TOKEN
+
     bus = _device(args).bus
-    status = bus.release() if args.cmd == "release" else bus.reopen()
-    print(f"{args.device}: " + ("connected" if status["connected"] else f"not connected ({status['error']})"))
+    doing = {"pause": "pausing", "resume": "resuming"}.get(args.cmd)
+    st = bus.status() if doing else {}
+    if args.cmd == "pause" and "paused" not in st:
+        print(f"{args.device}: its server runs an older insthub, which cannot pause a device (update insthub "
+              "there, then restart it)", file=sys.stderr)
+        return 1
+    if args.cmd == "resume" and not st.get("paused"):
+        print(f"{args.device}: not paused ({_status_text(st)})")
+        return 0
+    busy = st.get("busy") if st.get("busy") not in (None, "$pause") else None
+    if args.cmd == "resume" and not busy:  # paused and closed: the wait is for its own reopening
+        waits, then = "resumed; opening the instrument again...", "resumed; the instrument is still being opened"
+    else:
+        what = ("the instrument to finish opening", "it has finished opening") if busy == "$open" else \
+            (f"{busy or 'what it is doing'} to finish", f"{busy or 'what it is doing'} finishes")
+        waits = f"{doing}; waiting for {what[0]}..."
+        then = (f"paused (refusing every call already), and closed once {what[1]}" if args.cmd == "pause" else
+                f"resumed once {what[1]}")
+    request = {"release": ("$release", ()), "reopen": ("$open", ()), "resume": ("$resume", ()),
+               "pause": ("$pause", (f"insthub {args.cmd}", PROCESS_TOKEN))}[args.cmd]
+    reply = bus._t.request(bus.name, *request, {})
+    waiting = False
+    try:
+        try:  # the pause (or the resume) takes effect once what runs now has finished: say so if it takes long
+            status = reply.result(0.5 if doing else bus.timeout)
+        except TimeoutError:
+            if not doing:
+                raise
+            waiting = True
+            print(f"{args.device}: {waits}", flush=True)
+            status = reply.result(bus.timeout)
+    except KeyboardInterrupt:
+        if not doing:
+            raise
+        # the request has reached the server: it is carried out all the same
+        print(("\n" if waiting else "") + f"{args.device}: stopped waiting; it is {then}", file=sys.stderr)
+        return 130
+    if status.get("paused"):
+        print(f"{args.device}: paused; its commands fail until  insthub resume {args.device}")
+    else:
+        print(f"{args.device}: " + ("connected" if status["connected"] else
+                                    "not connected yet (it opens on first use)" if status["error"] is None else
+                                    f"not connected ({status['error']})"))
     return 0
 
 
@@ -314,7 +378,11 @@ def _cmd_gui(args) -> int:
 def _cmd_serve(args) -> int:
     from . import Server, config
 
-    kwargs, devices = config.load(args.config)
+    try:
+        kwargs, devices = config.load(args.config)
+    except (config.ConfigError, ImportError) as e:  # what is wrong with the file, or with this Python for it
+        print(f"error: {e}", file=sys.stderr)  # (a driver's own error, a DriverError, keeps its traceback)
+        return 1
     if args.tcp is not None:
         kwargs["tcp"] = args.tcp
     Server(kwargs.pop("name"), devices, **kwargs).serve_forever()
@@ -349,7 +417,8 @@ def _cmd_service(args) -> int:
     from . import service
 
     if args.action == "install":
-        path = service.install(args.target, args.name, start=not args.no_start, python=args.python)
+        login = not (args.no_start or args.no_login)
+        path = service.install(args.target, args.name, start=not args.no_start, python=args.python, login=login)
         name = path.stem[len(service.PREFIX):]
         print(f"installed {path}")
         if not args.no_start:
@@ -357,9 +426,13 @@ def _cmd_service(args) -> int:
             state = next((u["state"] for u in service.units() if u["name"] == name), "unknown")
             print(f"state: {state}" + ("" if state == "active" else f"   (see: insthub service logs {name})"))
         print(f"restart after changing its code or config:  insthub service restart {name}")
-        hint = service.linger_hint()
-        if hint:
-            print(f"it starts when you log in; to start it at boot instead, run once:  {hint}")
+        if login:
+            hint = service.linger_hint()
+            if hint:
+                print(f"it starts when you log in; to start it at boot instead, run once:  {hint}")
+        else:
+            print(f"it does not start at login: start it with  insthub service start {name}"
+                  f"  (or from now on at every login:  insthub service enable {name})")
         return 0
     if args.action == "remove":
         service.remove(args.name)
@@ -372,12 +445,17 @@ def _cmd_service(args) -> int:
         state = next((u["state"] for u in service.units() if u["name"] == args.name), "unknown")
         print(f"{service.PREFIX}{args.name}: {state}")
         return 0
+    if args.action in ("enable", "disable"):
+        getattr(service, args.action)(args.name)
+        print(f"{service.PREFIX}{args.name}: " + ("starts at every login" if args.action == "enable" else
+                                                  "no longer starts at login (start it by hand)"))
+        return 0
     units = service.units()
     if not units:
         print("no insthub services installed (insthub service install TARGET)")
     for unit in units:
-        boot = "enabled" if unit["enabled"] else "not enabled"
-        print(f"{unit['name']:16s} {unit['state']:10s} {boot:12s} {unit['command']}")
+        boot = "at login" if unit["enabled"] else "by hand"
+        print(f"{unit['name']:16s} {unit['state']:10s} {boot:9s} {unit['command']}")
     return 0
 
 
@@ -388,7 +466,8 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("list", help="servers and devices").set_defaults(fn=_cmd_list)
-    s = sub.add_parser("info", help="commands, properties and streams of a device")
+    s = sub.add_parser("info", help="commands, properties and streams of a device, with units, limits, "
+                                    "choices and what is dangerous")
     s.add_argument("device")
     s.set_defaults(fn=_cmd_info)
     s = sub.add_parser("call", help="call a command: insthub call scope measure VPP channel=2")
@@ -414,6 +493,12 @@ def main(argv=None) -> int:
     s.add_argument("device")
     s.set_defaults(fn=_cmd_release)
     s = sub.add_parser("reopen", help="open the instrument session now")
+    s.add_argument("device")
+    s.set_defaults(fn=_cmd_release)
+    s = sub.add_parser("pause", help="close the instrument session and refuse every command until resume")
+    s.add_argument("device")
+    s.set_defaults(fn=_cmd_release)
+    s = sub.add_parser("resume", help="end a pause (reconnecting if it was connected before)")
     s.add_argument("device")
     s.set_defaults(fn=_cmd_release)
     s = sub.add_parser("view", help="live plots of a device's streams")
@@ -449,13 +534,20 @@ def main(argv=None) -> int:
     a = actions.add_parser("install", help="register a server and start it; again to replace it")
     a.add_argument("target", help="a .toml config (run with `insthub serve`) or a .py server script")
     a.add_argument("--name", help="service name (default: the file name without extension)")
-    a.add_argument("--no-start", action="store_true", help="only write the unit file")
+    a.add_argument("--no-start", action="store_true", help="only write the unit file (neither start it nor "
+                                                               "start it at login)")
+    a.add_argument("--no-login", action="store_true", help="start it now, but not at every login "
+                                                           "(later: insthub service start NAME)")
     a.add_argument("--python", metavar="PATH",
                    help="the Python the service runs (default: the one running this command); "
                         "it needs insthub and the drivers' packages")
     actions.add_parser("list", help="installed services and their state")
-    for action, text in (("start", "start a service"), ("stop", "stop a service until the next login or start"),
-                         ("restart", "restart a service, e.g. after changing its code or config")):
+    for action, text in (("start", "start a service"),
+                         ("stop", ("stop a service (until `start`, or the next start of your services if it "
+                                   "starts at login)")),
+                         ("restart", "restart a service, e.g. after changing its code or config"),
+                         ("enable", "start a service at every login from now on"),
+                         ("disable", "no longer start a service at login")):
         actions.add_parser(action, help=text).add_argument("name")
     a = actions.add_parser("remove", help="stop a service and delete it")
     a.add_argument("name")
@@ -469,13 +561,30 @@ def main(argv=None) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     from .errors import BusError
 
-    try:
-        return args.fn(args)
-    except BusError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        return 130
+    with warnings.catch_warnings():
+        warnings.showwarning = _warning_printer(warnings.showwarning)
+        try:
+            return args.fn(args)
+        except BusError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            return 130
+
+
+def _warning_printer(default):
+    """A warnings.showwarning that prints a config file's warnings (a driver that imports Qt, ...)
+    as this command prints errors: one line, without the line of insthub that raised it."""
+
+    def show(message, category, filename, lineno, file=None, line=None):
+        from .config import ConfigWarning
+
+        if issubclass(category, ConfigWarning):
+            print(f"warning: {message}", file=file or sys.stderr)
+        else:
+            default(message, category, filename, lineno, file, line)
+
+    return show
 
 
 if __name__ == "__main__":

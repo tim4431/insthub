@@ -23,6 +23,7 @@ Client side (experiment script, notebook, GUI):
 
 See README.md.
 """
+from ._version import __version__ as __version__  # the redundant "as" marks it as exported
 from .client import (
                      CallFuture,
                      Client,
@@ -42,17 +43,16 @@ from .errors import (
                      ConnectionLost,
                      DeviceNotConnected,
                      DeviceNotFound,
+                     DevicePaused,
                      RemoteError,
                      SubscriptionClosed,
                      UnknownCommand,
 )
 from .server import Server, serve
 
-__version__ = "0.1.0"
-
 __all__ = [
     "BusError", "CallFuture", "Client", "ConnectionLost", "Device", "DeviceNotConnected", "DeviceNotFound",
-    "DeviceProxy", "Frame", "Record", "RemoteError", "Server", "Subscription", "SubscriptionClosed", "Task",
+    "DevicePaused", "DeviceProxy", "Frame", "Record", "RemoteError", "Server", "Subscription", "SubscriptionClosed", "Task",
     "UnknownCommand", "Wrapped", "close_all", "command", "connect", "device", "discover", "gather", "locate", "periodic",
     "prop", "register_type", "serve", "wrap",
 ]

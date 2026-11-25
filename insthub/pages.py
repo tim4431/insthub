@@ -5,9 +5,10 @@ a server: anything it asks for goes through the window's workers.
     Sidebar        the way to each page; how many servers and devices, what is broken
     DevicesPage    a tile per device, in a section per server, with a search
     DevicePage     a device: its connection, its properties (to read and change), streams,
-                   periodic tasks, state and commands (to run)
+                   periodic tasks, state and commands (to run); Pause and Resume
     ServersPage    a card per server
-    ServerPage     a server: its process, addresses, service, devices and clients
+    ServerPage     a server: its process, addresses, service (and whether it starts at
+                   login), devices and clients
     AgentsPage     giving AI agents the instruments (insthub mcp); which are connected
     SettingsPage   how the window looks and behaves; the files insthub uses
     LogDialog      a server's output, followed live
@@ -23,20 +24,24 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import __version__, cli, launcher, registry, service
+from . import __version__, cli, launcher, registry, service, tomlfile
 from . import widgets as ui
+from .client import meta_text
 from .errors import BusError
 from .inventory import (
     BAD,
     GOOD,
+    PAUSED,
     Server,
     ago,
     clock,
     device_state,
     mcp_command,
+    paused_by,
     route,
     routes,
     server_file,
@@ -50,6 +55,13 @@ if TYPE_CHECKING:
 
 Qt = QtCore.Qt
 STALE = 10.0  #: seconds without a new frame after which a preview is drawn faded
+PAUSE_TIP = ("Close the instrument session and refuse every command, property and periodic task until Resume, "
+             "e.g. while you use the instrument by hand or with the vendor's software")
+RESUME_TIP = "End the pause: its commands run again, and it reconnects if it was connected before"
+RELEASE_TIP = ("Close the instrument session for other software for a moment; the next command, or the next run "
+               "of a periodic task, opens it again (Pause keeps it closed)")
+SIM_TIP = "Simulated: it talks to a simulator, not to an instrument, so its data is not a measurement."
+DANGER = "It is marked dangerous: it can harm the instrument, the sample or a person."
 
 
 def open_path(path: str | Path) -> bool:
@@ -129,10 +141,12 @@ def device_view(s: Server, name: str, previews: bool = True) -> ui.TileView:
     """What a device's tile shows: a preview of its stream if there is one (and `previews`),
     else the figures of its state; why, if it is broken."""
     d = s.device(name)
-    status, word, sentence = device_state(d)
+    status, word, sentence = device_state(d, s.origin == "local")
     kind = d["type"] if d else ""
     view = ui.TileView(title=name, subtitle=" · ".join(x for x in (kind, s.name) if x), icon=_device_icon(name, kind),
                        status=status, word=word, tip=f"{name}: {sentence}")
+    if d is not None and d.get("simulated"):
+        view.badge, view.tip = "SIM", f"{view.tip}\n{SIM_TIP}"
     if d is None:
         if s.error:
             view.message = f"Its server does not answer: {s.error}"
@@ -140,7 +154,12 @@ def device_view(s: Server, name: str, previews: bool = True) -> ui.TileView:
             view.word, view.message = "checking", "Asking its server..."
         return view
     preview = s.previews.get(name) if previews else None
-    if status == BAD:
+    paused = d["status"].get("paused")
+    if paused and word == "paused":
+        view.icon = "pause"
+        view.message = (f"Paused since {clock(paused['since'])} by {paused_by(paused, s.origin == 'local')}. "
+                        "Nothing runs on it until it is resumed.")
+    elif status == BAD or word == "pausing":
         view.message = sentence
     elif preview is not None:
         view.preview, view.stale = preview, preview.age() > STALE
@@ -164,6 +183,9 @@ def server_view(s: Server) -> ui.TileView:
         devices = list(s.probe["devices"].values())
         connected = sum(1 for d in devices if d["status"]["connected"])
         figures = [("Connected", f"{connected} of {len(devices)}")]
+        paused = sum(1 for d in devices if d["status"].get("paused"))
+        if paused:
+            figures.append(("Paused", str(paused)))
         if s.probe["clients"] is not None:
             figures.append(("Programs", str(len(s.probe["clients"]))))
         figures.append(("Answers in", f"{s.probe['latency'] * 1e3:.2f} ms"))
@@ -174,7 +196,7 @@ def server_view(s: Server) -> ui.TileView:
     if s.origin == "local" and s.started:
         parts.append(f"up {ago(time.time() - s.started)}")
     if s.service:
-        parts.append("service, starts at login" if s.service["enabled"] else "service")
+        parts.append("service, starts at login" if s.service["enabled"] else "service, not at login")
     view.caption = " · ".join(p for p in parts if p)
     return view
 
@@ -274,6 +296,22 @@ class _Facts(QtWidgets.QFrame):
         field.setVisible(visible)
         self.form.labelForField(field).setVisible(visible)
 
+    def control_row(self, name: str, control: QtWidgets.QWidget, hint: str = "") -> QtWidgets.QWidget:
+        """A row with a control (a switch) and a line of explanation beside it."""
+        row = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        layout.addWidget(control)
+        row.hint = ui.label(hint, "small", wrap=True)
+        layout.addWidget(row.hint, 1)
+        self.form.addRow(ui.label(name, "label"), row)
+        return row
+
+    def show_widget(self, field: QtWidgets.QWidget, visible: bool) -> None:
+        field.setVisible(visible)
+        self.form.labelForField(field).setVisible(visible)
+
 
 class _Header(QtWidgets.QWidget):
     """The top of a page: the way back, its title and status, a line below, buttons on the right."""
@@ -282,6 +320,9 @@ class _Header(QtWidgets.QWidget):
         super().__init__()
         self.back = ui.button(back, "back", kind="link", slot=on_back) if back else None
         self.title = ui.label(title, "h1")
+        self.badge = ui.Tag("SIM")  #: shown for a simulated device
+        self.badge.setToolTip(SIM_TIP)
+        self.badge.hide()
         self.pill = ui.Pill()
         self.pill.hide()
         self.subtitle = ui.label("", "muted", wrap=True, select=True)
@@ -291,6 +332,7 @@ class _Header(QtWidgets.QWidget):
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(12)
         top.addWidget(self.title)
+        top.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignVCenter)
         top.addWidget(self.pill, 0, Qt.AlignmentFlag.AlignVCenter)
         top.addStretch(1)
         top.addLayout(self.actions)
@@ -491,6 +533,9 @@ class DevicesPage(_Page):
         broken = sum(1 for s in servers if s.probe for d in s.probe["devices"].values() if device_state(d)[0] == BAD)
         running = sum(1 for s in servers if s.origin != "service")
         text = f"{_count(total, 'device')} on {_count(running, 'server')}" if scanned else "Looking for servers..."
+        paused = sum(1 for s in servers if s.probe for d in s.probe["devices"].values() if d["status"].get("paused"))
+        if paused:
+            text += f" · {paused} paused"
         if total and any(s.probe for s in servers):
             text += f" · <span style='color:{ui.STATUS[BAD]}'>{broken} not connected</span>" if broken \
                 else " · all connected"
@@ -549,14 +594,18 @@ class ServerPage(_Page):
         self.start = ui.button("Start", "start", kind="primary", tip="Start the service",
                                slot=lambda: window.service_action(self.server, "start"))
         self.restart = ui.button("Restart", "refresh", tip="Stop and start again, e.g. after changing its code or "
-                                 "config", slot=lambda: window.service_action(self.server, "restart"))
+                                 "config", slot=self._restart)
         self.stop = ui.button("Stop", "stop", tip="Stop the server; its devices close their instruments",
                               slot=self._stop)
         self.logs = ui.button("Logs", "logs", tip="What the server printed", slot=lambda: window.show_logs(self.server))
         self.more = ui.button("", "more", kind="ghost", tip="More")
         self.more.setFixedWidth(38)
         menu = QtWidgets.QMenu(self.more)
+        self.edit_file = menu.addAction(ui.icon("edit"), "Edit its config...")
+        self.edit_file.setToolTip("Change its devices and their settings here; the file's comments are kept")
+        self.edit_file.triggered.connect(lambda *_: window.edit_config(self.server.key))
         self.open_file = menu.addAction(ui.icon("file"), "Open its config file")
+        self.open_file.setToolTip("In your text editor")
         self.open_file.triggered.connect(lambda *_: open_path(server_file(self.server)))
         self.remove = menu.addAction(ui.icon("trash"), "Remove the service...")
         self.remove.setToolTip("Stop it and no longer start it at login")
@@ -573,8 +622,14 @@ class ServerPage(_Page):
         self.reach = self.facts.row("Reached at")
         self.latency = self.facts.row("Answers in")
         self.service = self.facts.row("Service")
+        self.login = ui.Switch()
+        self.login.toggled.connect(lambda on: window.set_login(self.server, bool(on)))
+        self.login_row = self.facts.control_row("Starts at login", self.login)
         self.command = self.facts.row("Command")
         self.file = self.facts.row("Config")
+        self.file.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
+                                          | Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.file.linkActivated.connect(lambda *_: window.edit_config(self.server.key))
         self.devices = self.facts.row("Devices")
         self.body.addWidget(self.facts)
         self.devices_title = ui.label("Devices", "h2")
@@ -594,6 +649,9 @@ class ServerPage(_Page):
             self.window.service_action(self.server, "stop")
         else:
             self.window.stop_server(self.server)
+
+    def _restart(self) -> None:
+        self.window.restart_server(self.server, ask=True)  # (a service too: one restart at a time)
 
     def show_server(self, s: Server) -> None:
         self.server = s
@@ -620,33 +678,58 @@ class ServerPage(_Page):
         u = s.service
         if u:
             detail = f" ({u['sub']})" if u.get("sub") not in (None, "", "running", "dead", u["state"]) else ""
-            boot = "starts at login" if u["enabled"] else "does not start at login"
-            f.show_row(self.service, f"{service.PREFIX}{_esc(u['name'])} · {_esc(u['state'])}{detail} · {boot}")
+            f.show_row(self.service, f"{service.PREFIX}{_esc(u['name'])} · {_esc(u['state'])}{detail}")
             f.show_row(self.command, f"<code>{_esc(u['command'])}</code>")
+            pending = self.window.login_pending.get(u["name"])
+            on = bool(u["enabled"]) if pending is None else pending
+            self.login.set_quietly(on)
+            self.login.setEnabled(pending is None)
+            self.login_row.hint.setTextFormat(Qt.TextFormat.RichText)
+            self.login_row.hint.setText(
+                "On: it is started when you log in." if on else
+                f"Off: it runs only when you start it (Start, above, or "
+                f"<code>insthub service start {_esc(u['name'])}</code>).")
         elif s.origin == "local":
             f.show_row(self.service, ui.muted(
-                "none: started from this window, so it runs until it is stopped or you log out"
-                if self.window.started_here(s.pid) else "none: started by hand, so it stops when its terminal closes"))
+                "none: started from this window, so it runs until it is stopped (or, with lingering off, you "
+                "log out)" if self.window.started_here(s.pid) else
+                "none: started by hand, so it stops when its terminal closes"))
             f.show_row(self.command, None)
         else:
             f.show_row(self.service, None)
             f.show_row(self.command, None)
+        f.show_widget(self.login_row, bool(u))
         config = server_file(s)
-        f.show_row(self.file, f"<code>{_esc(config)}</code>" if config else None)
+        editable = config is not None and config.suffix == ".toml"
+        f.show_row(self.file, (f"<code>{_esc(config)}</code>" + (" &nbsp;<a href='edit'>Edit...</a>" if editable else ""))
+                   if config else None)
         if s.probe:
             devices = s.probe["devices"].values()
             connected = sum(1 for d in devices if d["status"]["connected"])
-            f.show_row(self.devices, f"{len(devices)} · {connected} connected")
-        else:
-            f.show_row(self.devices, ", ".join(_esc(n) for n in s.declared) or None)
+            paused = sum(1 for d in devices if d["status"].get("paused"))
+            f.show_row(self.devices, f"{len(devices)} · {connected} connected" + (f" · {paused} paused" if paused else ""))
+        elif s.declared:
+            f.show_row(self.devices, ", ".join(_esc(n) for n in s.declared))
+        else:  # a service that does not run: what its config holds
+            names = []
+            if editable:
+                try:
+                    names = list(tomllib.loads(tomlfile.read(config)).get("devices", {}))
+                except (OSError, ValueError, UnicodeDecodeError):
+                    names = []
+            f.show_row(self.devices, (", ".join(_esc(n) for n in names) + " " + ui.muted("(from its config)"))
+                       if names else None)
 
         running = s.origin == "local"
         mine = s.pid == os.getpid()
         self.start.setVisible(bool(u) and not running)
         self.stop.setVisible((bool(u) and running) or (running and not u and bool(s.pid) and not mine))
-        self.restart.setVisible(bool(u))
+        self.restart.setVisible((bool(u) and running) or (running and self.window.started_here(s.pid)))
         self.logs.setVisible(bool(u) or (running and server_log(s.name).is_file()))
         self.open_file.setVisible(config is not None)
+        self.edit_file.setVisible(editable)
+        if editable:
+            self.edit_file.setText(f"Edit {config.name}...")
         self.remove.setVisible(bool(u))
         self.forget.setVisible(s.origin == "remote")
         self.more.setVisible(config is not None or bool(u) or s.origin == "remote")
@@ -672,25 +755,41 @@ class ServerPage(_Page):
 
 # ---------------------------------------------------------------- a device
 class _PropRow(QtWidgets.QWidget):
-    """One property: its name and documentation, its value, and (if settable) a way to change it."""
+    """One property: its name, documentation and metadata, its value, and (if settable) a way to change
+    it.  The control follows the value and its metadata: a list for one of its choices, a spin box for a
+    number with a unit or limits, a switch for true or false, else the text field, which also takes
+    what the others cannot show, such as "auto"."""
 
     def __init__(self, panel: _Properties, name: str, info: dict):
         super().__init__()
         self.panel, self.name, self.settable = panel, name, info["settable"]
-        self.value, self.loaded = None, False
+        self.meta, self.dangerous = info.get("meta") or {}, bool(info.get("dangerous"))
+        self.choices = list(self.meta.get("choices") or ())
+        self.value, self.loaded, self._held = None, False, False
         title = ui.label(name)
         title.setFont(ui.scaled(title.font(), 1.0, QtGui.QFont.Weight.DemiBold))
         doc = (info.get("doc") or "").split("\n")[0]
         if not self.settable and "read-only" not in doc.lower():
             doc = f"{doc} (read-only)" if doc else "read-only"
+        danger = "dangerous to change: you are asked first" if self.dangerous and self.settable else ""
+        about = " · ".join(x for x in (doc, meta_text(self.meta), danger) if x)
         self.edit = QtWidgets.QLineEdit()
         self.edit.setReadOnly(not self.settable)
         self.edit.setPlaceholderText("reading..." if self.settable else "")
         self.edit.returnPressed.connect(self.apply)
         self.edit.textEdited.connect(lambda *_: self.set_button.setEnabled(True))
+        self.number = ui.NumberBox()
+        self.number.set_meta(self.meta)
+        self.number.valueChanged.connect(lambda *_: self.set_button.setEnabled(True))
+        self.number.submitted.connect(self.apply)
+        self.choice = QtWidgets.QComboBox()
+        self.choice.addItems([_edit_text(c) for c in self.choices])
+        self.choice.activated.connect(lambda index: self.panel.write(self.name, self.choices[index]))
         self.switch = ui.Switch()
-        self.switch.hide()
         self.switch.toggled.connect(lambda on: self.panel.write(self.name, bool(on)))
+        self.editor: QtWidgets.QWidget = self.edit  #: the control shown now
+        for control in (self.number, self.choice, self.switch):
+            control.hide()
         self.set_button = ui.button("Set", tip=f"Send the new {name} to the instrument", slot=self.apply)
         self.set_button.setEnabled(False)
         self.set_button.setVisible(self.settable)
@@ -701,10 +800,11 @@ class _PropRow(QtWidgets.QWidget):
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(2)
         grid.addWidget(title, 0, 0)
-        grid.addWidget(ui.label(_esc(doc), "small", wrap=True), 1, 0)
+        grid.addWidget(ui.label(_esc(about), "small", wrap=True), 1, 0)
         editor = QtWidgets.QHBoxLayout()
         editor.setSpacing(8)
-        editor.addWidget(self.edit, 1)
+        for control in (self.edit, self.number, self.choice):
+            editor.addWidget(control, 1)
         editor.addWidget(self.switch)
         editor.addWidget(self.set_button)
         grid.addLayout(editor, 0, 1, 2, 1, Qt.AlignmentFlag.AlignVCenter)
@@ -712,18 +812,38 @@ class _PropRow(QtWidgets.QWidget):
         grid.setColumnStretch(0, 3)
         grid.setColumnStretch(1, 4)
 
+    def _control(self, value) -> QtWidgets.QWidget:
+        """The control that shows `value` and changes it (see the class docstring)."""
+        if not self.settable:
+            return self.edit
+        if isinstance(value, bool):
+            return self.switch
+        plain = isinstance(value, (str, int, float))
+        if plain and value in self.choices:
+            return self.choice
+        if (plain and not isinstance(value, str) and self.meta.keys() & {"unit", "min", "max", "step"}
+                and self.number.fits(value)):
+            return self.number
+        return self.edit
+
     def show_value(self, value, keep_message: bool = False) -> None:
         self.value, self.loaded = value, True
-        boolean = isinstance(value, bool) and self.settable
-        self.switch.setVisible(boolean)
-        self.edit.setVisible(not boolean)
-        self.set_button.setVisible(self.settable and not boolean)
-        if boolean:
+        self.editor = self._control(value)
+        for control in (self.edit, self.number, self.choice, self.switch):
+            control.setVisible(control is self.editor)
+        self.set_button.setVisible(self.settable and self.editor in (self.edit, self.number))
+        if self.editor is self.switch:
             self.switch.set_quietly(value)
+        elif self.editor is self.choice:
+            self.choice.setCurrentIndex(self.choices.index(value))  # (only a click on the list sends one)
+        elif self.editor is self.number:
+            blocked = self.number.blockSignals(True)
+            self.number.setValue(value)
+            self.number.blockSignals(blocked)
         else:
             self.edit.setText(_edit_text(value))
             self.edit.setCursorPosition(0)
-            self.set_button.setEnabled(False)
+        self.set_button.setEnabled(False)
         if not keep_message:
             self.say("")
 
@@ -732,8 +852,22 @@ class _PropRow(QtWidgets.QWidget):
             self.edit.setPlaceholderText("could not be read")
         self.say(error_text(exc), error=True)
 
+    def hold(self, paused: bool) -> None:
+        """While the device is paused, a property can be neither read nor set: say so by not offering it."""
+        self._held = paused
+        self.edit.setReadOnly(paused or not self.settable)
+        for control in (self.number, self.choice, self.switch):
+            control.setEnabled(not paused)
+        if paused:
+            self.set_button.setEnabled(False)
+
     def apply(self) -> None:
-        if not self.settable:
+        """Send what is typed (Set, or Enter): the spin box's number, or the text field's text."""
+        if not self.settable or self._held:  # (Enter in a field held while paused)
+            return
+        if self.editor is self.number:
+            number = self.number.value()
+            self.panel.write(self.name, int(number) if isinstance(self.value, int) and number.is_integer() else number)
             return
         text = self.edit.text()
         self.panel.write(self.name, text if isinstance(self.value, str) else cli._value(text.strip()))
@@ -764,8 +898,13 @@ class _Properties(QtWidgets.QWidget):
         top.addWidget(self.reload)
         self.card, self.list = ui.card(margins=(18, 6, 18, 6), spacing=0)
         self.empty = ui.label("This device has no properties. Its commands are under Commands.", "muted", wrap=True)
+        self.paused_note = ui.label("It is paused: its properties are read again when it is resumed.", "muted",
+                                    wrap=True)
+        self.paused_note.hide()
+        self._paused = False
         area, content = ui.scroll_page(margins=(0, 0, 0, 0), spacing=10)
         content.addLayout(top)
+        content.addWidget(self.paused_note)
         content.addWidget(self.card)
         content.addWidget(self.empty)
         content.addStretch(1)
@@ -774,14 +913,27 @@ class _Properties(QtWidgets.QWidget):
         box.addWidget(area)
 
     def load(self, s: Server, name: str, d: dict | None) -> None:
-        """Show the properties of this device (and read them), if it is not the one shown already."""
+        """Show the properties of this device (and read them), if it is not the one shown already;
+        a paused device is not asked, and is asked again once it is resumed."""
         props = d["properties"] if d else {}
-        key = (s.key, name, tuple(props))
+        key = (s.key, name, repr(sorted(props.items())))  # rows anew when a property or what it says changes
+        paused = bool(d and d["status"].get("paused"))
+        was, self._paused = self._paused, paused
+        self.paused_note.setVisible(paused and bool(props))
+        self.note.setVisible(not paused and bool(props))
+        self.reload.setVisible(not paused and bool(props))
+        for row in self.rows.values():
+            row.hold(paused)
         if key == self._for:
+            if was != paused:
+                self._mark_unread()
+            if was and not paused:
+                self.read_all()
             return
         self._for = key
         while (item := self.list.takeAt(0)) is not None:  # the rows (and lines between them) of the one before
             if item.widget() is not None:
+                item.widget().hide()  # at once: deleteLater waits for the event loop
                 item.widget().deleteLater()
         self.rows = {}
         for index, (prop, info) in enumerate(sorted(props.items())):
@@ -792,17 +944,29 @@ class _Properties(QtWidgets.QWidget):
                 self.list.addWidget(line)
             row = self.rows[prop] = _PropRow(self, prop, info)
             self.list.addWidget(row)
+        self._mark_unread()
+        for row in self.rows.values():
+            row.hold(paused)
         self.card.setVisible(bool(self.rows))
         self.empty.setVisible(d is not None and not self.rows)
-        self.note.setVisible(bool(self.rows))
-        self.reload.setVisible(bool(self.rows))
+        self.note.setVisible(bool(self.rows) and not paused)
+        self.reload.setVisible(bool(self.rows) and not paused)
         self.read_all()
+
+    def _mark_unread(self) -> None:
+        """What the fields not read yet say: they are being read, or they wait for the device's resume."""
+        for row in self.rows.values():
+            if not row.loaded:
+                row.edit.setPlaceholderText("not read while paused" if self._paused else
+                                            "reading..." if row.settable else "")
 
     def _target(self) -> tuple | None:
         s, name = self.page.server, self.page.name
         return (s.address, name, self._for) if s is not None and s.address else None
 
     def read_all(self) -> None:
+        if self._paused:
+            return
         for prop in self.rows:
             self.read(prop)
 
@@ -826,12 +990,18 @@ class _Properties(QtWidgets.QWidget):
                       done, failed)
 
     def write(self, prop: str, value) -> None:
+        """Set a property on the instrument; one marked dangerous only once the user agrees."""
         target = self._target()
         if target is None:
             return
         address, device, token = target
-        window = self.page.window
-        self.rows[prop].say("setting...")
+        window, row = self.page.window, self.rows[prop]
+        if row.dangerous and not window.confirm(f"Set {device}.{prop}?", f"{DANGER}\n\nSet {prop} to "
+                                                f"{_short(value)}?", "Set"):
+            if row.loaded:
+                row.show_value(row.value, keep_message=True)  # the control shows what the instrument has again
+            return
+        row.say("setting...")
 
         def done(_):
             if self._for == token and prop in self.rows:
@@ -883,9 +1053,13 @@ class _Commands(QtWidgets.QWidget):
 
     def load(self, d: dict | None, changed: bool) -> None:
         commands = d["commands"] if d else {}
+        paused = bool(d and d["status"].get("paused"))
+        if paused != getattr(self, "_paused", False):
+            self._paused = paused
+            self._chosen()
         self._names = sorted(commands)
-        _fill(self.table, [[n, commands[n]["signature"], (commands[n]["doc"] or "").split("\n")[0]]
-                           for n in self._names])
+        _fill(self.table, [[n, commands[n]["signature"], ("Dangerous · " if commands[n].get("dangerous") else "")
+                            + (commands[n]["doc"] or "").split("\n")[0]] for n in self._names])
         if changed:
             self.table.clearSelection()
             self.args.clear()
@@ -903,26 +1077,38 @@ class _Commands(QtWidgets.QWidget):
     def _chosen(self) -> None:
         name = self.current()
         d = self.page.server.device(self.page.name) if self.page.server else None
+        if getattr(self, "_paused", False):
+            self.chosen.setText("It is paused: no command runs until it is resumed.")
+            self.run_button.setEnabled(False)
+            return
         if name is None or d is None or name not in d["commands"]:
             self.chosen.setText("Choose a command above, then Run.")
             self.run_button.setEnabled(False)
             return
         c = d["commands"][name]
+        hints = [f"{_esc(param)}: {_esc(meta_text(meta))}" for param, meta in (c.get("params") or {}).items()]
+        if c.get("dangerous"):
+            hints.append("dangerous: you are asked before it runs")
         self.chosen.setText(f"<b>{_esc(name)}</b>{_esc(c['signature'])}"
-                            + (f" &nbsp;{ui.muted(_esc(c['doc'].splitlines()[0]))}" if c["doc"] else ""))
+                            + (f" &nbsp;{ui.muted(_esc(c['doc'].splitlines()[0]))}" if c["doc"] else "")
+                            + (f"<br>{ui.muted(' · '.join(hints))}" if hints else ""))
         self.run_button.setEnabled(True)
 
     def run(self) -> None:
         name, s, device = self.current(), self.page.server, self.page.name
-        if name is None or s is None or not s.address:
+        if name is None or s is None or not s.address or not self.run_button.isEnabled():  # Enter while paused
             return
         try:
             positional, keyword = cli.parse_params(cli.split_arguments(self.args.text()))
         except ValueError as e:
             self.result.setPlainText(f"Cannot read the arguments: {e}")
             return
-        window, address, start = self.page.window, s.address, time.perf_counter()
-        call = f"{device}.{name}"
+        window, address, call = self.page.window, s.address, f"{device}.{name}"
+        d = s.device(device)
+        if d and d["commands"].get(name, {}).get("dangerous") and not window.confirm(
+                f"Run {call}?", f"{DANGER}\n\nRun {name} {self.args.text()}".rstrip() + "?", "Run"):
+            return
+        start = time.perf_counter()
         self.result.setPlainText(f"Running {call}...")
         self.took.clear()
 
@@ -950,16 +1136,29 @@ class DevicePage(_Page):
             tip="Close the instrument session so that other software (e.g. the vendor's) can use the instrument. "
                 "The next command or periodic task opens it again; stop the periodic tasks to keep it closed.",
             slot=lambda: window.device_action(self.server, self.name, "$release"))
+        self.pause = ui.button("Pause", "pause", slot=self._pause_or_resume)
         self.live = ui.button("Live view", "live", kind="primary", tip="Live plots of its streams, in a window of "
                               "their own", slot=lambda: window.live_view(self.server, self.name))
-        for button in (self.connect_now, self.release, self.live):
+        self.more = ui.button("", "more", kind="ghost", tip="More")
+        self.more.setFixedWidth(38)
+        menu = QtWidgets.QMenu(self.more)
+        self.edit_file = menu.addAction(ui.icon("edit"), "Edit in its config...")
+        self.edit_file.setToolTip("Its driver, its arguments, whether it opens at start; the file's comments are kept")
+        self.edit_file.triggered.connect(lambda *_: window.edit_config(self.server.key, self.name))
+        menu.addAction(ui.icon("copy"), "Copy its name").triggered.connect(lambda *_: window.copy(self.name))
+        self.more.setMenu(menu)
+        for button in (self.connect_now, self.release, self.pause, self.live, self.more):
             self.header.actions.addWidget(button)
 
         self.facts = _Facts()
         self.instrument = self.facts.row("Instrument")
+        self.instrument.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
+                                                | Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.instrument.linkActivated.connect(lambda *_: window.edit_config(self.server.key, self.name))
         self.activity = self.facts.row("Activity")
         self.requests = self.facts.row("Requests")
         self.via = self.facts.row("Server")
+        self.extension = self.facts.row("Extension")
         self.watchers = self.facts.row("Watched by")
         self.preview_box, inside = ui.card(margins=(12, 12, 12, 10), spacing=6)
         self.preview = ui.PreviewView()
@@ -997,11 +1196,16 @@ class DevicePage(_Page):
     def task_switch(self, task: str) -> ui.Switch:
         return self._switches[task]
 
+    def _pause_or_resume(self) -> None:
+        d = self.server.device(self.name) if self.server else None
+        paused = bool(d and d["status"].get("paused"))
+        self.window.device_action(self.server, self.name, "$resume" if paused else "$pause")
+
     def show_device(self, s: Server, name: str) -> None:
         changed = (s, name) != (self.server, self.name)
         self.server, self.name = s, name
         d = s.device(name)
-        status, word, sentence = device_state(d)
+        status, word, sentence = device_state(d, s.origin == "local")
         h = self.header
         h.title.setText(name)
         h.pill.set(status, word)
@@ -1010,7 +1214,10 @@ class DevicePage(_Page):
         what = _esc(d["type"]) if d else ("device listed in devices.toml" if s.origin == "remote" else "device")
         h.subtitle.setText(what + doc)
         f = self.facts
-        f.show_row(self.instrument, _badge(status, sentence))
+        config = server_file(s)
+        editable = config is not None and config.suffix == ".toml"
+        fix = f" &nbsp;<a href='edit'>Edit in {_esc(config.name)}...</a>" if editable and status == BAD else ""
+        f.show_row(self.instrument, _badge(status, sentence) + fix)
         reachable = d is not None
         if d:
             st = d["status"]
@@ -1027,6 +1234,9 @@ class DevicePage(_Page):
         how = route(s.address, s.origin) if s.address else ""
         pid = f" (pid {s.pid})" if s.origin == "local" and s.pid else ""
         f.show_row(self.via, f"{_esc(s.name)}{pid} · {ui.muted(how)}")
+        f.show_row(self.extension, _esc(f"{d['extension']} {d.get('extension_version') or ''}".rstrip())
+                   if d and d.get("extension") else None)
+        h.badge.setVisible(bool(d and d.get("simulated")))
         watching = {}
         reported = bool(s.probe) and s.probe["clients"] is not None
         for c in s.probe["clients"] if reported else ():
@@ -1037,13 +1247,27 @@ class DevicePage(_Page):
         f.show_row(self.watchers, "; ".join(f"{_esc(p)} ({', '.join(map(_esc, v))})" for p, v in watching.items())
                    or (ui.muted(nobody) if reachable else None))
         connected = bool(d and d["status"]["connected"])
-        self.connect_now.setEnabled(reachable and not connected)
+        paused = bool(d and d["status"].get("paused"))
+        self.connect_now.setEnabled(reachable and not connected and not paused)
         self.release.setEnabled(reachable and connected)
-        live_ok, why = self.window.can_view(s)
-        if live_ok and d is not None and not any(n != "state" for n in d["streams"]):
-            live_ok, why = False, "It publishes no streams to plot"
+        self.release.setToolTip(RELEASE_TIP)
+        can_pause, why_not = self.window.can_pause(d)
+        self.pause.setEnabled(paused or can_pause)
+        self.pause.setText("Resume" if paused else "Pause")
+        self.pause.setToolTip(RESUME_TIP if paused else why_not or PAUSE_TIP)
+        live_ok, why = self.window.can_view(s, d)
         self.live.setEnabled(reachable and live_ok)
         self.live.setToolTip("Live plots of its streams, in a window of their own" if live_ok else why)
+        for button, primary, icon in ((self.pause, paused, "start" if paused else "pause"),
+                                      (self.live, not paused, "live")):  # what to do now stands out
+            if button.property("kind") != ("primary" if primary else None):
+                button.setProperty("kind", "primary" if primary else None)
+                button.style().unpolish(button)
+                button.style().polish(button)
+            button.setIcon(ui.icon(icon, "on_accent" if primary else None))
+        self.edit_file.setVisible(editable)
+        if editable:
+            self.edit_file.setText(f"Edit in {config.name}...")
 
         preview = s.previews.get(name) if self.window.previews_on else None
         self.preview_box.setVisible(preview is not None)
@@ -1078,8 +1302,10 @@ class DevicePage(_Page):
             self.tasks.horizontalHeader().resizeSection(2, 90)
         for task, t in tasks:
             self._switches[task].set_quietly(t["enabled"])
-            self._switches[task].setToolTip(f"{task} is {'running' if t['enabled'] else 'stopped'}; click to "
-                                            f"{'stop' if t['enabled'] else 'start'} it")
+            self._switches[task].setToolTip(
+                f"{task} is {'on' if t['enabled'] else 'off'}; it does not run while the device is paused" if paused
+                else f"{task} is {'running' if t['enabled'] else 'stopped'}; click to "
+                     f"{'stop' if t['enabled'] else 'start'} it")
         state = s.probe["states"].get(name, {}) if s.probe else {}
         _fill(self.state, [[k, _short(v)] for k, v in state.items()])
         self.props.load(s, name, d)
@@ -1123,7 +1349,8 @@ class AgentsPage(_Page):
         self.header.subtitle.setText(
             "An AI agent such as Claude Code can use the instruments through <code>insthub mcp</code>: list them, "
             "read their documentation, call commands, set properties and take live traces. While it does, it is "
-            "listed among the programs connected to a server, and the tray says when one starts.")
+            "listed among the programs connected to a server, and the tray says when one starts. A device you "
+            "pause stays paused for agents too: they see it, and are told not to resume it.")
         command = mcp_command()
         self.add = ["mcp", "add", "--scope", "user", "insthub", "--", *command]
 
@@ -1251,8 +1478,9 @@ class SettingsPage(_Page):
                                 "answering or a service fails; also when an AI agent starts.", self.notify))
         self.login = ui.Switch(launcher.autostart())
         self.login.toggled.connect(lambda on: launcher.set_autostart(bool(on)))
-        self.login_row = _setting("Start at login, in the tray", "Runs <code>insthub gui --tray</code> when you log "
-                                  "in.", self.login)
+        self.login_row = _setting("Start this window at login, in the tray", "Runs <code>insthub gui --tray</code> "
+                                  "when you log in. Each server has its own Starts at login switch, on its page.",
+                                  self.login)
         box2.addWidget(self.login_row)
         self.menu_add = ui.button("Add", "plus", tip="Add insthub to the applications menu and the desktop",
                                   slot=self._install)
@@ -1381,6 +1609,9 @@ class Sidebar(QtWidgets.QWidget):
         lines = [f"{_count(running, 'server')} · {_count(total, 'device')}"]
         if agents:
             lines.append(f"{_count(agents, 'AI agent')} connected")
+        paused = sum(1 for s in servers if s.probe for d in s.probe["devices"].values() if d["status"].get("paused"))
+        if paused:
+            lines.append(_badge(PAUSED, f"{paused} paused"))
         if broken_devices:
             lines.append(_badge(BAD, f"{broken_devices} not connected"))
         if broken_servers:

@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import insthub
 from insthub import mcp, render, sim
 
 
@@ -97,6 +98,46 @@ def test_list_and_describe(tools):
     assert "no device 'nope'" in failed(tools.describe("nope"))
 
 
+def test_a_paused_device_says_so(tools, server):
+    server.device("synth").bus.pause(by="the experimenter")
+    assert ok(tools.list_devices())["devices"]["synth"]["paused"] is True
+    text = failed(tools.get("synth", "frequency"))
+    assert "synth is paused" in text and "the experimenter" in text and "do not resume it" in text
+    assert "insthub resume" not in text                                   # not the hint meant for people
+    start = time.monotonic()
+    text = failed(tools.snapshot("synth", "sweep", timeout=5))                       # no waiting
+    assert "publishes nothing" in text and text.count("do not resume it") == 1 and ".." not in text
+    assert "insthub resume" not in text
+    assert "publishes nothing" in failed(tools.snapshot("synth", "sweep", fresh=0, timeout=5))  # nothing kept
+    assert time.monotonic() - start < 2
+    server.device("synth").bus.resume()
+    assert "paused" not in ok(tools.list_devices())["devices"]["synth"]
+
+
+def test_a_snapshot_of_a_paused_device(tools, server):
+    scope = server.device("scope")
+    with scope.bus.subscribe("ch1", retained=False) as sub:
+        sub.get(5)                                                       # it has published a frame
+    scope.bus.pause(by="the experimenter")
+    try:
+        frame = ok(tools.snapshot("scope", "ch1", fresh=0))              # the one from before the pause
+        assert frame["paused"] is True and frame["seq"] >= 1
+        assert "paused" not in ok(tools.snapshot("sa", "trace", fresh=0))    # another device: as before
+    finally:
+        scope.bus.resume()
+    assert "paused" not in ok(tools.snapshot("scope", "ch1"))
+
+
+def test_a_pause_during_a_snapshot_says_so(tools, server):
+    synth = server.device("synth")
+    threading.Timer(0.3, lambda: synth.bus.pause(by="the experimenter")).start()
+    try:
+        text = failed(tools.snapshot("synth", "sweep", timeout=1.5))     # nothing published while waiting
+        assert "synth is paused" in text and "the experimenter" in text and "do not resume it" in text
+    finally:
+        synth.bus.resume()
+
+
 def test_get_set_call(tools):
     assert tools.set("synth", "frequency", 2500).text == "ok"
     assert ok(tools.get("synth", "frequency")) == 2500.0
@@ -110,6 +151,83 @@ def test_get_set_call(tools):
     assert "unknown tool" in failed(tools.run("rm", {}))
     assert ok(tools.call("scope", "$release"))["connected"] is False
     assert ok(tools.call("scope", "$open"))["connected"] is True
+
+
+class Laser(insthub.Device):
+    """A laser: firing it, or raising its power, is dangerous."""
+
+    def open(self):
+        self.fired, self._power = 0, 1.0
+
+    @insthub.prop(unit="mW", max=50, dangerous=True)
+    def power(self) -> float:
+        return self._power
+
+    @power.setter
+    def power(self, mw):
+        self._power = mw
+
+    @insthub.command(dangerous=True, params={"ms": {"unit": "ms"}})
+    def fire(self, ms=10):
+        self.fired += 1
+        return ms
+
+    @insthub.command
+    def status_word(self):
+        return "ok"
+
+
+def test_what_is_dangerous_needs_its_own_tool(tools):
+    with insthub.Server("l", [Laser("laser")]) as server:
+        laser = server.devices["laser"]
+        d = ok(tools.describe("laser"))
+        assert d["commands"]["fire"] == {"signature": "(ms=10)", "params": {"ms": {"unit": "ms"}}, "dangerous": True}
+        assert d["properties"]["power"] == {"meta": {"unit": "mW", "max": 50}, "dangerous": True}
+        assert ok(tools.call("laser", "status_word")) == "ok" and ok(tools.get("laser", "power")) == 1.0
+        for refused in (tools.call("laser", "fire", [5]), tools.set("laser", "power", 40),
+                        tools.call("laser", "$set", ["power", 40])):
+            text = failed(refused)
+            assert text.startswith("PermissionError: laser: ") and "is marked dangerous" in text
+            assert "call_dangerous('laser', " in text
+        assert "$set\", ['power', value]" in failed(tools.set("laser", "power", 40))
+        assert laser.fired == 0 and laser.power == 1.0                      # nothing ran
+        assert ok(tools.call_dangerous("laser", "fire", kwargs={"ms": 5})) == 5 and laser.fired == 1
+        assert ok(tools.call_dangerous("laser", "$set", ["power", 40])) is None and laser.power == 40
+        assert ok(tools.call("laser", "$release"))["connected"] is False       # managing the session is not
+
+
+class Shutter:
+    """A driver whose output is an accessor pair: get_output() and set_output(on)."""
+
+    def __init__(self):
+        self.on = False
+
+    def get_output(self):
+        return self.on
+
+    def set_output(self, on):
+        self.on = on
+
+
+def test_either_half_of_a_dangerous_accessor_pair_needs_its_own_tool(tools):
+    for i, marked in enumerate(("set_output", "output")):  # the command and the property write one setting
+        shutter = insthub.wrap(Shutter, "shutter", accessors=True, dangerous=[marked])
+        with insthub.Server(f"s{i}", [shutter]):
+            for refused in (tools.set("shutter", "output", True), tools.call("shutter", "set_output", [True]),
+                            tools.call("shutter", "$set", ["output", True])):
+                assert "is marked dangerous" in failed(refused), marked
+            assert shutter.target.on is False and ok(tools.call("shutter", "get_output")) is False  # reading is not
+            assert ok(tools.call_dangerous("shutter", "set_output", [True])) is None and shutter.target.on is True
+
+
+def test_tools_say_what_a_device_is(tools):
+    listing = ok(tools.list_devices())["devices"]
+    assert listing["synth"]["simulated"] is True and listing["synth"]["extension"] == "insthub-sim"
+    d = ok(tools.describe("synth"))
+    assert d["simulated"] is True and d["properties"]["frequency"]["meta"] == {"unit": "MHz", "min": 10, "max": 24000}
+    assert ok(tools.describe("scope"))["commands"]["measure"]["params"]["item"] == {"choices": ["VPP", "VRMS", "FREQ"]}
+    dangerous = next(t for t in mcp.TOOLS if t["name"] == "call_dangerous")
+    assert dangerous["annotations"]["destructiveHint"] is True and "dangerous" in mcp.INSTRUCTIONS
 
 
 def test_call_timeout_does_not_block_other_devices(tools):
@@ -205,7 +323,7 @@ def test_stdio_protocol(spawned, tmp_path):
         agent.send(method="notifications/initialized")
         agent.send(id=2, method="tools/list")
         names = [t["name"] for t in agent.receive()["result"]["tools"]]
-        assert names == ["list_devices", "describe", "get", "set", "call", "snapshot"]
+        assert names == ["list_devices", "describe", "get", "set", "call", "snapshot", "call_dangerous"]
         agent.send(id=3, method="tools/call", params={"name": "call", "arguments": {
             "device": "loopback", "command": "sleep", "args": [0.5]}})
         agent.send(id=4, method="tools/call", params={"name": "get", "arguments": {
@@ -228,3 +346,25 @@ def test_stdio_protocol(spawned, tmp_path):
         assert "sim.py" in text
     finally:
         assert agent.close() == 0
+
+
+def test_an_agent_that_paused_a_device_is_not_told_a_person_did(tools, server):
+    ok(tools.call("synth", "$pause"))
+    try:
+        assert server.device("synth").bus.status()["paused"]["by"] == "an AI agent (insthub mcp)"
+        text = failed(tools.get("synth", "frequency"))
+        assert "by an AI agent" in text and "A person paused it" not in text and "$resume" in text
+    finally:
+        ok(tools.call("synth", "$resume"))
+
+
+def test_an_agents_pause_behind_a_long_command_is_not_reported_as_failed(server, tmp_path):
+    tools = ThroughRun(mcp.Tools(render.Renderer(tmp_path / "data"), timeout=10))
+    slow = server.device("loopback").sleep.future(2.0)
+    time.sleep(0.1)
+    try:
+        reply = ok(tools.call("loopback", "$pause", timeout=0.5))
+        assert reply["paused"] and "refuses every call already" in reply["note"] and "sleep" in reply["note"]
+    finally:
+        slow.result(5)
+        server.device("loopback").bus.resume()

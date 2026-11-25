@@ -10,14 +10,21 @@ After connecting, each side sends the 8-byte `MAGIC`.  Then every message is
 `tag` is the request id for CALL / REPLY / ERROR (0 = no reply wanted) and the
 subscription id for DATA.
 
-    HELLO  server -> client   body: {"server", "pid", "devices", "protocol"}
+    HELLO  server -> client   body: {"server", "pid", "devices", "protocol", "version", "features"}
     CALL   client -> server   body: [device, command, args, kwargs]
     REPLY  server -> client   body: the return value
     ERROR  server -> client   body: [class names, message, traceback]
     DATA   server -> client   body: [seq, time, data, meta]
+
+A side skips a message of a type it does not know instead of closing the
+connection (its header says how long it is), so a newer insthub can add a kind
+of message without breaking an older one.  A new kind comes with a name in the
+hello's "features" (server.FEATURES), so that a client knows whether it may
+send it.
 """
 from __future__ import annotations
 
+import logging
 import socket
 import struct
 
@@ -26,6 +33,11 @@ import numpy as np
 MAGIC = b"INSTHUB1"
 PROTOCOL = 1
 HELLO, CALL, REPLY, ERROR, DATA = 1, 2, 3, 4, 5
+#: The types each side reads; a FrameReader given one of these skips any other.
+TO_SERVER = frozenset({CALL})
+TO_CLIENT = frozenset({HELLO, REPLY, ERROR, DATA})
+
+_log = logging.getLogger("insthub")
 
 _PREFIX = struct.Struct("<IHBBQ")
 _PREFIX_SIZE = _PREFIX.size
@@ -106,10 +118,13 @@ class FrameReader:
 
     Small messages are parsed out of one receive buffer (usually one syscall per
     message, or one for a whole burst).  Large buffers are received directly
-    into the uninitialized numpy array they will be decoded as."""
+    into the uninitialized numpy array they will be decoded as.  Given the set of
+    message types this side knows, it skips any other (see the module docstring)."""
 
-    def __init__(self, sock: socket.socket, bufsize: int = 1 << 16):
+    def __init__(self, sock: socket.socket, types: frozenset | None = None, bufsize: int = 1 << 16):
         self._sock = sock
+        self._types = types  #: the message types `read()` returns (None: all); others are skipped
+        self._skipped: set[int] = set()
         self._size = bufsize
         self._buf = bytearray(bufsize)
         self._mv = memoryview(self._buf)
@@ -160,6 +175,16 @@ class FrameReader:
     def read(self):
         """Next message as `(type, tag, body, buffers)`.  `body` may be a view
         into the receive buffer: decode it before reading again."""
+        while True:
+            message = self._read_one()
+            if self._types is None or message[0] in self._types:
+                return message
+            if message[0] not in self._skipped:  # logged once per type and connection
+                self._skipped.add(message[0])
+                _log.debug("skipping messages of type %d, which this insthub does not know (the other side "
+                           "runs a newer one)", message[0])
+
+    def _read_one(self):
         self._need(_PREFIX_SIZE)
         blen, nbuf, mtype, _flags, tag = _PREFIX.unpack_from(self._buf, self._r)
         self._r += _PREFIX_SIZE

@@ -5,15 +5,27 @@ templates for real drivers.  `insthub sim` serves all three.
     SimSynth     signal generator with properties
     SimCamera    a moving Gaussian spot; frames on stream "image"
     SimAnalyzer  spectrum analyzer cabled to the SimSynth: shows its tone while its output is on
+
+They describe themselves as real drivers should: units and limits of their
+properties and command parameters, choices, a value read periodically (`poll`),
+and that they are simulated, so that clients mark them SIM.
 """
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
 from .device import Device, command, periodic, prop
+
+
+class _Simulated(Device):
+    """What every simulated instrument says about itself."""
+
+    extension = "insthub-sim"  # its manifest is insthub's own (see docs/design.md#extensions)
+    simulated = True
 
 
 @dataclass
@@ -30,7 +42,7 @@ class Waveform:
         return self.t0 + self.dt * np.arange(len(self.volts))
 
 
-class SimScope(Device):
+class SimScope(_Simulated):
     """Two-channel oscilloscope looking at a sine of adjustable frequency."""
 
     streams = {"ch1": "live trace of channel 1 (V); meta: t0, dt", "ch2": "live trace of channel 2 (V)"}
@@ -64,7 +76,7 @@ class SimScope(Device):
         """Instrument identification string."""
         return "insthub,SimScope,0001,1.0"
 
-    @command
+    @command(params={"seconds_per_div": {"unit": "s/div", "min": 1e-9, "max": 10}})
     def set_timebase(self, seconds_per_div: float) -> float:
         """Horizontal scale in s/div.  Returns the value in effect."""
         if not 1e-9 <= seconds_per_div <= 10:
@@ -73,7 +85,7 @@ class SimScope(Device):
         self.set_state(timebase=self._timebase)
         return self._timebase
 
-    @command
+    @command(params={"hz": {"unit": "Hz", "min": 0}, "noise": {"unit": "V", "min": 0}})
     def set_signal(self, hz: float, noise: float | None = None) -> None:
         """Frequency (and optionally noise amplitude) of the simulated input."""
         self._signal_hz = float(hz)
@@ -81,15 +93,15 @@ class SimScope(Device):
             self._noise = float(noise)
         self.set_state(signal_hz=self._signal_hz)
 
-    @command
+    @command(params={"channel": {"choices": [1, 2]}})
     def get_waveform(self, channel: int = 1) -> Waveform:
         """Capture one trace now."""
         if channel not in (1, 2):
             raise ValueError(f"channel must be 1 or 2, got {channel!r}")
         return self._capture(channel)
 
-    @command
-    def measure(self, item: str = "VPP", channel: int = 1) -> float:
+    @command(params={"channel": {"choices": [1, 2]}})  # item: its choices come from the annotation
+    def measure(self, item: Literal["VPP", "VRMS", "FREQ"] = "VPP", channel: int = 1) -> float:
         """A scalar measurement: VPP, VRMS or FREQ."""
         wf = self._capture(channel)
         item = item.upper()
@@ -101,7 +113,7 @@ class SimScope(Device):
             return self._signal_hz
         raise ValueError(f"unknown measurement {item!r}")
 
-    @command
+    @command(params={"interval": {"unit": "s", "min": 0}})
     def live(self, on: bool = True, interval: float | None = None) -> None:
         """Switch the continuous acquisition (streams "ch1", "ch2") on or off."""
         task = self.tasks["_acquire"]
@@ -119,7 +131,7 @@ class SimScope(Device):
                 self.publish(f"ch{channel}", wf.volts, t0=wf.t0, dt=wf.dt, unit="V")
 
 
-class SimSynth(Device):
+class SimSynth(_Simulated):
     """Signal generator: frequency and power are properties, like a local driver.
     Its output is cabled to the simulated spectrum analyzer."""
 
@@ -128,6 +140,7 @@ class SimSynth(Device):
 
     def __init__(self, name: str = "synth"):
         super().__init__(name)
+        self.poll = {"temperature": 1.0}  # read every second, and published on the stream "temperature"
 
     def open(self) -> None:
         self._freq, self._power, self._rf = 1000.0, 0.0, False
@@ -136,7 +149,7 @@ class SimSynth(Device):
     def _publish_state(self) -> None:
         self.set_state(frequency_MHz=self._freq, power_dBm=self._power, rf=self._rf)
 
-    @prop
+    @prop(unit="MHz", min=FREQ_RANGE_MHZ[0], max=FREQ_RANGE_MHZ[1])
     def frequency(self) -> float:
         """Output frequency in MHz."""
         return self._freq
@@ -149,7 +162,7 @@ class SimSynth(Device):
         self._freq = float(mhz)
         self._publish_state()
 
-    @prop
+    @prop(unit="dBm", step=0.5)
     def power(self) -> float:
         """Output power in dBm."""
         return self._power
@@ -171,7 +184,8 @@ class SimSynth(Device):
         self._publish_state()
         return self._rf
 
-    @command
+    @command(params={"start_mhz": {"unit": "MHz"}, "stop_mhz": {"unit": "MHz"}, "steps": {"min": 1},
+                     "dwell": {"unit": "s", "min": 0}})
     def sweep(self, start_mhz: float, stop_mhz: float, steps: int, dwell: float = 0.0) -> int:
         """Step the frequency from start to stop; publishes each point on "sweep"."""
         for i, f in enumerate(np.linspace(start_mhz, stop_mhz, int(steps))):
@@ -184,10 +198,10 @@ class SimSynth(Device):
     @command(concurrent=True)
     def temperature(self) -> float:
         """Internal temperature in C (cached: answers even while a sweep runs)."""
-        return 42.0
+        return round(42.0 + 0.4 * float(np.sin(time.time() / 20)), 2)  # it drifts a little
 
 
-class SimCamera(Device):
+class SimCamera(_Simulated):
     """Camera looking at a slowly circling Gaussian spot."""
 
     streams = {"image": "live frames, uint16; meta: exposure_us"}
@@ -214,7 +228,7 @@ class SimCamera(Device):
         img = 3000.0 * (self._exposure / 1000.0) * spot + self._rng.normal(100, 5, self.shape)
         return np.clip(img, 0, 4095).astype(np.uint16)
 
-    @prop
+    @prop(unit="us", min=1, step=100)
     def exposure(self) -> float:
         """Exposure time in microseconds."""
         return self._exposure
@@ -252,7 +266,7 @@ class Spectrum:
         return self.x0 + self.dx * np.arange(len(self.dbm))
 
 
-class SimAnalyzer(Device):
+class SimAnalyzer(_Simulated):
     """Spectrum analyzer.  Its input is cabled to the simulated synth through a
     20 dB attenuator, so it shows the synth's tone (and a second harmonic
     35 dB below it) while the synth's output is on."""
@@ -275,7 +289,7 @@ class SimAnalyzer(Device):
     def _publish_state(self) -> None:
         self.set_state(center_Hz=self._center, span_Hz=self._span, rbw_Hz=self._rbw)
 
-    @prop
+    @prop(unit="Hz", min=0, max=MAX_HZ)
     def center(self) -> float:
         """Center frequency in Hz."""
         return self._center
@@ -287,7 +301,7 @@ class SimAnalyzer(Device):
         self._center = float(hz)
         self._publish_state()
 
-    @prop
+    @prop(unit="Hz", min=100, max=MAX_HZ)
     def span(self) -> float:
         """Frequency span in Hz."""
         return self._span
@@ -299,7 +313,7 @@ class SimAnalyzer(Device):
         self._span = float(hz)
         self._publish_state()
 
-    @prop
+    @prop(unit="Hz", min=10, max=10e6)
     def rbw(self) -> float:
         """Resolution bandwidth in Hz (10 Hz to 10 MHz).  The noise floor is -90 dBm at 100 kHz."""
         return self._rbw
@@ -351,7 +365,7 @@ def devices() -> list[Device]:
     return [SimScope(), synth, SimCamera(), SimAnalyzer(source=synth)]
 
 
-class Loopback(Device):
+class Loopback(_Simulated):
     """Echoes, sleeps, fails and floods on demand: for tests and `insthub bench`."""
 
     reconnect_interval = 0.0
