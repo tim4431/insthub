@@ -309,24 +309,59 @@ device's state.
 
 ### The manager window
 
-`insthub gui` opens a window that shows every server on this computer, the
-installed services that are not running, and the servers of other computers
-listed in `devices.toml`. Under each server are its devices, each with a
-status dot: connected, busy, released, or not connected and why.
+`insthub gui` opens a window with four pages, in its sidebar: **Devices**,
+**Servers**, **AI agents** and **Settings**. The sidebar also counts the
+devices and servers, and marks the ones that are broken.
 
-Select a device to see whether its instrument is connected and since when,
-what it is doing, its streams and how fast they arrive, its periodic tasks
-(with a switch each), its state, its commands, and which programs are watching
-it. Its buttons open the instrument session now (**Connect now**), close it for
+**Devices** shows every device as a tile, in a section per server: the
+servers on this computer, the installed services that are not running, and
+the servers of other computers listed in `devices.toml`. A tile says whether
+its instrument is connected (connected, busy, released, or not connected and
+why). It shows a small live preview of what the device publishes: a trace, an
+image or a number. A device that publishes nothing shows the figures of its
+state instead. The preview is the stream's last frame, fetched once a second,
+so it never makes an instrument acquire: a scope that only reads out while
+somebody watches stays idle until something does. The search box filters by
+device, class or server.
+
+Click a tile to see whether its instrument is connected and since when, what
+it is doing, and which programs are watching it. Its tabs show:
+
+- **Settings**: its properties, read from the instrument when the page opens.
+  A settable one is changed in place (a switch for one that is on or off).
+- **Streams**: how fast each one arrives.
+- **Periodic tasks**: a switch each.
+- **State**: what the device published as its state.
+- **Commands**: run one with arguments typed as on the command line
+  (`VPP channel=2`, `[1, 2]`), and see what it returned.
+
+Its buttons open the instrument session now (**Connect now**), close it for
 other software (**Release**), or open its live plots (**Live view**).
 
-Select a server to see its process, its addresses, its service and the
-programs connected to it. A service can be started, stopped, restarted and
-removed there, and its log read. A server started by hand can be stopped.
-**Add service...** keeps a new server running in the background.
-**AI agents...** lets an AI agent such as Claude Code use the instruments (see
+**Servers** shows a card per server. Open one to see its process, its
+addresses, its service, its config file, its devices and the programs
+connected to it. A service can be started, stopped, restarted and removed
+there, and its log read. A server started by hand can be stopped.
+
+**Add** (on the Devices and Servers pages) sets things up without editing
+files by hand:
+
+- **New server...** builds the config of a new server. You choose its devices:
+  a driver for each (`module:Class`, or a `.py` file to pick a class from) and
+  the arguments of its constructor. Those arguments are read from the driver's
+  source without running it, with their defaults shown. It writes `NAME.toml`
+  (in `~/.config/insthub/servers` unless you choose another folder) and starts
+  the server as a background service, or once, or not at all.
+- **Keep a server running...** installs an existing `.toml` or `.py` server as
+  a service.
+- **Devices on another computer...** asks a server there which devices it has
+  and lists them in `devices.toml`.
+- **Simulated instruments** starts `insthub sim`.
+
+**AI agents** lets an AI agent such as Claude Code use the instruments (see
 [agents](agents.md)); a connected agent is listed as "AI agent (Claude Code)"
-and counted in the toolbar.
+and counted in the sidebar. **Settings** chooses a light or dark look (or the
+desktop's), turns the previews off, and shows the files insthub uses.
 
 The window is an ordinary client: it needs only Qt, never waits for a server,
 and can be closed and reopened at any time without affecting anything.

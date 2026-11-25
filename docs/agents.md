@@ -28,7 +28,7 @@ Install insthub as a command of your own, then register it with the agent
 once. For Claude Code:
 
 ```bash
-uv tool install --editable "/path/to/insthub[mcp]"      # add gui for the manager window: [gui,mcp]
+uv tool install --editable "/path/to/insthub[gui,mcp]"  # gui: the manager window too (needs Qt)
 claude mcp add --scope user insthub -- insthub mcp
 ```
 
@@ -66,9 +66,9 @@ claude mcp add --scope user insthub -- insthub mcp
 Other MCP clients (Claude Desktop, other agents) take the same command and
 arguments in their own configuration.
 
-The manager window does the same with a click: in `insthub gui`, **AI
-agents...** shows the command and the JSON for this installation, with the full
-path filled in, and sets it up for Claude Code (or removes it again).
+The manager window does the same with a click: in `insthub gui`, the **AI
+agents** page shows the command and the JSON for this installation, with the
+full path filled in, and sets it up for Claude Code (or removes it again).
 
 Options of `insthub mcp`:
 
@@ -82,7 +82,7 @@ Options of `insthub mcp`:
 An agent's `insthub mcp` is an ordinary client, so `insthub gui` shows it like
 any other program, named after the agent that started it: "AI agent (Claude
 Code)" among the programs connected to a server, and among the watchers of the
-streams it takes snapshots of. The toolbar counts the agents connected, the
+streams it takes snapshots of. The sidebar counts the agents connected, the
 tray menu lists them, and the tray announces each new one ("An AI agent is
 using the instruments"). This is how to notice that an agent is acting on
 real hardware while you are doing something else.

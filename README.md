@@ -32,10 +32,13 @@ What you get:
   with one line of Python or four lines of config.
 - **Nothing else to run.** There is no central service. Each server stands
   alone, and insthub knows nothing about any particular instrument.
-- **A window to keep an eye on it all.** `insthub gui` shows every server and
-  device, whether each instrument is connected and which programs are using
-  it, with buttons to reconnect, release, restart and read logs. Closed, it
-  keeps watching from the tray and tells you when something breaks.
+- **A window to keep an eye on it all.** `insthub gui` shows every device as
+  a tile: whether its instrument is connected, a small live preview of what it
+  publishes, and which programs are using it. A device's page reads and sets
+  its properties and runs its commands; a server's page starts, stops and
+  restarts it and shows its log. **Add** sets up a new server without writing
+  its config by hand. Closed, it keeps watching from the tray and tells you
+  when something breaks.
 
 It needs Python 3.11 or later, `numpy` and `msgpack`. Live plotting also needs
 `pyqtgraph` and a Qt binding.
@@ -75,9 +78,9 @@ claude mcp add --scope user insthub -- insthub mcp     # with insthub installed 
 
 Claude Code (or any agent that speaks MCP) can then list the instruments,
 read their documentation from your docstrings, call commands, set properties
-and take live traces, with large arrays handed over as files. **AI agents...**
-in `insthub gui` does the setup with a click and shows which agents are
-connected. See [using insthub from AI agents](docs/agents.md).
+and take live traces, with large arrays handed over as files. The **AI
+agents** page of `insthub gui` does the setup with a click and shows which
+agents are connected. See [using insthub from AI agents](docs/agents.md).
 
 ## The smallest example
 
@@ -126,9 +129,9 @@ for frame in thermo.subscribe("temperature"):
 
 ## Status
 
-- 203 tests cover calls, streams, device lifecycle, finding servers,
-  reconnecting, the command line, services, the GUIs and the agent interface.
-  Run them with `python -m pytest tests` (about 17 s).
+- 221 tests cover calls, streams, device lifecycle, finding servers,
+  reconnecting, the command line, config files, services, the GUIs and the
+  agent interface. Run them with `python -m pytest tests` (about 30 s).
 - Developed and tested on Linux with Python 3.11, 3.12 and 3.14. Written to
   run on Windows, but never run there.
 - Not included: passwords or encryption for network connections, clients for
@@ -154,8 +157,10 @@ insthub/
   qt.py         helpers for Qt GUIs             viewer.py   the generic live viewer
   mcp.py        insthub mcp: the bus for AI agents
   render.py     results as JSON plus files and plots, for agents
-  manager.py    insthub gui: the manager window and its tray icon
-  launcher.py   the launcher icon of insthub gui
+  manager.py    insthub gui: the window (refreshing, navigation, actions), the tray icon
+  pages.py      what each page of it shows      forms.py    its dialogs that set things up
+  inventory.py  what it knows of servers and devices, and how it asks them (no Qt)
+  widgets.py    its look: colours, icons, tiles  launcher.py its launcher icon
   sim.py        simulated instruments           bench.py    insthub bench
   cli.py        the insthub command
 docs/           the pages above

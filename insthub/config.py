@@ -16,11 +16,16 @@ arguments), `include` / `exclude` (method names), `attrs` (instance attributes
 to expose), `close` (name of the close method), `link_errors` (exception
 classes as "module:Class" that mean the connection broke), and for all
 devices `reconnect_interval`.
+
+`dump()` writes such a file (the manager window's "New server" does).
 """
 from __future__ import annotations
 
 import importlib
 import inspect
+import json
+import math
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -104,3 +109,40 @@ def load(path: str | Path) -> tuple[dict, list[Device]]:
         raise ValueError(f"unknown keys in [server]: {sorted(unknown)}")
     devices = [build_device(name, spec) for name, spec in config.get("devices", {}).items()]
     return server, devices
+
+
+def _toml_key(key: str) -> str:
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else _toml_value(key)
+
+
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "nan"
+        return ("inf" if value > 0 else "-inf") if math.isinf(value) else repr(value)
+    if isinstance(value, str):  # a JSON string is a TOML basic string, but for DEL, which TOML wants escaped
+        return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{_toml_key(str(k))} = {_toml_value(v)}" for k, v in value.items()) + " }" \
+            if value else "{}"
+    raise ValueError(f"{value!r} cannot be written to a config file (TOML has no {type(value).__name__})")
+
+
+def dump(server: dict, devices: dict[str, dict], comment: str = "") -> str:
+    """The text of a config file that `load` reads back as `server` (the [server]
+    table) and `devices` (name -> its keys).  Values: strings, numbers, booleans,
+    and lists and dicts of them.  `comment` goes on top, as # lines."""
+    lines = [f"# {line}".rstrip() for line in comment.splitlines()]
+    lines += [""] if lines else []
+    lines.append("[server]")
+    lines += [f"{_toml_key(k)} = {_toml_value(v)}" for k, v in server.items()]
+    for name, spec in devices.items():
+        lines += ["", f"[devices.{_toml_key(name)}]"]
+        lines += [f"{_toml_key(k)} = {_toml_value(v)}" for k, v in spec.items()]
+    return "\n".join(lines) + "\n"

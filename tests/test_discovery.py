@@ -75,6 +75,26 @@ def test_static_table_for_other_machines(server, tmp_path):
     assert insthub.locate("far") == server.addresses[1]
 
 
+def test_static_table_is_edited_in_place():
+    path = registry.devices_file()
+    path.write_text('# mine\n[devices]\nawg = "tcp://h:1"  # the awg\n\n# the rest\n[other]\nx = 1\n')
+    registry.edit_static_devices({"psu": "tcp://h:3", "awg": "tcp://h:2", "a.b": "tcp://h:4"})
+    assert path.read_text() == ('# mine\n[devices]\nawg = "tcp://h:2"  # the awg\npsu = "tcp://h:3"\n'
+                                '"a.b" = "tcp://h:4"\n\n# the rest\n[other]\nx = 1\n')
+    assert registry.static_devices() == {"awg": "tcp://h:2", "psu": "tcp://h:3", "a.b": "tcp://h:4"}
+    registry.edit_static_devices(remove=["awg", "a.b"])
+    assert registry.static_devices() == {"psu": "tcp://h:3"} and "# the awg" not in path.read_text()
+    path.unlink()
+    registry.edit_static_devices({"far": "tcp://h:5"})                     # no file yet: one is written
+    assert registry.static_devices() == {"far": "tcp://h:5"} and path.read_text().startswith("#")
+    path.write_text('devices = { awg = "tcp://h:1" }\n')                  # a form it cannot edit: left alone
+    with pytest.raises(ValueError, match="edit it by hand"):
+        registry.edit_static_devices({"psu": "tcp://h:3"})
+    assert path.read_text() == 'devices = { awg = "tcp://h:1" }\n'
+    with pytest.raises(ValueError, match="tcp://host:port"):
+        registry.edit_static_devices({"psu": "h:3"})
+
+
 def test_calls_fail_cleanly_when_the_server_dies_and_work_again_after_restart(spawned):
     spawned.start()
     lb = insthub.device("loopback")
