@@ -2,8 +2,10 @@
 
 This page explains what happens inside insthub: the pieces, what happens during
 a call, what happens when a device publishes data, how programs find each
-other, and what happens when something breaks. It assumes you write Python and
-know your instruments; it does not assume any networking background.
+other, what happens when something breaks, and how the manager window is
+built. It assumes you write Python and know your instruments; it does not
+assume any networking background. The diagrams are Mermaid, drawn from their
+text by GitHub and most Markdown viewers.
 
 For how to *use* insthub, read the [guide](guide.md). For how to keep servers
 running, read [running servers](running-servers.md).
@@ -43,20 +45,23 @@ holds the connection, and everything else asks that program.
 
 ## The whole picture
 
-```
-   CLIENT PROGRAMS                         ONE SERVER PROGRAM                     INSTRUMENTS
-
- ┌────────────────────┐                 ┌───────────────────────────────┐
- │ experiment.py      │   connection    │  device "scope"               │
- │                    │ ──────────────▶ │    waiting line: [measure]    │
- │  scope.measure()   │ ◀────────────── │    its own thread ────────────┼──▶ oscilloscope (LAN)
- │  synth.frequency=… │                 │                               │
- └────────────────────┘                 │  device "synth"               │
-                                        │    waiting line: [set freq]   │
- ┌────────────────────┐   connection    │    its own thread ────────────┼──▶ generator (USB)
- │ live plot window   │ ◀────────────── │                               │
- │  shows "ch1"       │  stream frames  └───────────────────────────────┘
- └────────────────────┘
+```mermaid
+flowchart LR
+    subgraph clients["Client programs"]
+        exp["experiment.py<br/>scope.measure()<br/>synth.frequency = 2500"]
+        plot["live plot window<br/>shows ch1"]
+    end
+    subgraph server["One server program"]
+        scope["device <b>scope</b><br/>its waiting line: measure<br/>its own thread"]
+        synth["device <b>synth</b><br/>its waiting line: set frequency<br/>its own thread"]
+    end
+    osc(["oscilloscope<br/>(LAN)"])
+    gen(["signal generator<br/>(USB)"])
+    exp <-->|"requests and replies,<br/>one connection"| scope
+    exp <--> synth
+    scope -->|"frames of ch1"| plot
+    scope --> osc
+    synth --> gen
 ```
 
 Three rules explain most of the design:
@@ -74,23 +79,29 @@ Three rules explain most of the design:
 Take `vpp = scope.measure("VPP")` in an experiment script, with the server in
 another program on the same PC.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as experiment.py<br/>the proxy
+    participant C as experiment.py<br/>reader thread
+    participant R as server<br/>reader thread
+    participant D as server<br/>scope's thread
+    P->>R: request 57: scope.measure("VPP")
+    Note left of P: goes to sleep
+    R->>D: at the end of the scope's waiting line
+    D->>D: connects if needed, then runs your measure("VPP")
+    D-->>C: request 57: result 0.812
+    C-->>P: wakes the caller with 0.812
 ```
-  experiment.py                    connection                     server program
-  ─────────────                    ──────────                     ──────────────
-  1. The proxy packs the request,
-     numbers it #57, sends it      ── #57 scope.measure("VPP") ─▶
-     and goes to sleep.                                           2. A reader thread unpacks it and puts it
-                                                                     at the end of the scope's waiting line.
 
-                                                                  3. The scope's thread takes it, makes sure
-                                                                     the instrument is connected, and runs
-                                                                     your method measure("VPP").
-
-                                   ◀─ #57 result 0.812 ──────────  4. The result is sent back.
-  5. A reader thread sees #57,
-     finds who is waiting for it
-     and wakes them with 0.812.
-```
+1. The proxy packs the request, numbers it 57, sends it and goes to sleep.
+2. A reader thread of the server unpacks it and puts it at the end of the
+   scope's waiting line.
+3. The scope's thread takes it, makes sure the instrument is connected, and
+   runs your method `measure("VPP")`.
+4. The result is sent back, numbered 57 like the request.
+5. A reader thread of the script sees 57, finds who is waiting for it and
+   wakes them with 0.812.
 
 Steps 1, 2, 4 and 5 are insthub and take about 12 microseconds together. Step 3
 is your instrument and takes however long it takes.
@@ -120,30 +131,30 @@ asked. A device publishes with one line:
 self.publish("ch1", trace, dt=1e-6)      # inside the device, e.g. in a periodic task
 ```
 
-```
-  server program                                              client programs
-  ──────────────                                              ───────────────
-  1. The frame gets a running number and a timestamp,
-     and is remembered as the stream's latest frame.
-
-  2. For every subscriber of "ch1":                           3. A reader thread puts the frame into the
-       send the frame on that subscriber's connection.           subscription's mailbox.
-       If that client cannot take it right now, the
-       frame waits in a one-place mailbox, and a newer        4. Your code picks it up:
-       frame replaces it.                                          sub.get()   wait for the next one
-                                                                   sub.poll()  take it if there is one
-                                                                   callback    called for each frame
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as server<br/>device thread
+    participant S as server<br/>stream ch1
+    participant M as client<br/>subscription mailbox
+    participant Y as client<br/>your code
+    D->>S: publish(trace): numbered, timestamped, kept as the latest frame
+    loop for every subscriber
+        S-)M: the frame, on that subscriber's connection
+    end
+    Note over S,M: a client that cannot take it now gets it later,<br/>from a one-place mailbox where a newer frame replaces it
+    Y->>M: sub.get() waits for the next, sub.poll() takes one if there is one, or a callback is called
 ```
 
 The important behaviour is what happens to a reader that is slower than the
 publisher:
 
-```
-  device publishes     #1  #2  #3  #4  #5  #6  #7  #8        20 per second
-  fast reader gets     #1  #2  #3  #4  #5  #6  #7  #8
-  slow reader gets     #1          #4          #7            always the newest; sub.dropped counts the rest
-  reader with a queue  #1  #2  #3  #4  #5  #6  #7  #8        later, but all of them, in order
-```
+| | the frames, by number | |
+|---|---|---|
+| the device publishes, 20 per second | 1 2 3 4 5 6 7 8 | |
+| a fast reader gets | 1 2 3 4 5 6 7 8 | |
+| a slow reader gets | 1 · · 4 · · 7 · | always the newest; `sub.dropped` counts the rest |
+| a reader with a queue gets | 1 2 3 4 5 6 7 8 | later, but all of them, in order |
 
 By default a subscription holds one frame, the newest. That is what a live
 display wants: the present, not a growing backlog. A recorder that must not
@@ -207,9 +218,10 @@ A server can run inside the program that uses it, for example a GUI that both
 owns the instrument and displays it. Then there is no connection and nothing is
 packed or copied:
 
-```
-  GUI thread ── proxy ──▶ device's waiting line ──▶ device thread ──▶ instrument
-  GUI thread ◀── the very array object the device published
+```mermaid
+flowchart LR
+    gui["GUI thread"] -->|proxy| line["the device's<br/>waiting line"] --> dev["device thread"] --> inst(["instrument"])
+    dev -.->|"the very array object it published"| gui
 ```
 
 You get the same array the device made, not a copy. Treat it as read-only.
@@ -266,12 +278,9 @@ Two promises are worth spelling out:
 
 Every message has three parts:
 
-```
-  ┌────────────────┬──────────────────────────┬─────────────────────────────┐
-  │ 16-byte header │ small packed description │ raw array memory, if any    │
-  │ kind, number   │ names, numbers, text     │ exactly the bytes of numpy  │
-  └────────────────┴──────────────────────────┴─────────────────────────────┘
-```
+| 16-byte header | small packed description | raw array memory, if any |
+|---|---|---|
+| kind of message, its number | names, numbers, text | exactly the bytes of the numpy arrays |
 
 The middle part is [MessagePack](https://msgpack.org), a compact binary cousin
 of JSON. Arrays larger than about 2 kB are not put into it. They are sent
@@ -301,6 +310,62 @@ Except in the first column, the server is a separate program.
 An instrument answers in milliseconds, so for a single command the bus is not
 what you wait for. Its speed matters for large data, for many small calls, and
 for streams.
+
+## Inside the manager window
+
+`insthub gui` is an ordinary client: it talks to the servers the way a script
+does, so closing it (or it crashing) changes nothing for them. It is built in
+four layers, each knowing only the ones below it (an arrow means "uses"):
+
+```mermaid
+flowchart TB
+    manager["<b>manager.py</b><br/>the window: refresh loop, navigation, actions, tray icon, main()"]
+    pages["<b>pages.py</b><br/>what each page shows"]
+    forms["<b>forms.py</b><br/>the dialogs that set things up"]
+    inventory["<b>inventory.py</b><br/>what is known of servers and devices,<br/>and how it is asked (no Qt)"]
+    widgets["<b>widgets.py</b><br/>colours, icons, tiles<br/>(knows nothing of insthub)"]
+    manager --> pages
+    manager --> forms
+    manager --> inventory
+    pages --> inventory
+    pages --> widgets
+    forms --> widgets
+    manager --> widgets
+```
+
+Its GUI thread never waits for a server. Once a second (every 3 s while only
+the tray icon is watching) it asks its worker threads to look again, and draws
+what comes back:
+
+```mermaid
+sequenceDiagram
+    participant G as GUI thread<br/>manager.py
+    participant W as worker threads<br/>inventory.Backend
+    participant S as servers
+    G->>W: scan(), every second
+    W->>W: the registry folder, devices.toml, systemd services
+    W-->>G: the servers found
+    par for each server
+        G->>W: probe()
+        W->>S: info, devices, $state of each device
+        S-->>W: answers
+        W-->>G: what it said, and how fast it answered
+    end
+    opt a stream has a new frame (and the window is open)
+        G->>W: latest()
+        W->>S: $latest: its last frame, no subscription
+        W-->>G: the frame, made small for a tile
+    end
+    G->>G: render(): the sidebar and the page on show
+```
+
+- **A tile's preview** is the last frame of the device's first stream, fetched
+  with `$latest`. That is no subscription: a device that only reads out while
+  somebody watches (`self.subscribers("ch1")`) stays idle, and the window is
+  not counted among its watchers.
+- **Properties** are read only when a device's page opens, and **commands** run
+  only when you ask. Both wait in the device's line like any other request.
+- **Live view** opens `insthub view` as a program of its own.
 
 ## Why it is built this way
 

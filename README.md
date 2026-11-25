@@ -1,90 +1,132 @@
-# insthub
+<p align="center">
+  <img src="insthub/insthub.svg" width="96" alt="insthub">
+</p>
 
-insthub connects the programs of an experiment. For each instrument, one small
-program (a *server*) holds the connection to the hardware. Experiment scripts,
-notebooks and live displays ask that program instead of opening the instrument
-themselves, so several of them can use it at once without getting in each
-other's way.
+<h1 align="center">insthub</h1>
 
+<p align="center">
+  <b>Share your lab instruments between experiment scripts, notebooks, live plots and AI agents,<br>
+  all at the same time, without them getting in each other's way.</b>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#try-it-without-hardware">Try it</a> ·
+  <a href="#put-your-instrument-on-it">Your instrument</a> ·
+  <a href="#the-window">The window</a> ·
+  <a href="#ai-agents">AI agents</a> ·
+  <a href="#documentation">Documentation</a>
+</p>
+
+An oscilloscope, a signal generator or a camera can talk to only one program at
+a time. With insthub, one small program, a **server**, holds the connection to
+each instrument, and every other program asks it. Your experiment script, a
+notebook, a live plot and an AI agent can then all use the same instrument at
+once.
+
+```mermaid
+flowchart LR
+    subgraph yours["Your programs, as many as you like"]
+        script["experiment script"]
+        notebook["notebook"]
+        gui["insthub gui"]
+        agent["AI agent"]
+    end
+    subgraph server["A server: one small program per computer or rig"]
+        scope["scope<br/>device"]
+        synth["synth<br/>device"]
+    end
+    script <--> server
+    notebook <--> server
+    gui <--> server
+    agent <--> server
+    scope --> osc(["oscilloscope"])
+    synth --> gen(["signal generator"])
 ```
-   your programs                            a server                        instruments
 
- ┌───────────────────┐                 ┌─────────────────────────┐
- │ experiment script │ ── commands ──▶ │ scope device  (thread) ─┼──▶ oscilloscope
- │ notebook          │ ◀── results ─── │                         │
- │ live plot         │ ◀── streams ─── │ synth device  (thread) ─┼──▶ signal generator
- └───────────────────┘                 └─────────────────────────┘
-```
+## What you get
 
-What you get:
-
-- **A remote instrument reads like the local driver.** `scope.measure("VPP")`
+- **A remote instrument reads like its local driver.** `scope.measure("VPP")`
   and `synth.frequency = 2500` work from any program. Errors arrive as the
   exceptions the driver raised.
-- **No waiting unless you want to.** Every call can also return at once and
-  deliver its result later, so one script can work with several instruments at
-  the same time.
-- **Live data.** A device can publish traces, images and settings as they
-  change. A display always gets the newest one; a recorder can get all of them.
-- **Speed.** A call between two programs costs about 12 millionths of a second,
-  and arrays move at about 10 GB/s because they are sent straight from memory.
 - **Your drivers stay as they are.** An existing driver class goes on the bus
   with one line of Python or four lines of config.
+- **Live data.** A device can publish traces, images and readings as they
+  come. A display always gets the newest one; a recorder can get all of them.
+- **No waiting unless you want to.** Every call can also return at once and
+  deliver its result later, so one script can drive several instruments at
+  the same time.
+- **Fast.** A call between two programs takes about 12 microseconds, and
+  arrays move at about 10 GB/s, sent straight from memory.
 - **Nothing else to run.** There is no central service. Each server stands
   alone, and insthub knows nothing about any particular instrument.
-- **A window to keep an eye on it all.** `insthub gui` shows every device as
-  a tile: whether its instrument is connected, a small live preview of what it
-  publishes, and which programs are using it. A device's page reads and sets
-  its properties and runs its commands; a server's page starts, stops and
-  restarts it and shows its log. **Add** sets up a new server without writing
-  its config by hand. Closed, it keeps watching from the tray and tells you
-  when something breaks.
+- **A window for all of it.** `insthub gui` shows every instrument as a tile
+  with a live preview, and sets up new servers for you.
+- **AI agents, in plain sight.** Claude Code or any agent that speaks MCP can
+  read your instruments' documentation and use them, and the window shows
+  when one does.
 
-It needs Python 3.11 or later, `numpy` and `msgpack`. Live plotting also needs
-`pyqtgraph` and a Qt binding.
+## Install
+
+You need Python 3.11 or later.
+
+Into the environment that has your instruments' drivers, because that is
+where their servers run:
 
 ```bash
-pip install "insthub @ git+https://github.com/tim4431/insthub"          # into the environment of each server and client
-pip install "insthub[gui] @ git+https://github.com/tim4431/insthub"     # with live plotting
-pip install -e /path/to/insthub                                          # or from a local checkout, to work on it
-uv tool install --editable "/path/to/insthub[gui,mcp]"                   # and the insthub command for you, in every folder
+pip install "insthub @ git+https://github.com/tim4431/insthub"
 ```
 
-Servers run in the environment that has their drivers. The command of your
-own is for using the instruments: the command line, `insthub gui` and AI
-agents. See [the insthub command for yourself](docs/running-servers.md#the-insthub-command-for-yourself).
+That needs only `numpy` and `msgpack`. Then, once, the `insthub` command for
+yourself, in every folder: for the window, the command line and AI agents. The
+extras add Qt for the window and live plots (`gui`) and matplotlib for the
+plots agents get (`mcp`):
+
+```bash
+uv tool install "insthub[gui,mcp] @ git+https://github.com/tim4431/insthub"    # or, from a checkout you work on:
+uv tool install --editable "/path/to/insthub[gui,mcp]"
+```
+
+A server that shows a window of its own (see `examples/04_server_with_gui.py`)
+needs the `gui` extra in its environment too.
+
+[The insthub command for yourself](docs/running-servers.md#the-insthub-command-for-yourself)
+explains why there are two installs.
 
 ## Try it without hardware
 
 ```bash
-insthub sim                          # terminal 1: simulated scope, generator, camera and spectrum analyzer
+insthub sim                          # terminal 1: a simulated scope, generator, camera and spectrum analyzer
+insthub gui                          # terminal 2: every device as a tile
 ```
 
+The command line works on the same instruments:
+
 ```bash
-insthub list                         # terminal 2: what is running
+insthub list                         # what is running
 insthub call scope measure VPP
 insthub set synth frequency 2500
 insthub watch scope ch1              # the live trace, as text
 insthub view scope                   # the live trace, as a plot
-insthub gui                          # every server and device, and how each is connected
 python examples/03_experiment.py    # a script that uses several at once
 ```
 
-## Let an AI agent use the instruments
+## Put your instrument on it
 
-```bash
-claude mcp add --scope user insthub -- insthub mcp     # with insthub installed as your own command, as above
+**With your existing driver**, in a config file `lab.toml`:
+
+```toml
+[devices.psu]                       # the device is called "psu"
+driver = "mydriver:PowerSupply"     # your driver class, as it is
+path = "~/Code/mydriver"            # where its module is
+port = "/dev/ttyUSB0"               # passed to its constructor
 ```
 
-Claude Code (or any agent that speaks MCP) can then list the instruments,
-read their documentation from your docstrings, call commands, set properties
-and take live traces, with large arrays handed over as files. The **AI
-agents** page of `insthub gui` does the setup with a click and shows which
-agents are connected. See [using insthub from AI agents](docs/agents.md).
+Start it with `insthub serve lab.toml`. You do not even have to write the
+file: in `insthub gui`, **Add → New server...** writes it for you, reading the
+arguments your driver takes from its source.
 
-## The smallest example
-
-A server, in one file:
+**Or as a device of its own**, in one file:
 
 ```python
 import insthub
@@ -105,7 +147,7 @@ class Thermometer(insthub.Device):
 insthub.serve(Thermometer("thermo"))
 ```
 
-Any other program on the same computer:
+**Then, from any other program** on the same computer:
 
 ```python
 import insthub
@@ -117,19 +159,56 @@ for frame in thermo.subscribe("temperature"):
     print(frame.data)                        # arrives by itself, once a second
 ```
 
+To keep a server running in the background, starting at every login, use
+`insthub service install lab.toml`, or **Add → Keep a server running...** in
+the window. See [running servers](docs/running-servers.md).
+
+## The window
+
+`insthub gui` shows the instruments of this computer, and of other computers
+you list:
+
+- **Devices**: every instrument as a tile. Each tile says whether the
+  instrument is connected (and if not, why), shows a live preview of its
+  trace, image or reading, and who is watching it. Click a tile to read and
+  set its properties, run its commands, switch its periodic tasks, or open
+  live plots.
+- **Servers**: start, stop and restart them, read their logs, and see which
+  programs are connected.
+- **Add**: write the config of a new server by picking its drivers, keep a
+  server running in the background, or add the devices of another computer.
+- **Settings**: light or dark, or the same as the desktop.
+
+Closed, it keeps watching from the tray and tells you when something breaks.
+`insthub gui --install` puts it in the applications menu. The window is an
+ordinary client: it never waits for an instrument, and opening or closing it
+changes nothing for your servers. More in [the guide](docs/guide.md#the-manager-window).
+
+## AI agents
+
+```bash
+claude mcp add --scope user insthub -- insthub mcp     # with the insthub command installed for yourself
+```
+
+Claude Code (or any agent that speaks MCP) can then list the instruments, read
+their documentation from your docstrings, call commands, set properties and
+take live traces, with large arrays handed over as files. The **AI agents**
+page of `insthub gui` does this setup with a click and shows which agents are
+connected. See [AI agents](docs/agents.md).
+
 ## Documentation
 
 | Read this | To learn |
 |---|---|
-| [How insthub works](docs/architecture.md) | the pieces, what happens during a call and a stream, how programs find each other, what happens when things break, and why it is built this way |
-| [Using insthub](docs/guide.md) | writing devices, putting existing drivers on the bus, calls, streams, errors, GUIs, the command line |
+| [How insthub works](docs/architecture.md) | the pieces, what happens during a call and a stream, how programs find each other, what happens when things break, how the window is built, and why it is built this way |
+| [Using insthub](docs/guide.md) | writing devices, putting existing drivers on the bus, calls, streams, errors, GUIs, the window, the command line |
 | [Running servers](docs/running-servers.md) | starting servers, keeping them running in the background, who sets up what, several computers |
 | [AI agents](docs/agents.md) | letting Claude Code or another agent use the instruments: setup, the tools, what comes back |
 | [examples/](examples/) | four runnable examples, all on simulated instruments |
 
 ## Status
 
-- 221 tests cover calls, streams, device lifecycle, finding servers,
+- 222 tests cover calls, streams, device lifecycle, finding servers,
   reconnecting, the command line, config files, services, the GUIs and the
   agent interface. Run them with `python -m pytest tests` (about 30 s).
 - Developed and tested on Linux with Python 3.11, 3.12 and 3.14. Written to
@@ -142,7 +221,8 @@ for frame in thermo.subscribe("temperature"):
 
 MIT, see [LICENSE](LICENSE).
 
-## Layout
+<details>
+<summary><b>Layout of the code</b></summary>
 
 ```
 insthub/
@@ -167,3 +247,5 @@ docs/           the pages above
 examples/       runnable examples
 tests/
 ```
+
+</details>

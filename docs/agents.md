@@ -11,12 +11,15 @@ and talks to through the [Model Context Protocol](https://modelcontextprotocol.i
 just another client, like an experiment script: the servers and drivers do not
 change and do not know it exists.
 
-```
-   agent (Claude Code, ...)
-        │  MCP, on stdin/stdout
-   insthub mcp        six tools, results made cheap to read
-        │  ordinary insthub calls
-   servers            unchanged ──▶ instruments
+```mermaid
+flowchart TB
+    agent["AI agent<br/>(Claude Code, ...)"]
+    mcp["<b>insthub mcp</b><br/>six tools; results made cheap to read"]
+    servers["servers<br/>(unchanged)"]
+    inst(["instruments"])
+    agent -->|"MCP, on stdin/stdout"| mcp
+    mcp -->|"ordinary insthub calls"| servers
+    servers --> inst
 ```
 
 It needs nothing beyond insthub. Plots additionally need matplotlib
