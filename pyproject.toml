@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insthub"
+version = "0.1.0"
+description = "Fast command and data exchange between instrument servers, GUIs and experiment scripts"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24", "msgpack>=1.0"]
+
+[project.optional-dependencies]
+# Live plotting (insthub.qt, `insthub view`). pyqtgraph works with PyQt5, PyQt6 or PySide6.
+gui = ["pyqtgraph>=0.13", "PyQt6>=6.5"]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/tim4431/insthub"
+
+[project.scripts]
+insthub = "insthub.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["insthub*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110

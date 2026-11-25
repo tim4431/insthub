@@ -1,0 +1,344 @@
+# How insthub works
+
+This page explains what happens inside insthub: the pieces, what happens during
+a call, what happens when a device publishes data, how programs find each
+other, and what happens when something breaks. It assumes you write Python and
+know your instruments; it does not assume any networking background.
+
+For how to *use* insthub, read the [guide](guide.md). For how to keep servers
+running, read [running servers](running-servers.md).
+
+## The problem
+
+Lab instruments share three awkward properties.
+
+1. **One owner at a time.** A serial port, a GPIB address or an instrument's
+   LAN port is a single conversation. If two programs talk on it at once, their
+   commands interleave and each reads the other's reply. Some instruments
+   simply refuse a second connection.
+2. **They are slow.** A query takes milliseconds, a sweep takes seconds. A
+   program that waits for each instrument in turn spends most of its time
+   waiting.
+3. **Several programs want them at once.** The experiment script sets and
+   reads. A window shows the live trace. A notebook is open for poking around.
+
+insthub answers all three the same way: for each instrument, exactly one program
+holds the connection, and everything else asks that program.
+
+## Words used here
+
+| Word | Meaning |
+|---|---|
+| **Program** (process) | One running `python something.py`. Two terminals are two programs. They share nothing unless they are connected. |
+| **Thread** | One line of execution inside a program. A program can have several, working side by side. |
+| **Device** | A Python object that holds the session with one instrument. You write it, or insthub wraps your existing driver class. |
+| **Server** | A program that hosts one or more devices and answers requests for them. It is a program, not a machine: one PC can run several. |
+| **Client** | Any program that uses a device: an experiment script, a notebook, a GUI. |
+| **Proxy** | What a client gets from `insthub.device("scope")`. It has the same methods as the device, but each method sends a request to the server instead of doing the work itself. |
+| **Command** | A method of a device that clients are allowed to call. |
+| **Stream** | A named channel on which a device publishes data on its own initiative, for example `"ch1"` or `"image"`. |
+| **Frame** | One published value of a stream, with a running number and a timestamp. |
+| **Future** | A placeholder for a result that does not exist yet. You get it at once and ask it for the result later. |
+| **Connection** | An open two-way channel between two programs, like a phone line that stays open. The operating system provides it; its technical name is a *socket*. |
+
+## The whole picture
+
+```
+   CLIENT PROGRAMS                         ONE SERVER PROGRAM                     INSTRUMENTS
+
+ ┌────────────────────┐                 ┌───────────────────────────────┐
+ │ experiment.py      │   connection    │  device "scope"               │
+ │                    │ ──────────────▶ │    waiting line: [measure]    │
+ │  scope.measure()   │ ◀────────────── │    its own thread ────────────┼──▶ oscilloscope (LAN)
+ │  synth.frequency=… │                 │                               │
+ └────────────────────┘                 │  device "synth"               │
+                                        │    waiting line: [set freq]   │
+ ┌────────────────────┐   connection    │    its own thread ────────────┼──▶ generator (USB)
+ │ live plot window   │ ◀────────────── │                               │
+ │  shows "ch1"       │  stream frames  └───────────────────────────────┘
+ └────────────────────┘
+```
+
+Three rules explain most of the design:
+
+1. **Only a device's own thread ever talks to its instrument.** Your driver
+   code runs on that one thread, so it needs no locks and can never be
+   interrupted halfway through a command by another caller.
+2. **Requests for one device wait in a line** and are served in the order they
+   arrived.
+3. **Every device has its own line and its own thread.** A scope that takes
+   five seconds to trigger does not hold up the generator.
+
+## What happens during a call
+
+Take `vpp = scope.measure("VPP")` in an experiment script, with the server in
+another program on the same PC.
+
+```
+  experiment.py                    connection                     server program
+  ─────────────                    ──────────                     ──────────────
+  1. The proxy packs the request,
+     numbers it #57, sends it      ── #57 scope.measure("VPP") ─▶
+     and goes to sleep.                                           2. A reader thread unpacks it and puts it
+                                                                     at the end of the scope's waiting line.
+
+                                                                  3. The scope's thread takes it, makes sure
+                                                                     the instrument is connected, and runs
+                                                                     your method measure("VPP").
+
+                                   ◀─ #57 result 0.812 ──────────  4. The result is sent back.
+  5. A reader thread sees #57,
+     finds who is waiting for it
+     and wakes them with 0.812.
+```
+
+Steps 1, 2, 4 and 5 are insthub and take about 12 microseconds together. Step 3
+is your instrument and takes however long it takes.
+
+A few things follow from this picture.
+
+- **Many requests can be under way on one connection.** Each carries a number,
+  and the reply carries the same number, so replies may come back in any
+  order. This is why one connection per server is enough, however many threads
+  and devices use it.
+- **`scope.measure.future("VPP")`** is the same, except that step 1 does not go
+  to sleep. You get a future immediately and collect the result when you want
+  it. This is how one script works with several instruments at the same time.
+- **`scope.measure.notify("VPP")`** sends the request and asks for no reply at
+  all. Steps 4 and 5 do not happen.
+- **If your method raises an exception**, step 4 sends the exception instead of
+  a result, and step 5 raises it in the caller. A `ValueError` on the server
+  arrives as a `ValueError` in the script, with the server's traceback
+  attached.
+
+## What happens when a device publishes
+
+Calls are the client asking. Streams are the device telling, without being
+asked. A device publishes with one line:
+
+```python
+self.publish("ch1", trace, dt=1e-6)      # inside the device, e.g. in a periodic task
+```
+
+```
+  server program                                              client programs
+  ──────────────                                              ───────────────
+  1. The frame gets a running number and a timestamp,
+     and is remembered as the stream's latest frame.
+
+  2. For every subscriber of "ch1":                           3. A reader thread puts the frame into the
+       send the frame on that subscriber's connection.           subscription's mailbox.
+       If that client cannot take it right now, the
+       frame waits in a one-place mailbox, and a newer        4. Your code picks it up:
+       frame replaces it.                                          sub.get()   wait for the next one
+                                                                   sub.poll()  take it if there is one
+                                                                   callback    called for each frame
+```
+
+The important behaviour is what happens to a reader that is slower than the
+publisher:
+
+```
+  device publishes     #1  #2  #3  #4  #5  #6  #7  #8        20 per second
+  fast reader gets     #1  #2  #3  #4  #5  #6  #7  #8
+  slow reader gets     #1          #4          #7            always the newest; sub.dropped counts the rest
+  reader with a queue  #1  #2  #3  #4  #5  #6  #7  #8        later, but all of them, in order
+```
+
+By default a subscription holds one frame, the newest. That is what a live
+display wants: the present, not a growing backlog. A recorder that must not
+lose anything asks for a queue (`subscribe("ch1", queue=1000)`).
+
+Two more details:
+
+- **A device never waits for a subscriber.** A frozen window or a slow network
+  link cannot slow down the instrument or the other clients.
+- **Publishing to nobody costs almost nothing** (less than a microsecond). A device
+  can also ask `self.subscribers("ch1")` and skip an expensive readout that
+  nobody is watching.
+
+## Where the programs are, and how they reach each other
+
+There are three situations, and client code is the same in all of them.
+
+| Client and server are | How they are connected | Does data leave the computer? |
+|---|---|---|
+| the same program | not at all: the proxy puts requests straight into the device's waiting line | no |
+| two programs on one computer | a *Unix socket*: a connection inside the operating system, named by a file | no |
+| programs on two computers | a *TCP* connection over the network, only if the server was started with `tcp=` | yes |
+
+So a socket is not the same thing as Ethernet. It is the operating system's
+word for a connection between two programs. Only the third kind travels over a
+cable.
+
+This is separate from how the server reaches the instrument. That link (USB,
+serial, GPIB, the instrument's LAN port) belongs to your driver, and insthub
+never sees it.
+
+### Finding a device by name
+
+There is no central directory service. Each server announces itself with two
+files in a folder that belongs to your user account:
+
+```
+  /run/user/1000/insthub/
+      scopes.sock      the Unix socket of the server "scopes"
+      scopes.json      who it is: process id, addresses, device names ["rigol", "siglent"]
+      rf.sock
+      rf.json                                                   ["synth", "sa"]
+```
+
+`insthub.device("synth")` looks, in this order:
+
+1. at servers inside the same program,
+2. through the `.json` files of that folder, for a server that lists `synth`,
+3. in a small table you write by hand for devices on other computers
+   (`~/.config/insthub/devices.toml`).
+
+It then opens one connection to that server and keeps it. Asking for a second
+device of the same server reuses the connection.
+
+If a server is killed without a chance to clean up, its files stay behind. The
+next lookup notices that the process is gone and deletes them.
+
+### The same program: a shortcut
+
+A server can run inside the program that uses it, for example a GUI that both
+owns the instrument and displays it. Then there is no connection and nothing is
+packed or copied:
+
+```
+  GUI thread ── proxy ──▶ device's waiting line ──▶ device thread ──▶ instrument
+  GUI thread ◀── the very array object the device published
+```
+
+You get the same array the device made, not a copy. Treat it as read-only.
+
+## Threads: who does what
+
+Inside a server:
+
+| Thread | How many | What it does |
+|---|---|---|
+| device thread | one per device | everything that touches the instrument: opening, closing, commands, properties, periodic tasks |
+| listener | one per way of being reached (the Unix socket, a TCP port) | accepts new connections |
+| reader | one per connected client | reads requests and puts each into the right waiting line |
+| writer | at most one per connected client, created only when needed | finishes sending to a client that cannot take data fast enough |
+| main thread | one | waits for Ctrl-C, or runs the window of a GUI server |
+
+Inside a client: your own threads, one reader per connection, and one thread
+per subscription that uses a callback.
+
+**Periodic tasks** deserve a note. A method marked `@periodic(0.1)` runs on the
+device thread every 0.1 s, *between* requests. It is how a device acquires and
+publishes continuously without a second thread fighting over the instrument.
+A waiting request is always served before the next run of a task, so a busy
+acquisition loop does not make commands sluggish.
+
+**Commands marked `concurrent=True`** are the one exception to the waiting
+line. They only read values the device has already cached, so they are answered
+immediately by the reader thread, even while the device thread is in the middle
+of a long sweep.
+
+## When things go wrong
+
+| What happens | What insthub does | What your code sees |
+|---|---|---|
+| A command raises an exception (bad argument, instrument error). | Sends it back. The device carries on. | The same kind of exception, with the server's traceback. |
+| The instrument stops answering (timeout, cable pulled). | Closes the session. The next command opens a new one, but never sooner than `reconnect_interval` (1 s) after the previous attempt. | The failed call raises. The next call works if the instrument is back. |
+| The instrument is off when the server starts. | Starts anyway and marks the device "not connected". | Calls raise `DeviceNotConnected` at once, until it is back. |
+| A command takes very long. | Later requests for that device wait in line. Other devices are unaffected. | Nothing, unless you asked for a timeout. Use `.future()` to do other things meanwhile. |
+| A client reads a stream too slowly, or freezes. | Keeps only the newest frame for it. Never waits for it. | `sub.dropped` goes up. |
+| A client program crashes. | Removes its subscriptions. Requests it had already sent still run. | Nothing. |
+| The server program crashes or is restarted. | Nothing can be done from inside. | Calls under way raise `ConnectionLost`. The next call reconnects. Subscriptions resume by themselves when the server is back. |
+| The server is stopped (Ctrl-C, or its service is stopped). | Lets the running command finish, cancels the ones still waiting, closes every instrument. | Waiting calls raise an error. |
+
+Two promises are worth spelling out:
+
+- **A request is never run twice.** If a connection breaks after a request was
+  sent, insthub does not know whether it ran, so it reports `ConnectionLost`
+  rather than sending it again.
+- **A timeout on the client does not stop the instrument.** `with_timeout(5)`
+  only stops the waiting. The command keeps running on the device, and later
+  requests still wait behind it.
+
+## What travels on a connection
+
+Every message has three parts:
+
+```
+  ┌────────────────┬──────────────────────────┬─────────────────────────────┐
+  │ 16-byte header │ small packed description │ raw array memory, if any    │
+  │ kind, number   │ names, numbers, text     │ exactly the bytes of numpy  │
+  └────────────────┴──────────────────────────┴─────────────────────────────┘
+```
+
+The middle part is [MessagePack](https://msgpack.org), a compact binary cousin
+of JSON. Arrays larger than about 2 kB are not put into it. They are sent
+straight from the array's memory, and on the other side they are received
+straight into the array that is handed to your code. An array is therefore
+never converted to text and never copied by Python on the way.
+
+Besides plain values and arrays, tuples, sets, complex numbers and dataclasses
+survive the trip as what they were. The exact list is in the
+[guide](guide.md#what-can-be-sent), and the byte layout is at the top of
+`insthub/wire.py`.
+
+## How fast it is
+
+Measured with `insthub bench` on a 32-core Linux PC (Python 3.12) on 2026-11-24.
+Except in the first column, the server is a separate program.
+
+| | same program | Unix socket | TCP on one PC |
+|---|---|---|---|
+| one call through the device thread | 5 µs | 12 µs | 14 µs |
+| one call answered at once (`concurrent=True`) | 1.5 µs | 10 µs | 12 µs |
+| many calls sent ahead as futures | 320 000 /s | 220 000 /s | 130 000 /s |
+| a 100 MB array there and back | not copied | 19 ms (10.7 GB/s) | 18 ms (11.2 GB/s) |
+| stream of 1000-point traces | 370 000 frames/s | 230 000 frames/s | 190 000 frames/s |
+| stream of 8 MB images | not copied | 1100 frames/s | 1400 frames/s |
+
+An instrument answers in milliseconds, so for a single command the bus is not
+what you wait for. Its speed matters for large data, for many small calls, and
+for streams.
+
+## Why it is built this way
+
+**Why one thread per device, instead of a lock around the driver?**
+A lock keeps two callers apart but says nothing about order, and it gives a
+background acquisition loop no fair way in. A waiting line gives order for
+free, lets periodic tasks run in the gaps, and keeps everything for one
+instrument on one thread, which some vendor libraries require.
+
+**Why threads and not `asyncio`?**
+Instrument libraries (pyvisa, pyserial, GPIB, camera SDKs) block while they
+wait. With threads, driver code stays ordinary Python. Clients that do use
+asyncio can still `await` any call.
+
+**Why no central server that all others register with?**
+It would be one more thing to start first and one more thing to fail. Without
+it, each server works alone, and finding one is a matter of reading a file.
+
+**Why not HTTP and JSON, which any language can speak?**
+JSON has no way to carry an array except as text, which makes large data slow,
+and HTTP has no natural way for the server to send data without being asked,
+which streams need. The cost is that clients exist only for Python so far.
+
+**Why MessagePack and not Python's `pickle`?**
+Unpickling data from a connection can run arbitrary code. insthub only ever
+rebuilds a fixed set of plain types, plus dataclasses your own program has
+already defined.
+
+**Why does a stream skip frames by default?**
+Because the usual reader is a display, and a display that falls behind is
+worse than one that skips. Lossless delivery is one argument away
+(`queue=N`).
+
+## What insthub does not do
+
+- It does not know any instrument. Protocols, command strings and vendor
+  libraries stay in your drivers.
+- It does not set up the operating system for hardware (permissions, kernel
+  drivers). See [who sets up what](running-servers.md#who-sets-up-what).
+- It has no authentication or encryption. Keep TCP on a trusted network.
+- It cannot cancel a command that is already running on an instrument.
