@@ -8,9 +8,14 @@ journal.  Nothing here needs root.
 There is one convention for every server, whatever instrument it drives:
 
     unit        ~/.config/systemd/user/insthub-NAME.service
-    command     the Python interpreter that ran `insthub service install`, so the
-                server runs in that environment (the virtualenv with the
-                driver's dependencies), on a .toml config or a .py script
+    command     the Python interpreter that ran `insthub service install` (or
+                --python), so the server runs in that environment (the
+                virtualenv with the driver's dependencies), on a .toml config
+                or a .py script
+
+Before writing the unit, `install` makes sure that Python can import insthub
+and, for a config, every driver it names.  It refuses to run from the user-wide
+`insthub` command (a uv tool or pipx environment), which has no drivers.
 
 What stays outside: anything that gives the operating system access to the
 hardware (udev rules, kernel modules, groups).  That belongs to the driver.
@@ -53,6 +58,39 @@ def command_for(target: str | Path, python: str | None = None) -> list[str]:
     raise BusError(f"{target.name}: expected a .toml config (for `insthub serve`) or a .py server script")
 
 
+def tool_environment(prefix: str | None = None) -> str | None:
+    """"uv tool" or "pipx" if this Python is the private environment of a command
+    installed that way (the user-wide `insthub` command); else None."""
+    root = Path(prefix or sys.prefix)
+    if (root / "uv-receipt.toml").exists():
+        return "uv tool"
+    if (root / "pipx_metadata.json").exists():
+        return "pipx"
+    return None
+
+
+_CHECK = "import sys\nfrom insthub import config\nif sys.argv[1].endswith('.toml'):\n    config.check(sys.argv[1])\n"
+
+
+def check_python(target: str | Path, python: str) -> None:
+    """Make sure `python` can serve `target`: it imports insthub and, for a
+    .toml config, every driver of it (without creating a device), from the
+    folder the service will run in.  Raises BusError saying what is missing."""
+    target = Path(target).expanduser().resolve()
+    try:
+        result = subprocess.run([python, "-c", _CHECK, str(target)], capture_output=True, text=True, timeout=120,
+                                check=False, cwd=target.parent)
+    except OSError as e:
+        raise BusError(f"cannot run {python}: {e}") from None
+    except subprocess.TimeoutExpired:
+        raise BusError(f"{python} took more than 120 s to import the drivers of {target.name}") from None
+    if result.returncode != 0:
+        last = (result.stderr.strip().splitlines() or ["(no output)"])[-1]
+        raise BusError(f"{python} cannot serve {target.name}: {last}\n"
+                       "The service runs this Python, so it needs insthub and the drivers' packages. "
+                       "Install them there, or pass --python with the Python that has them.")
+
+
 def unit_text(name: str, target: str | Path, python: str | None = None) -> str:
     """The systemd unit that keeps the server of `target` running."""
     registry.check_name(name, "service name")
@@ -87,10 +125,26 @@ def _systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
 
 def install(target: str | Path, name: str | None = None, start: bool = True, python: str | None = None) -> Path:
     """Register the server of `target` as the service insthub-NAME and start it.
-    Installing again under the same name replaces the old definition."""
+    Installing again under the same name replaces the old definition.
+    `python`: the interpreter the service runs (default: this one)."""
     target = Path(target).expanduser().resolve()
     name = name or target.stem
+    if python is None:
+        python = sys.executable
+    else:
+        found = shutil.which(python)
+        if found is None:
+            raise BusError(f"--python {python}: no such program")
+        python = os.path.abspath(found)  # not realpath: a virtualenv is recognized by the path of its python link
+    kind = tool_environment(str(Path(python).parent.parent))  # <env>/bin/python, <env>\Scripts\python.exe
+    if kind:
+        raise BusError(
+            f"{python} belongs to the user-wide `insthub` command (a {kind} environment), which has none of your "
+            "drivers, so a service run with it could not load them. Use the Python of the server's own "
+            f"environment: run its insthub (e.g.  ~/Code/mydriver/.venv/bin/insthub service install {target.name})"
+            " or pass --python.")
     text = unit_text(name, target, python)
+    check_python(target, python)
     folder = unit_dir()
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{PREFIX}{name}.service"

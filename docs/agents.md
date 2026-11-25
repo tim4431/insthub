@@ -24,15 +24,29 @@ It needs nothing beyond insthub. Plots additionally need matplotlib
 
 ## Setting it up
 
-Register it with the agent once. For Claude Code:
+Install insthub as a command of your own, then register it with the agent
+once. For Claude Code:
 
 ```bash
-claude mcp add --scope user insthub -- /path/to/venv/bin/insthub mcp
+uv tool install --editable "/path/to/insthub[mcp]"      # add gui for the manager window: [gui,mcp]
+claude mcp add --scope user insthub -- insthub mcp
 ```
 
-- **Use the full path** of the `insthub` program in the environment where
-  insthub is installed (`which insthub` shows it). The agent does not start it
-  from your shell, so an activated virtual environment does not help.
+- **The command of your own.** `uv tool install` gives insthub a private
+  environment and puts the `insthub` command in `~/.local/bin`, so the agent
+  can start it by name from any folder. `--editable` makes it run the code of
+  your checkout, the same as your servers. `[mcp]` adds matplotlib for plots.
+  `insthub mcp` needs no driver, because it gets everything from the servers.
+  See [the insthub command for yourself](running-servers.md#the-insthub-command-for-yourself).
+- **If the agent cannot find it.** The agent starts `insthub` with the
+  `PATH` of the environment it was itself started from. A desktop launcher or
+  an ssh session may not include `~/.local/bin`, and then `claude mcp list`
+  reports a failure. Register the full path instead:
+  `claude mcp add --scope user insthub -- ~/.local/bin/insthub mcp`.
+- **Without the command of your own,** register the full path of the
+  `insthub` in any virtual environment that has insthub
+  (`/path/to/venv/bin/insthub mcp`). An activated environment does not help,
+  because the agent does not start it from your shell.
 - **Same user account.** Run the agent under the same account as the
   servers, because the folder through which servers are found belongs to
   that account.
@@ -41,8 +55,10 @@ claude mcp add --scope user insthub -- /path/to/venv/bin/insthub mcp
   instead, commit a `.mcp.json` file at its top:
 
   ```json
-  {"mcpServers": {"insthub": {"command": "/path/to/venv/bin/insthub", "args": ["mcp"]}}}
+  {"mcpServers": {"insthub": {"command": "insthub", "args": ["mcp"]}}}
   ```
+
+  Everyone who uses it then needs the `insthub` command of their own.
 
 - **Check it.** `claude mcp list` shows whether it connects, and `/mcp`
   inside a session shows its tools.
@@ -258,8 +274,9 @@ There are two ways:
   in its `devices.toml`. Saved files are then on the agent's computer, where
   it can load them.
 - **Start it on the lab computer through ssh:**
-  `claude mcp add insthub -- ssh labpc /path/to/venv/bin/insthub mcp`. This
-  opens no network port. Saved files are then on the lab computer, and the
+  `claude mcp add insthub -- ssh labpc .local/bin/insthub mcp`. Use the path,
+  because a command run by ssh usually does not get `~/.local/bin` on its
+  `PATH`. This opens no network port. Saved files are then on the lab computer, and the
   agent sees the summaries and pictures but cannot load the files itself.
 
 ## What it does not do

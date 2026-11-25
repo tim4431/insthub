@@ -17,8 +17,10 @@
     insthub bench                                  latency and throughput on this machine
     insthub mcp [--data DIR] [--timeout S]         the bus for AI agents (MCP on stdin/stdout); see docs/agents.md
 
-    insthub service install TARGET [--name NAME]   keep a server running in the background (systemd user service);
-                                                  TARGET is a .toml config or a .py server script
+    insthub service install TARGET [--name NAME] [--python PATH]
+                                                  keep a server running in the background (systemd user service);
+                                                  TARGET is a .toml config or a .py server script.  The service
+                                                  runs this Python (or PATH), which must import its drivers
     insthub service list | start NAME | stop NAME | restart NAME | remove NAME | logs NAME [-f]
 
 Values are parsed as JSON when possible (1e3, true, [1,2], "text"), else taken
@@ -268,14 +270,14 @@ def _cmd_service(args) -> int:
     from . import service
 
     if args.action == "install":
-        path = service.install(args.target, args.name, start=not args.no_start)
+        path = service.install(args.target, args.name, start=not args.no_start, python=args.python)
         name = path.stem[len(service.PREFIX):]
         print(f"installed {path}")
         if not args.no_start:
             time.sleep(1.0)  # long enough for a bad config to have failed
             state = next((u["state"] for u in service.units() if u["name"] == name), "unknown")
             print(f"state: {state}" + ("" if state == "active" else f"   (see: insthub service logs {name})"))
-        print(f"restart after changing its code or config:  systemctl --user restart {path.stem}")
+        print(f"restart after changing its code or config:  insthub service restart {name}")
         hint = service.linger_hint()
         if hint:
             print(f"it starts when you log in; to start it at boot instead, run once:  {hint}")
@@ -369,6 +371,9 @@ def main(argv=None) -> int:
     a.add_argument("target", help="a .toml config (run with `insthub serve`) or a .py server script")
     a.add_argument("--name", help="service name (default: the file name without extension)")
     a.add_argument("--no-start", action="store_true", help="only write the unit file")
+    a.add_argument("--python", metavar="PATH",
+                   help="the Python the service runs (default: the one running this command); "
+                        "it needs insthub and the drivers' packages")
     actions.add_parser("list", help="installed services and their state")
     for action, text in (("start", "start a service"), ("stop", "stop a service until the next login or start"),
                          ("restart", "restart a service, e.g. after changing its code or config")):

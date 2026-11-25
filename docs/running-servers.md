@@ -47,7 +47,7 @@ This writes a small *systemd user service*, starts it, and from then on:
 
 | Command | Effect |
 |---|---|
-| `insthub service install TARGET [--name NAME]` | register and start; run it again to replace the definition |
+| `insthub service install TARGET [--name NAME] [--python PATH]` | register and start; run it again to replace the definition |
 | `insthub service list` | what is installed and whether it is running |
 | `insthub service logs NAME [-f]` | its output; `-f` follows it live |
 | `insthub service restart NAME` | restart, after changing code or config |
@@ -65,12 +65,20 @@ Nothing here needs administrator rights. Two details:
   `sudo loginctl enable-linger $USER`. `insthub service install` tells you if
   it is off.
 - **Which Python.** The service runs with the Python interpreter that ran
-  `insthub service install`. If a server needs the packages of a particular
-  virtualenv, install it with that virtualenv's `insthub`:
+  `insthub service install`, or the one named with `--python`. If a server
+  needs the packages of a particular virtualenv, install it with that
+  virtualenv's `insthub`:
 
   ```bash
   ~/Code/mydriver/.venv/bin/insthub service install ~/Code/mydriver/server.toml
   ```
+
+  Before it writes anything, `install` checks that this Python can import
+  insthub and every driver the config names, from the folder the service
+  will run in. If one is missing, it stops with the import error instead of
+  installing a service that would fail at every start. It refuses the Python
+  of [the insthub command for yourself](#the-insthub-command-for-yourself),
+  which has insthub but none of your drivers.
 
 This needs Linux with systemd. On other systems, start servers with the
 system's own autostart mechanism.
@@ -111,6 +119,33 @@ line can name the repository instead of the folder:
 ```
 insthub @ git+https://github.com/tim4431/insthub
 ```
+
+## The insthub command for yourself
+
+Using the instruments, as opposed to serving them, needs no driver.
+`insthub list`, `call`, `watch`, `view`, `gui` and `mcp` get everything they
+show from the servers. So besides the copy in each instrument's project,
+install insthub once as a command of your own:
+
+```bash
+uv tool install --editable "/path/to/insthub[gui,mcp]"     # pipx install --editable works the same
+```
+
+`uv tool` gives it a private environment and puts the `insthub` command in
+`~/.local/bin`, which is on the `PATH` of most Linux desktops. It then works
+in every folder without activating anything, and AI agents can start it by
+name (see [AI agents](agents.md#setting-it-up)). `--editable` makes it run the
+code of your checkout, like the projects that installed insthub with `-e`.
+After a `git pull` every program runs the same version, so no two of them
+disagree about the message format. To remove it: `uv tool uninstall insthub`.
+
+Servers do not use it. A server needs its driver's packages, and those are
+in its project's environment, not in this one. That is why
+`insthub service install` refuses this command's Python and asks you to run
+the project's `insthub` or to pass `--python` (see
+[keeping a server running](#keeping-a-server-running)). Run `insthub serve`
+from the project's environment as well; from this command it stops at the
+first driver it cannot import.
 
 ## Who sets up what
 
@@ -212,6 +247,7 @@ the instruments, so open a TCP port only on a network you trust.
 | Sockets and announcements of running servers | `$XDG_RUNTIME_DIR/insthub/` (for example `/run/user/1000/insthub/`); override with `INSTHUB_DIR` |
 | Addresses of devices on other computers | `~/.config/insthub/devices.toml`; override with `INSTHUB_DEVICES` |
 | Service definitions | `~/.config/systemd/user/insthub-NAME.service` |
+| The insthub command for yourself | `~/.local/bin/insthub`; its environment in `~/.local/share/uv/tools/insthub/` |
 | Results saved for AI agents by `insthub mcp` | `.insthub/` in the folder the agent was started in; override with `INSTHUB_DATA` or `--data` |
 | The launcher of `insthub gui` | `~/.local/share/applications/insthub.desktop`, its icon under `~/.local/share/icons/`, a copy on the desktop, and `~/.config/autostart/insthub.desktop` with Start at login |
 

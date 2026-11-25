@@ -44,7 +44,12 @@ It needs Python 3.11 or later, `numpy` and `msgpack`. Live plotting also needs
 pip install "insthub @ git+https://github.com/tim4431/insthub"          # into the environment of each server and client
 pip install "insthub[gui] @ git+https://github.com/tim4431/insthub"     # with live plotting
 pip install -e /path/to/insthub                                          # or from a local checkout, to work on it
+uv tool install --editable "/path/to/insthub[gui,mcp]"                   # and the insthub command for you, in every folder
 ```
+
+Servers run in the environment that has their drivers. The command of your
+own is for using the instruments: the command line, `insthub gui` and AI
+agents. See [the insthub command for yourself](docs/running-servers.md#the-insthub-command-for-yourself).
 
 ## Try it without hardware
 
@@ -65,7 +70,7 @@ python examples/03_experiment.py    # a script that uses several at once
 ## Let an AI agent use the instruments
 
 ```bash
-claude mcp add --scope user insthub -- "$(which insthub)" mcp
+claude mcp add --scope user insthub -- insthub mcp     # with insthub installed as your own command, as above
 ```
 
 Claude Code (or any agent that speaks MCP) can then list the instruments,

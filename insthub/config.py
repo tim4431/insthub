@@ -46,15 +46,19 @@ def load_object(spec: str, path: str | None = None):
     return obj
 
 
-def build_device(name: str, spec: dict) -> Device:
-    spec = dict(spec)
+def _driver(name: str, spec: dict):
     if "driver" not in spec:
         raise ValueError(f"[devices.{name}] needs a driver = 'module:Class'")
     try:
-        cls = load_object(spec["driver"], spec.get("path"))
+        return load_object(spec["driver"], spec.get("path"))
     except (ImportError, AttributeError) as e:
-        raise ImportError(f"[devices.{name}]: cannot load driver {spec['driver']!r}: {e} "
-                          "(is this Python environment the one that has the driver's dependencies?)") from e
+        raise ImportError(f"[devices.{name}]: cannot load driver {spec['driver']!r}: {e} (this is {sys.executable}; "
+                          "is it the Python environment that has the driver's dependencies?)") from e
+
+
+def build_device(name: str, spec: dict) -> Device:
+    spec = dict(spec)
+    cls = _driver(name, spec)
     kwargs = {**{k: v for k, v in spec.items() if k not in _RESERVED}, **spec.get("kwargs", {})}
     link_errors = spec.get("link_errors")
     if link_errors is not None:
@@ -75,6 +79,17 @@ def build_device(name: str, spec: dict) -> Device:
     if "reconnect_interval" in spec:
         dev.reconnect_interval = float(spec["reconnect_interval"])
     return dev
+
+
+def check(path: str | Path) -> None:
+    """Import the driver (and link_errors) of every device in a config file,
+    without creating any device.  Raises if one cannot be loaded."""
+    with open(Path(path).expanduser(), "rb") as f:
+        config = tomllib.load(f)
+    for name, spec in config.get("devices", {}).items():
+        _driver(name, spec)
+        for spec_error in spec.get("link_errors", ()):
+            load_object(spec_error)
 
 
 def load(path: str | Path) -> tuple[dict, list[Device]]:
