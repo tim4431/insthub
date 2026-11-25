@@ -9,6 +9,9 @@
     insthub release DEVICE                         close the instrument session (to use the vendor's software);
                                                   the next command reopens it.  `insthub reopen DEVICE` does it now
     insthub view DEVICE                            live plots of its streams (needs insthub[gui])
+    insthub gui [--tray | --install | --uninstall] the manager window: every server and device, how each is
+                                                  connected, and controls; it stays in the tray when closed.
+                                                  --install adds a launcher icon
     insthub serve CONFIG.toml                      host the devices listed in a config file
     insthub sim [--name NAME] [--tcp PORT] [--gui] simulated scope, synth, camera and spectrum analyzer
     insthub bench                                  latency and throughput on this machine
@@ -16,7 +19,7 @@
 
     insthub service install TARGET [--name NAME]   keep a server running in the background (systemd user service);
                                                   TARGET is a .toml config or a .py server script
-    insthub service list | remove NAME | logs NAME [-f]
+    insthub service list | start NAME | stop NAME | restart NAME | remove NAME | logs NAME [-f]
 
 Values are parsed as JSON when possible (1e3, true, [1,2], "text"), else taken
 as text.  `-a ADDRESS` talks to a server by address instead of looking the
@@ -208,6 +211,24 @@ def _cmd_view(args) -> int:
     return viewer.main(_device(args))
 
 
+def _cmd_gui(args) -> int:
+    from . import launcher
+
+    if args.install:
+        for path in launcher.install(desktop=not args.no_desktop):
+            print(f"wrote {path}")
+        print("insthub is now in the applications menu; to keep it in the dock, right-click its icon there "
+              "and pin it")
+        return 0
+    if args.uninstall:
+        removed = launcher.uninstall()
+        print("\n".join(f"removed {path}" for path in removed) or "no launcher was installed")
+        return 0
+    from . import manager
+
+    return manager.main(tray_only=args.tray)
+
+
 def _cmd_serve(args) -> int:
     from . import Server, config
 
@@ -265,6 +286,11 @@ def _cmd_service(args) -> int:
         return 0
     if args.action == "logs":
         return service.logs(args.name, follow=args.follow, lines=args.lines)
+    if args.action in ("start", "stop", "restart"):
+        getattr(service, args.action)(args.name)
+        state = next((u["state"] for u in service.units() if u["name"] == args.name), "unknown")
+        print(f"{service.PREFIX}{args.name}: {state}")
+        return 0
     units = service.units()
     if not units:
         print("no insthub services installed (insthub service install TARGET)")
@@ -312,6 +338,12 @@ def main(argv=None) -> int:
     s = sub.add_parser("view", help="live plots of a device's streams")
     s.add_argument("device")
     s.set_defaults(fn=_cmd_view)
+    s = sub.add_parser("gui", help="the manager window: servers, devices and how each is connected")
+    s.add_argument("--install", action="store_true", help="add insthub to the applications menu and the desktop")
+    s.add_argument("--no-desktop", action="store_true", help="with --install: no icon on the desktop")
+    s.add_argument("--uninstall", action="store_true", help="remove what --install added")
+    s.add_argument("--tray", action="store_true", help="start in the tray, without opening the window")
+    s.set_defaults(fn=_cmd_gui)
     s = sub.add_parser("serve", help="host the devices of a config file")
     s.add_argument("config")
     s.add_argument("--tcp", help="also listen on this port or host:port")
@@ -338,6 +370,9 @@ def main(argv=None) -> int:
     a.add_argument("--name", help="service name (default: the file name without extension)")
     a.add_argument("--no-start", action="store_true", help="only write the unit file")
     actions.add_parser("list", help="installed services and their state")
+    for action, text in (("start", "start a service"), ("stop", "stop a service until the next login or start"),
+                         ("restart", "restart a service, e.g. after changing its code or config")):
+        actions.add_parser(action, help=text).add_argument("name")
     a = actions.add_parser("remove", help="stop a service and delete it")
     a.add_argument("name")
     a = actions.add_parser("logs", help="show a service's output")

@@ -38,6 +38,33 @@ def test_bad_targets_and_names(tmp_path):
         service.unit_text("has space", cfg)
 
 
+def test_units_come_from_one_systemctl_call(tmp_path, monkeypatch):
+    folder = tmp_path / "systemd" / "user"
+    folder.mkdir(parents=True)
+    for name in ("lab", "rf"):
+        (folder / f"insthub-{name}.service").write_text(f'[Service]\nExecStart="/usr/bin/python3" "{name}.py"\n')
+    calls = []
+
+    def systemctl(*args, check=True):
+        calls.append(args)
+        out = ("Id=insthub-lab.service\nActiveState=active\nSubState=running\nUnitFileState=enabled\nMainPID=4242\n"
+               "\nId=insthub-rf.service\nActiveState=activating\nSubState=auto-restart\nUnitFileState=disabled\n"
+               "MainPID=0\n")
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(service, "_systemctl", systemctl)
+    lab, rf = service.units()
+    assert len(calls) == 1 and calls[0][0] == "show"
+    assert (lab["name"], lab["state"], lab["sub"], lab["enabled"], lab["pid"]) == ("lab", "active", "running", True, 4242)
+    assert (rf["state"], rf["sub"], rf["enabled"], rf["pid"]) == ("activating", "auto-restart", False, None)
+    assert lab["command"] == '"/usr/bin/python3" "lab.py"'
+    with pytest.raises(insthub.BusError, match="no service insthub-nope"):
+        service.restart("nope")
+    service.restart("lab")
+    assert calls[-1] == ("restart", "insthub-lab.service")
+
+
 @pytest.mark.skipif(shutil.which("systemd-analyze") is None, reason="needs systemd")
 def test_systemd_accepts_the_unit(tmp_path):
     cfg = tmp_path / "lab.toml"

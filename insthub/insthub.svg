@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>insthub</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a8ae8"/>
+      <stop offset="1" stop-color="#1d5fb5"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#tile)"/>
+  <g stroke="#ffffff" stroke-width="6" stroke-linecap="round" opacity="0.9">
+    <line x1="64" y1="64" x2="34" y2="34"/>
+    <line x1="64" y1="64" x2="94" y2="34"/>
+    <line x1="64" y1="64" x2="34" y2="94"/>
+    <line x1="64" y1="64" x2="94" y2="94"/>
+  </g>
+  <circle cx="34" cy="34" r="11" fill="#ffffff"/>
+  <circle cx="94" cy="34" r="11" fill="#ffffff"/>
+  <circle cx="34" cy="94" r="11" fill="#ffffff"/>
+  <circle cx="94" cy="94" r="11" fill="#ffffff"/>
+  <circle cx="64" cy="64" r="19" fill="#ffffff"/>
+  <path d="M51 64 q6.5 -13 13 0 t13 0" fill="none" stroke="#1d5fb5" stroke-width="4.5" stroke-linecap="round"/>
+</svg>

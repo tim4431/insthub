@@ -32,6 +32,10 @@ What you get:
   with one line of Python or four lines of config.
 - **Nothing else to run.** There is no central service. Each server stands
   alone, and insthub knows nothing about any particular instrument.
+- **A window to keep an eye on it all.** `insthub gui` shows every server and
+  device, whether each instrument is connected and which programs are using
+  it, with buttons to reconnect, release, restart and read logs. Closed, it
+  keeps watching from the tray and tells you when something breaks.
 
 It needs Python 3.11 or later, `numpy` and `msgpack`. Live plotting also needs
 `pyqtgraph` and a Qt binding.
@@ -54,6 +58,7 @@ insthub call scope measure VPP
 insthub set synth frequency 2500
 insthub watch scope ch1              # the live trace, as text
 insthub view scope                   # the live trace, as a plot
+insthub gui                          # every server and device, and how each is connected
 python examples/03_experiment.py    # a script that uses several at once
 ```
 
@@ -115,9 +120,9 @@ for frame in thermo.subscribe("temperature"):
 
 ## Status
 
-- 186 tests cover calls, streams, device lifecycle, finding servers,
-  reconnecting, the command line, services, the GUI and the agent interface.
-  Run them with `python -m pytest tests` (about 15 s).
+- 200 tests cover calls, streams, device lifecycle, finding servers,
+  reconnecting, the command line, services, the GUIs and the agent interface.
+  Run them with `python -m pytest tests` (about 17 s).
 - Developed and tested on Linux with Python 3.11, 3.12 and 3.14. Written to
   run on Windows, but never run there.
 - Not included: passwords or encryption for network connections, clients for
@@ -143,6 +148,8 @@ insthub/
   qt.py         helpers for Qt GUIs             viewer.py   the generic live viewer
   mcp.py        insthub mcp: the bus for AI agents
   render.py     results as JSON plus files and plots, for agents
+  manager.py    insthub gui: the manager window and its tray icon
+  launcher.py   the launcher icon of insthub gui
   sim.py        simulated instruments           bench.py    insthub bench
   cli.py        the insthub command
 docs/           the pages above

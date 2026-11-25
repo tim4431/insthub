@@ -1,4 +1,6 @@
 import asyncio
+import os
+import socket
 import threading
 import time
 
@@ -178,6 +180,20 @@ def test_introspection(client):
     assert "frequency" in text and "locked  (read-only)" in text and "rf(on: bool = True) -> bool" in text
     assert sorted(client.devices()) == ["camera", "loopback", "sa", "scope", "synth"]
     assert client.ping() < 0.5
+
+
+def test_server_lists_the_programs_connected_to_it(server):
+    with insthub.connect(server.addresses[0]) as local, insthub.connect(server.addresses[1]) as remote:
+        sub = local.scope.subscribe("ch1")
+        clients = remote.info()["clients"]
+        assert len(clients) == 2
+        unix = next(c for c in clients if c["peer"] is None)
+        tcp = next(c for c in clients if c["peer"] is not None)
+        assert unix["subscriptions"] == ["scope/ch1"] and tcp["subscriptions"] == []
+        assert tcp["pid"] is None and tcp["peer"].startswith("127.0.0.1:")      # TCP: an address, no process
+        if hasattr(socket, "SO_PEERCRED"):
+            assert unix["pid"] == os.getpid()                                   # Unix socket: the very process
+        sub.close()
 
 
 def test_device_can_call_itself_and_other_devices(server):
