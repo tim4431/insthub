@@ -47,6 +47,59 @@ def _value(text: str):
         return text
 
 
+def parse_params(items) -> tuple[list, dict]:
+    """Arguments as typed after a command: KEY=VALUE are keyword arguments, the rest
+    positional; each value as JSON when possible, else as text."""
+    positional, keyword = [], {}
+    for item in items:
+        key, eq, text = item.partition("=")
+        if eq and key.isidentifier():
+            keyword[key] = _value(text)
+        else:
+            positional.append(_value(item))
+    return positional, keyword
+
+
+def split_arguments(text: str) -> list[str]:
+    """Arguments typed on one line (in `insthub gui`): split at spaces, but not inside
+    quotes or brackets, so that [1, 2] and {"a": 1} stay one argument.  Single quotes
+    around a whole argument (or around what follows its `=`) are removed, as a shell
+    does: 'two words'.  Raises ValueError for a quote left open."""
+    words, word, depth, quote, escaped = [], "", 0, None, False
+    for ch in text:
+        if quote:
+            word += ch
+            if escaped:
+                escaped = False
+            elif ch == "\\" and quote == '"':
+                escaped = True
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote, word = ch, word + ch
+        elif ch.isspace() and depth == 0:
+            if word:
+                words.append(word)
+            word = ""
+        else:
+            depth += (ch in "[{(") - (ch in "]})")
+            depth = max(depth, 0)
+            word += ch
+    if quote:
+        raise ValueError(f"a {quote} is not closed")
+    if word:
+        words.append(word)
+
+    def unquote(w: str) -> str:
+        return w[1:-1] if len(w) >= 2 and w[0] == w[-1] == "'" else w
+
+    out = []
+    for w in words:
+        key, eq, value = w.partition("=")
+        out.append(f"{key}={unquote(value)}" if eq and key.isidentifier() else unquote(w))
+    return out
+
+
 def _plain(obj):
     """A JSON-friendly rendering of a result: arrays and blobs become summaries."""
     from .device import summarize
@@ -116,13 +169,7 @@ def _cmd_info(args) -> int:
 
 def _cmd_call(args) -> int:
     dev = _device(args)
-    positional, keyword = [], {}
-    for item in args.params:
-        key, eq, text = item.partition("=")
-        if eq and key.isidentifier():
-            keyword[key] = _value(text)
-        else:
-            positional.append(_value(item))
+    positional, keyword = parse_params(args.params)
     start = time.perf_counter()
     result = dev.bus.call(args.command, *positional, **keyword)
     elapsed = time.perf_counter() - start
@@ -207,10 +254,45 @@ def _cmd_release(args) -> int:
     return 0
 
 
-def _cmd_view(args) -> int:
-    from . import viewer
+def qt_hint(what: str) -> str:
+    """What to run to give the Python of this insthub the Qt that `what` ("insthub gui") needs."""
+    import importlib.util
+    import shutil
 
-    return viewer.main(_device(args))
+    from .service import tool_environment
+
+    source = Path(__file__).resolve().parent.parent
+    kind = tool_environment()
+    if kind == "uv tool":  # the user-wide command: reinstall it with the extra
+        spec = f'--editable "{source}[gui,mcp]"' if (source / "pyproject.toml").is_file() else \
+            '"insthub[gui,mcp] @ git+https://github.com/tim4431/insthub"'
+        fix = f"uv tool install --force {spec}"
+    elif kind == "pipx":
+        fix = "pipx inject insthub pyqtgraph PyQt6"
+    elif importlib.util.find_spec("pip") is None and shutil.which("uv"):  # a virtualenv made by uv has no pip
+        fix = f"uv pip install --python {sys.executable} pyqtgraph PyQt6"
+    else:
+        fix = f"{sys.executable} -m pip install pyqtgraph PyQt6"
+    return f"{what} needs Qt, which the Python of this insthub ({sys.executable}) does not have. Add it with:\n" \
+           f"    {fix}"
+
+
+def _gui_module(name: str, what: str):
+    """Import insthub.NAME (the viewer or the manager window), or say how to get the Qt it needs."""
+    import importlib
+
+    from .errors import BusError
+
+    try:
+        return importlib.import_module(f"{__package__}.{name}")
+    except ImportError as e:
+        if "Qt binding" in str(e) or e.name == "pyqtgraph":
+            raise BusError(qt_hint(what)) from None
+        raise
+
+
+def _cmd_view(args) -> int:
+    return _gui_module("viewer", "insthub view").main(_device(args))
 
 
 def _cmd_gui(args) -> int:
@@ -226,9 +308,7 @@ def _cmd_gui(args) -> int:
         removed = launcher.uninstall()
         print("\n".join(f"removed {path}" for path in removed) or "no launcher was installed")
         return 0
-    from . import manager
-
-    return manager.main(tray_only=args.tray)
+    return _gui_module("manager", "insthub gui").main(tray_only=args.tray)
 
 
 def _cmd_serve(args) -> int:
@@ -244,12 +324,11 @@ def _cmd_serve(args) -> int:
 def _cmd_sim(args) -> int:
     from . import Server, sim
 
+    viewer = _gui_module("viewer", "insthub sim --gui") if args.gui else None  # before a server is made
     server = Server(args.name, [*sim.devices(), sim.Loopback()], tcp=args.tcp)
-    if not args.gui:
+    if viewer is None:
         server.serve_forever()
         return 0
-    from . import viewer
-
     with server:
         return viewer.main(*(server.device(name) for name in ("scope", "camera", "synth")))
 

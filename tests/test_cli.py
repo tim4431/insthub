@@ -81,3 +81,55 @@ reconnect_interval = 0.5
         assert server.device("scope").get_waveform().volts.shape == (500,)
     with pytest.raises(ValueError, match="needs a driver"):
         config.build_device("x", {})
+
+
+def test_config_is_written_as_it_is_read(tmp_path):
+    devices = {"scope": {"driver": "insthub.sim:SimScope", "points": 500, "lazy": True},
+               "odd.name": {"driver": "insthub.sim:Loopback", "args": [], "kwargs": {}},
+               "quoted": {"driver": "x:Y", "port": 'C:\\dev "1"\x7f', "gains": [1, 2.5], "opts": {"a b": True}}}
+    text = config.dump({"name": "lab", "tcp": "0.0.0.0:8700"}, devices, comment="first line\n\nthird")
+    assert text.startswith("# first line\n#\n# third\n\n[server]\n")
+    path = tmp_path / "lab.toml"
+    path.write_text(text)
+    import tomllib
+
+    assert tomllib.loads(text) == {"server": {"name": "lab", "tcp": "0.0.0.0:8700"}, "devices": devices}
+    del devices["quoted"]  # no such driver: the others are built
+    path.write_text(config.dump({"name": "lab"}, devices))
+    kwargs, built = config.load(path)
+    assert kwargs == {"name": "lab"} and [d.name for d in built] == ["scope", "odd.name"]
+    assert built[0].points == 500 and built[0].open_on_start is False
+    with pytest.raises(ValueError, match="TOML has no NoneType"):
+        config.dump({"name": "lab"}, {"x": {"driver": "a:B", "port": None}})
+
+
+def test_parameters_as_typed():
+    assert cli.parse_params(["VPP", "2", "channel=1", "on=true", "x=[1, 2]", "a=b=c", "1x=2"]) == \
+        (["VPP", 2, "1x=2"], {"channel": 1, "on": True, "x": [1, 2], "a": "b=c"})
+    split = cli.split_arguments
+    assert split('VPP channel=2  gains=[1, 2] {"a": [3, 4]} \'two words\' note=\'a b\' "q \\" q"') == \
+        ["VPP", "channel=2", "gains=[1, 2]", '{"a": [3, 4]}', "two words", "note=a b", '"q \\" q"']
+    assert cli.parse_params(split('"text" [1, "two"] x={"k": null}')) == (["text", [1, "two"]], {"x": {"k": None}})
+    with pytest.raises(ValueError, match="not closed"):
+        split("'open")
+
+
+def test_gui_without_qt_says_how_to_get_it(capsys, monkeypatch):
+    import importlib
+    import importlib.util
+    import shutil
+
+    from insthub import service
+
+    def no_qt(name, *a, **k):
+        raise ImportError("insthub.qt needs a Qt binding: pip install 'insthub[gui]'")
+
+    monkeypatch.setattr(importlib, "import_module", no_qt)
+    for kind, fix in (("uv tool", "uv tool install --force --editable"), ("pipx", "pipx inject insthub"),
+                      (None, "pip install --python" if shutil.which("uv") and importlib.util.find_spec("pip") is None
+                       else "-m pip install pyqtgraph PyQt6")):
+        monkeypatch.setattr(service, "tool_environment", lambda prefix=None, kind=kind: kind)
+        code, _, err = run(capsys, "gui")
+        assert code == 1 and "insthub gui needs Qt" in err and fix in err
+    monkeypatch.setattr(service, "tool_environment", lambda prefix=None: "uv tool")
+    assert '/insthub[gui,mcp]"' in cli.qt_hint("x")                       # keeps the extras it had

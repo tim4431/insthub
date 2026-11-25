@@ -55,8 +55,10 @@ This writes a small *systemd user service*, starts it, and from then on:
 | `insthub service start NAME` | start it again |
 | `insthub service remove NAME` | stop it and remove it |
 
-The same controls, and the log, are in the manager window (`insthub gui`): select
-the server, or the service if it is not running.
+The same controls, and the log, are in the manager window (`insthub gui`): open
+the server from **Servers**, or the service if it is not running. Its **Add**
+button installs a service too (**Keep a server running...**), and **New
+server...** writes the config of a new server and starts it.
 
 Nothing here needs administrator rights. Two details:
 
