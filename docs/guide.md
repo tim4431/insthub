@@ -323,6 +323,7 @@ insthub serve CONFIG.toml                      host the devices of a config file
 insthub service install | list | remove | logs keep servers running in the background
 insthub sim [--gui]                            simulated instruments to try things on
 insthub bench                                  speed on this computer
+insthub mcp                                    the bus for AI agents, see agents.md
 ```
 
 Values are read as JSON where possible (`1e3`, `true`, `[1, 2]`) and as text

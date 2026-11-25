@@ -45,7 +45,7 @@ pip install -e /path/to/insthub                                          # or fr
 ## Try it without hardware
 
 ```bash
-insthub sim                          # terminal 1: a simulated scope, generator and camera
+insthub sim                          # terminal 1: simulated scope, generator, camera and spectrum analyzer
 ```
 
 ```bash
@@ -54,8 +54,19 @@ insthub call scope measure VPP
 insthub set synth frequency 2500
 insthub watch scope ch1              # the live trace, as text
 insthub view scope                   # the live trace, as a plot
-python examples/03_experiment.py    # a script that uses all three at once
+python examples/03_experiment.py    # a script that uses several at once
 ```
+
+## Let an AI agent use the instruments
+
+```bash
+claude mcp add --scope user insthub -- "$(which insthub)" mcp
+```
+
+Claude Code (or any agent that speaks MCP) can then list the instruments,
+read their documentation from your docstrings, call commands, set properties
+and take live traces, with large arrays handed over as files. See
+[using insthub from AI agents](docs/agents.md).
 
 ## The smallest example
 
@@ -99,13 +110,14 @@ for frame in thermo.subscribe("temperature"):
 | [How insthub works](docs/architecture.md) | the pieces, what happens during a call and a stream, how programs find each other, what happens when things break, and why it is built this way |
 | [Using insthub](docs/guide.md) | writing devices, putting existing drivers on the bus, calls, streams, errors, GUIs, the command line |
 | [Running servers](docs/running-servers.md) | starting servers, keeping them running in the background, who sets up what, several computers |
+| [AI agents](docs/agents.md) | letting Claude Code or another agent use the instruments: setup, the tools, what comes back |
 | [examples/](examples/) | four runnable examples, all on simulated instruments |
 
 ## Status
 
-- 175 tests cover calls, streams, device lifecycle, finding servers,
-  reconnecting, the command line, services and the GUI. Run them with
-  `python -m pytest tests` (about 12 s).
+- 186 tests cover calls, streams, device lifecycle, finding servers,
+  reconnecting, the command line, services, the GUI and the agent interface.
+  Run them with `python -m pytest tests` (about 15 s).
 - Developed and tested on Linux with Python 3.11, 3.12 and 3.14. Written to
   run on Windows, but never run there.
 - Not included: passwords or encryption for network connections, clients for
@@ -129,9 +141,11 @@ insthub/
   config.py     servers from a TOML file
   service.py    insthub service: background services
   qt.py         helpers for Qt GUIs             viewer.py   the generic live viewer
+  mcp.py        insthub mcp: the bus for AI agents
+  render.py     results as JSON plus files and plots, for agents
   sim.py        simulated instruments           bench.py    insthub bench
   cli.py        the insthub command
-docs/           the three pages above
+docs/           the pages above
 examples/       runnable examples
 tests/
 ```

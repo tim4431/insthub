@@ -10,8 +10,9 @@
                                                   the next command reopens it.  `insthub reopen DEVICE` does it now
     insthub view DEVICE                            live plots of its streams (needs insthub[gui])
     insthub serve CONFIG.toml                      host the devices listed in a config file
-    insthub sim [--name NAME] [--tcp PORT] [--gui] simulated scope, synth and camera
+    insthub sim [--name NAME] [--tcp PORT] [--gui] simulated scope, synth, camera and spectrum analyzer
     insthub bench                                  latency and throughput on this machine
+    insthub mcp [--data DIR] [--timeout S]         the bus for AI agents (MCP on stdin/stdout); see docs/agents.md
 
     insthub service install TARGET [--name NAME]   keep a server running in the background (systemd user service);
                                                   TARGET is a .toml config or a .py server script
@@ -236,6 +237,12 @@ def _cmd_bench(args) -> int:
     return bench.main(args.address, quick=args.quick)
 
 
+def _cmd_mcp(args) -> int:
+    from . import mcp
+
+    return mcp.main(args.data, args.timeout)
+
+
 def _cmd_service(args) -> int:
     from . import service
 
@@ -317,6 +324,12 @@ def main(argv=None) -> int:
     s = sub.add_parser("bench", help="measure call latency and data throughput")
     s.add_argument("--quick", action="store_true", help="shorter run")
     s.set_defaults(fn=_cmd_bench)
+    s = sub.add_parser("mcp", help="serve the bus to AI agents over MCP (stdin/stdout); see docs/agents.md")
+    s.add_argument("--data", metavar="DIR",
+                   help="where results too large to return inline are saved (default: $INSTHUB_DATA or ./.insthub)")
+    s.add_argument("--timeout", type=float, default=60.0, metavar="S",
+                   help="seconds a call may take unless the agent asks for longer (default 60)")
+    s.set_defaults(fn=_cmd_mcp)
     s = sub.add_parser("service", help="keep servers running in the background (systemd user services)")
     s.set_defaults(fn=_cmd_service)
     actions = s.add_subparsers(dest="action", required=True)

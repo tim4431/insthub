@@ -1,9 +1,10 @@
 """Simulated instruments: for trying the bus, for tests and benchmarks, and as
 templates for real drivers.  `insthub sim` serves all three.
 
-    SimScope    two channels of noisy sine; live traces on streams "ch1", "ch2"
-    SimSynth    signal generator with properties, wired to nothing
-    SimCamera   a moving Gaussian spot; frames on stream "image"
+    SimScope     two channels of noisy sine; live traces on streams "ch1", "ch2"
+    SimSynth     signal generator with properties
+    SimCamera    a moving Gaussian spot; frames on stream "image"
+    SimAnalyzer  spectrum analyzer cabled to the SimSynth: shows its tone while its output is on
 """
 from __future__ import annotations
 
@@ -119,7 +120,8 @@ class SimScope(Device):
 
 
 class SimSynth(Device):
-    """Signal generator: frequency and power are properties, like a local driver."""
+    """Signal generator: frequency and power are properties, like a local driver.
+    Its output is cabled to the simulated spectrum analyzer."""
 
     streams = {"sweep": "frequency (MHz) of each point while sweep() runs"}
     FREQ_RANGE_MHZ = (10.0, 24000.0)
@@ -235,9 +237,118 @@ class SimCamera(Device):
             self.publish("image", self._frame(), exposure_us=self._exposure)
 
 
+@dataclass
+class Spectrum:
+    """One sweep.  Point i is at frequency x0 + i*dx (Hz)."""
+
+    dbm: np.ndarray
+    x0: float
+    dx: float
+    unit: str = "dBm"
+    xunit: str = "Hz"
+
+    @property
+    def frequency(self) -> np.ndarray:
+        return self.x0 + self.dx * np.arange(len(self.dbm))
+
+
+class SimAnalyzer(Device):
+    """Spectrum analyzer.  Its input is cabled to the simulated synth through a
+    20 dB attenuator, so it shows the synth's tone (and a second harmonic
+    35 dB below it) while the synth's output is on."""
+
+    streams = {"trace": "live spectrum (dBm); meta: x0, dx (Hz)"}
+    MAX_HZ = 26.5e9
+
+    def __init__(self, name: str = "sa", source: SimSynth | None = None, points: int = 1001,
+                 attenuation_db: float = 20.0):
+        super().__init__(name)
+        self.source = source
+        self.points = int(points)
+        self.attenuation_db = float(attenuation_db)
+
+    def open(self) -> None:
+        self._rng = np.random.default_rng(2)
+        self._center, self._span, self._rbw = 1e9, 10e6, 100e3
+        self._publish_state()
+
+    def _publish_state(self) -> None:
+        self.set_state(center_Hz=self._center, span_Hz=self._span, rbw_Hz=self._rbw)
+
+    @prop
+    def center(self) -> float:
+        """Center frequency in Hz."""
+        return self._center
+
+    @center.setter
+    def center(self, hz: float) -> None:
+        if not 0 < hz <= self.MAX_HZ:
+            raise ValueError(f"center {hz} Hz outside 0-{self.MAX_HZ:g} Hz")
+        self._center = float(hz)
+        self._publish_state()
+
+    @prop
+    def span(self) -> float:
+        """Frequency span in Hz."""
+        return self._span
+
+    @span.setter
+    def span(self, hz: float) -> None:
+        if not 100 <= hz <= self.MAX_HZ:
+            raise ValueError(f"span {hz} Hz outside 100-{self.MAX_HZ:g} Hz")
+        self._span = float(hz)
+        self._publish_state()
+
+    @prop
+    def rbw(self) -> float:
+        """Resolution bandwidth in Hz (10 Hz to 10 MHz).  The noise floor is -90 dBm at 100 kHz."""
+        return self._rbw
+
+    @rbw.setter
+    def rbw(self, hz: float) -> None:
+        if not 10 <= hz <= 10e6:
+            raise ValueError(f"rbw {hz} Hz outside 10 Hz-10 MHz")
+        self._rbw = float(hz)
+        self._publish_state()
+
+    def _tones(self) -> list[tuple[float, float]]:
+        st = self.source.state if self.source is not None else {}
+        if not st.get("rf"):
+            return []
+        f, p = st["frequency_MHz"] * 1e6, st["power_dBm"] - self.attenuation_db
+        return [(f, p), (2 * f, p - 35.0)]
+
+    @command
+    def trace(self) -> Spectrum:
+        """Take one sweep."""
+        n = self.points
+        x0, dx = self._center - self._span / 2, self._span / (n - 1)
+        f = x0 + dx * np.arange(n)
+        floor = -90.0 + 10 * np.log10(self._rbw / 100e3)
+        mw = 10 ** ((floor + self._rng.normal(0, 1.0, n)) / 10)
+        sigma = max(self._rbw, dx) / 2.355  # as with a peak detector: a tone never falls between points
+        for ft, p in self._tones():
+            mw += 10 ** (p / 10) * np.exp(-0.5 * ((f - ft) / sigma) ** 2)
+        return Spectrum((10 * np.log10(mw)).astype(np.float32), x0, dx)
+
+    @command
+    def peak(self) -> dict:
+        """Marker to peak: frequency (Hz) and level (dBm) of the highest point of a new sweep."""
+        s = self.trace()
+        i = int(np.argmax(s.dbm))
+        return {"frequency_Hz": s.x0 + i * s.dx, "level_dBm": float(s.dbm[i])}
+
+    @periodic(0.1)
+    def _sweep(self) -> None:
+        if self.subscribers("trace"):
+            s = self.trace()
+            self.publish("trace", s.dbm, x0=s.x0, dx=s.dx, xunit="Hz", xlabel="frequency", unit="dBm")
+
+
 def devices() -> list[Device]:
-    """One of each, as served by `insthub sim`."""
-    return [SimScope(), SimSynth(), SimCamera()]
+    """One of each, as served by `insthub sim`; the analyzer is cabled to the synth."""
+    synth = SimSynth()
+    return [SimScope(), synth, SimCamera(), SimAnalyzer(source=synth)]
 
 
 class Loopback(Device):

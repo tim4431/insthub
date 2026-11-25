@@ -26,7 +26,7 @@ def test_device_is_found_in_another_process(spawned):
     assert scope.get_waveform(1).volts.shape == (1000,)
     info = insthub.discover()[0]
     assert info["server"] == "child" and info["pid"] == spawned.proc.pid and "camera" in info["devices"]
-    with pytest.raises(insthub.DeviceNotFound, match="known devices: camera, loopback, scope, synth"):
+    with pytest.raises(insthub.DeviceNotFound, match="known devices: camera, loopback, sa, scope, synth"):
         insthub.device("laser")
 
 

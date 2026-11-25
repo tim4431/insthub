@@ -208,6 +208,7 @@ the instruments, so open a TCP port only on a network you trust.
 | Sockets and announcements of running servers | `$XDG_RUNTIME_DIR/insthub/` (for example `/run/user/1000/insthub/`); override with `INSTHUB_DIR` |
 | Addresses of devices on other computers | `~/.config/insthub/devices.toml`; override with `INSTHUB_DEVICES` |
 | Service definitions | `~/.config/systemd/user/insthub-NAME.service` |
+| Results saved for AI agents by `insthub mcp` | `.insthub/` in the folder the agent was started in; override with `INSTHUB_DATA` or `--data` |
 
 A server and its clients must use the same first folder to find each other by
 name. They do when both run under your account in a normal login session or as

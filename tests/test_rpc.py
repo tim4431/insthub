@@ -176,7 +176,7 @@ def test_introspection(client):
     assert scope.measure.__doc__.startswith("measure(item: str = 'VPP', channel: int = 1) -> float")
     text = client.synth.bus.help()
     assert "frequency" in text and "locked  (read-only)" in text and "rf(on: bool = True) -> bool" in text
-    assert sorted(client.devices()) == ["camera", "loopback", "scope", "synth"]
+    assert sorted(client.devices()) == ["camera", "loopback", "sa", "scope", "synth"]
     assert client.ping() < 0.5
 
 

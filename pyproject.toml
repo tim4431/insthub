@@ -14,6 +14,8 @@ dependencies = ["numpy>=1.24", "msgpack>=1.0"]
 [project.optional-dependencies]
 # Live plotting (insthub.qt, `insthub view`). pyqtgraph works with PyQt5, PyQt6 or PySide6.
 gui = ["pyqtgraph>=0.13", "PyQt6>=6.5"]
+# Plots for AI agents (`insthub mcp`, plot=true). The MCP server itself needs nothing extra.
+mcp = ["matplotlib>=3.6"]
 dev = ["pytest>=8"]
 
 [project.urls]
