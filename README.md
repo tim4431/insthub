@@ -62,6 +62,11 @@ flowchart LR
   alone, and insthub knows nothing about any particular instrument.
 - **A window for all of it.** `insthub gui` shows every instrument as a tile
   with a live preview, and sets up new servers for you.
+- **Devices say what they take.** A setting can carry its unit, limits and
+  choices, and a command can be marked dangerous. The window then shows a
+  spin box with the unit or a list, and asks before anything dangerous;
+  agents read the units and need a tool of their own for what is dangerous.
+  A simulator says so, and is marked SIM everywhere.
 - **AI agents, in plain sight.** Claude Code or any agent that speaks MCP can
   read your instruments' documentation and use them, and the window shows
   when one does.
@@ -124,7 +129,9 @@ port = "/dev/ttyUSB0"               # passed to its constructor
 
 Start it with `insthub serve lab.toml`. You do not even have to write the
 file: in `insthub gui`, **Add → New server...** writes it for you, reading the
-arguments your driver takes from its source.
+arguments your driver takes from its source, and **⋯ → Edit lab.toml...**
+changes it later, keeping your comments. [Adding an instrument](docs/adding-a-device.md)
+walks through it step by step, with every key of the file.
 
 **Or as a device of its own**, in one file:
 
@@ -171,10 +178,12 @@ you list:
 - **Devices**: every instrument as a tile. Each tile says whether the
   instrument is connected (and if not, why), shows a live preview of its
   trace, image or reading, and who is watching it. Click a tile to read and
-  set its properties, run its commands, switch its periodic tasks, or open
-  live plots.
-- **Servers**: start, stop and restart them, read their logs, and see which
-  programs are connected.
+  set its properties, run its commands, switch its periodic tasks, open live
+  plots, or **Pause** it: everything stays off the instrument until you
+  resume it, while you use it by hand.
+- **Servers**: start, stop and restart them, read their logs, choose whether
+  each starts at login, edit their config, and see which programs are
+  connected.
 - **Add**: write the config of a new server by picking its drivers, keep a
   server running in the background, or add the devices of another computer.
 - **Settings**: light or dark, or the same as the desktop.
@@ -192,25 +201,30 @@ claude mcp add --scope user insthub -- insthub mcp     # with the insthub comman
 
 Claude Code (or any agent that speaks MCP) can then list the instruments, read
 their documentation from your docstrings, call commands, set properties and
-take live traces, with large arrays handed over as files. The **AI agents**
-page of `insthub gui` does this setup with a click and shows which agents are
-connected. See [AI agents](docs/agents.md).
+take live traces, with large arrays handed over as files. What a device marks
+dangerous needs a separate tool, `call_dangerous`, so you can let the agent
+use everything else without being asked. The **AI agents** page of `insthub
+gui` does this setup with a click and shows which agents are connected. See
+[AI agents](docs/agents.md).
 
 ## Documentation
 
 | Read this | To learn |
 |---|---|
 | [How insthub works](docs/architecture.md) | the pieces, what happens during a call and a stream, how programs find each other, what happens when things break, how the window is built, and why it is built this way |
+| [Adding an instrument](docs/adding-a-device.md) | putting your instrument on the bus step by step: the config file and every key in it, trying it, keeping it running, changing it later, what to do when it does not work |
 | [Using insthub](docs/guide.md) | writing devices, putting existing drivers on the bus, calls, streams, errors, GUIs, the window, the command line |
 | [Running servers](docs/running-servers.md) | starting servers, keeping them running in the background, who sets up what, several computers |
 | [AI agents](docs/agents.md) | letting Claude Code or another agent use the instruments: setup, the tools, what comes back |
+| [Design](docs/design.md) | the rules every change follows, the planned extensions (an instrument's driver and UI in one folder), and what we learned from other lab-control projects |
 | [examples/](examples/) | four runnable examples, all on simulated instruments |
 
 ## Status
 
-- 222 tests cover calls, streams, device lifecycle, finding servers,
-  reconnecting, the command line, config files, services, the GUIs and the
-  agent interface. Run them with `python -m pytest tests` (about 30 s).
+- 350 tests cover calls, streams, device lifecycle, finding servers,
+  reconnecting, mixed insthub versions, the command line, config files,
+  services, the GUIs, the agent interface, and how little `import insthub`
+  loads. Run them with `python -m pytest tests` (about 30 s).
 - Developed and tested on Linux with Python 3.11, 3.12 and 3.14. Written to
   run on Windows, but never run there.
 - Not included: passwords or encryption for network connections, clients for

@@ -1,11 +1,13 @@
 """The dialogs of `insthub gui` that set things up, so that nothing has to be
 typed into a file by hand.  Each shows the file it writes or the command it runs.
 
-    NewServerDialog   a new server: its name, who may reach it, and its devices.  For each a
-                      driver ("module:Class", or a .py file to pick a class from) and the
-                      arguments of its constructor, which are read from the driver's source
-                      without running it.  Writes NAME.toml (config.dump), then starts it as
-                      a background service, or once, or not at all.
+    ServerDialog      a server's config.  New: its name, who may reach it, and its devices;
+                      for each a driver ("module:Class", or a .py file to pick a class from)
+                      and the arguments of its constructor, which are read from the driver's
+                      source without running it.  Writes NAME.toml (config.dump), then starts
+                      it as a background service (at login or not), or once, or not at all.
+                      Existing (`path=`): the same form, filled from the file; saving changes
+                      only what was changed (tomlfile.edit: comments stay), then restarts it.
     ServiceDialog     keep an existing .toml config or .py server running in the background
     RemoteDialog      a server on another computer: asks it which devices it has, and adds
                       them to devices.toml (registry.edit_static_devices)
@@ -16,18 +18,21 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import difflib
 import inspect
 import json
 import os
+import re
 import shlex
 import sys
+import tomllib
 from pathlib import Path
 
-from . import cli, config, registry, service
+from . import cli, config, registry, service, tomlfile
 from . import widgets as ui
 from .client import _SocketTransport
 from .inventory import find_python
-from .qt import QtCore, QtWidgets
+from .qt import QtCore, QtGui, QtWidgets
 
 Qt = QtCore.Qt
 
@@ -87,10 +92,12 @@ def classes_in(source: str) -> dict[str, list[tuple[str, str | None, bool]]]:
     return found
 
 
-def constructor_args(driver: str, folder: str = "") -> list[tuple[str, str | None, bool]] | None:
+def constructor_args(driver: str, folder: str = "", base: str | Path | None = None
+                     ) -> list[tuple[str, str | None, bool]] | None:
     """The constructor arguments of a driver ("module:Class"), or None where they cannot
     be known without importing it.  Only insthub's own drivers are imported; any other
-    is read from its .py file in `folder`."""
+    is read from its .py file in `folder` (a relative one counts from `base`, the folder
+    the server runs in: the config's)."""
     module, _, name = driver.partition(":")
     if not module or not name:
         return None
@@ -104,7 +111,10 @@ def constructor_args(driver: str, folder: str = "") -> list[tuple[str, str | Non
                 for p in params if p.name != "name" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)]
     if not folder:
         return None
-    base = Path(folder).expanduser() / Path(*module.split("."))
+    where = Path(folder).expanduser()
+    if not where.is_absolute() and base is not None:
+        where = Path(base) / where
+    base = where / Path(*module.split("."))
     for path in (base.with_suffix(".py"), base / "__init__.py"):
         if path.is_file():
             try:
@@ -117,37 +127,179 @@ def constructor_args(driver: str, folder: str = "") -> list[tuple[str, str | Non
 # ---------------------------------------------------------------- a new server
 @dataclasses.dataclass
 class DeviceSpec:
-    """One device of a new server, as typed into the dialog."""
+    """One device of a server's config, as shown in the dialog.  `loaded` and `original`
+    remember what the file said, so that a field nobody touched is written back exactly
+    as it was (its type, its spaces, an empty string)."""
 
     name: str
     driver: str = ""
     folder: str = ""
     lazy: bool = False
     args: dict = dataclasses.field(default_factory=dict)  #: constructor argument -> text typed (empty: default)
-    texts: set = dataclasses.field(default_factory=set)  #: arguments whose value is text whatever it looks like
-    extra: str = ""  #: more arguments, a "key = value" per line
+    texts: set = dataclasses.field(default_factory=set)  #: arguments whose default is text
+    strings: set = dataclasses.field(default_factory=set)  #: keys that are text in the file
+    extra: str = ""  #: more keys, as TOML lines:  key = value
+    loaded: dict = dataclasses.field(default_factory=dict)  #: argument -> the text its field was filled with
+    in_kwargs: set = dataclasses.field(default_factory=set)  #: arguments the file gives under kwargs
+    known: set | None = None  #: the arguments of its driver as it is now (None: not known)
+    original: dict = dataclasses.field(default_factory=dict)  #: the device's table in the file
+    was: str | None = None  #: its name in the file (None: a new device)
+    dirty: bool = False  #: changed in the dialog
 
     def table(self) -> dict:
         """Its [devices.NAME] table.  Raises ValueError for what cannot be written."""
         registry.check_name(self.name, "device name")
         if ":" not in self.driver:
             raise ValueError(f"{self.name}: the driver must look like module:Class")
+        old = self.original
         out: dict = {"driver": self.driver.strip()}
         if self.folder.strip():
-            out["path"] = self.folder.strip()
+            out["path"] = old["path"] if old.get("path") == self.folder.strip() else self.folder.strip()
         if self.lazy:
             out["lazy"] = True
+        elif old.get("lazy") is False:
+            out["lazy"] = False  # written as false in the file: stays so
+        old_kwargs = self._old_kwargs()
+        kwargs: dict = {}  # what the dialog shows of them: its fields, and the kwargs.* lines of more keys
         for key, text in self.args.items():
-            if text.strip():
-                out[key] = text.strip() if key in self.texts else cli._value(text.strip())
-        for line in self.extra.splitlines():
-            if not line.strip() or line.strip().startswith("#"):
-                continue
-            key, eq, text = line.partition("=")
-            if not eq or not key.strip().isidentifier():
-                raise ValueError(f"{self.name}: “{line.strip()}” should look like  key = value")
-            out[key.strip()] = cli._value(text.strip())
+            if self.known is not None and key not in self.known:
+                continue  # an argument of another driver chosen before (kept, should that one come back)
+            inside, value = self.argument(key, text)
+            target = kwargs if inside else out
+            if value is not None:
+                target[key] = value
+            else:
+                target.pop(key, None)
+        try:
+            more = tomllib.loads(self.extra)
+        except tomllib.TOMLDecodeError as e:
+            raise ValueError(f"{self.name}: more keys: {e} (write them as in the file:  key = value)") from None
+        for key, value in more.items():
+            if key == "kwargs" and isinstance(value, dict):
+                kwargs.update({k: old_kwargs[k] if k in old_kwargs and tomlfile.same(old_kwargs[k], v) else v
+                               for k, v in value.items()})
+            else:
+                out[key] = old[key] if key in old and tomlfile.same(old[key], value) else value
+        if kwargs:
+            out["kwargs"] = kwargs
         return out
+
+    def _old_kwargs(self) -> dict:
+        return self.original["kwargs"] if isinstance(self.original.get("kwargs"), dict) else {}
+
+    def argument(self, key: str, text: str) -> tuple[bool, object]:
+        """(whether it goes under kwargs, its value; None: not given) of an argument whose field holds
+        `text`.  Raises ValueError for what cannot be written."""
+        # where the file gives it, and an argument called like a key of insthub's: under kwargs
+        inside = key in config._RESERVED or key in self.in_kwargs
+        if key in self.loaded and text == self.loaded[key]:
+            return inside, (self._old_kwargs() if inside else self.original).get(key)  # untouched: as it was
+        if not text.strip():
+            return inside, None  # emptied: the driver's default
+        if key in self.texts or key in self.strings:
+            return inside, text.strip()
+        value = cli._value(text.strip())
+        if value is None:
+            raise ValueError(f"{self.name}: {key} = null cannot be written (a TOML file has no null); "
+                             "leave the field empty to keep the driver's default")
+        return inside, value
+
+
+_SHOWN = ("driver", "path", "lazy")  #: keys of a device table that have their own field
+
+
+def _gone(old: dict, new: dict, path: tuple = ()) -> list[str]:
+    """What is in `old` but not in `new`, as HTML: the tables, and the keys with the table they were in."""
+    out = []
+    for k, v in old.items():
+        if k not in new:
+            if isinstance(v, dict):
+                out.append(f"<code>{_esc(tomlfile.header((*path, k)))}</code>")
+            else:
+                line = f"{tomlfile.key(k)} = {tomlfile.value(v)}"
+                line = line if len(line) <= 60 else line[:57] + "..."
+                out.append(f"<code>{_esc(line)}</code>" + (f" in <code>{_esc(tomlfile.header(path))}</code>"
+                                                            if path else ""))
+        elif isinstance(v, dict) and isinstance(new[k], dict):
+            out += _gone(v, new[k], (*path, k))
+    return out
+
+
+def _esc(text) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def read_config(text: str, base: str | Path | None = None) -> tuple[dict, list[DeviceSpec]]:
+    """The [server] table and the devices of a config, as the dialog shows them: each
+    constructor argument the driver declares in a field of its own, the rest as TOML lines
+    of `key = value`.  `base`: the config's folder.  Raises ValueError for a file that is
+    not an insthub config."""
+    doc = tomllib.loads(text)
+    server, devices = doc.get("server", {}), doc.get("devices", {})
+    if not isinstance(server, dict) or not isinstance(devices, dict) or \
+            any(not isinstance(t, dict) for t in devices.values()):
+        raise ValueError("this is not an insthub server's config (its [server] and [devices.NAME] are not tables)")
+    specs = []
+    for name, table in devices.items():
+        spec = DeviceSpec(name, str(table.get("driver", "")), str(table.get("path", "")), table.get("lazy") is True,
+                          original=table, was=name)
+        arguments = constructor_args(spec.driver, spec.folder, base)
+        known = spec.known = None if arguments is None else {arg for arg, _, _ in arguments}
+        known = known or set()
+        extra, kwargs = [], table.get("kwargs") if isinstance(table.get("kwargs"), dict) else {}
+
+        def field(spec, key, value, inside=False):
+            spec.args[key] = spec.loaded[key] = _text(value)
+            if isinstance(value, str):
+                spec.strings.add(key)
+            if inside:
+                spec.in_kwargs.add(key)
+
+        for key, value in table.items():  # insthub's keys (driver, close, ...) never fill an argument's field
+            if key in _SHOWN or (key == "kwargs" and isinstance(value, dict)):
+                continue
+            if key in known and _plain(value) and key not in config._RESERVED and key not in kwargs:
+                field(spec, key, value)
+            else:
+                extra.append(f"{tomlfile.key(key)} = {tomlfile.value(value)}")
+        for key, value in kwargs.items():  # (what kwargs gives wins over a key of the same name)
+            if key in known and _plain(value):
+                field(spec, key, value, inside=True)
+            else:
+                extra.append(f"kwargs.{tomlfile.key(key)} = {tomlfile.value(value)}")
+        spec.extra = "\n".join(extra)
+        specs.append(spec)
+    return server, specs
+
+
+def _first_change(old: str, new: str) -> int | None:
+    """The first line of `new` that differs from `old` (None: none does)."""
+    a, b = old.split("\n"), new.split("\n")
+    for op, _, _, b0, _ in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op != "equal":
+            return min(b0, len(b) - 1)
+    return None
+
+
+def _placeholder(d: DeviceSpec) -> bool:
+    """Whether a device still has the name Add gave it (device1): the driver chosen may name it."""
+    return d.was is None and re.fullmatch(r"device\d+", d.name) is not None
+
+
+def _plain(value) -> bool:
+    """Whether a value fits in a field of its own (else it is shown under more keys)."""
+    return isinstance(value, (str, int, float, bool))
+
+
+def _given_in(extra: str, in_kwargs: set = frozenset()) -> set:
+    """The constructor arguments that these more-keys lines give (kwargs.x, and x for a key that
+    is not insthub's own, nor one that kwargs gives too: kwargs wins)."""
+    try:
+        more = tomllib.loads(extra)
+    except tomllib.TOMLDecodeError:
+        return set()
+    inner = more.get("kwargs") if isinstance(more.get("kwargs"), dict) else {}
+    return {k for k in more if k not in config._RESERVED and k not in in_kwargs} | set(inner)
 
 
 def _browse_row(edit: QtWidgets.QLineEdit, slot) -> QtWidgets.QWidget:
@@ -159,6 +311,7 @@ def _browse_row(edit: QtWidgets.QLineEdit, slot) -> QtWidgets.QWidget:
     browse = ui.button("", "folder", tip="Choose...", slot=slot)
     browse.setFixedWidth(38)
     layout.addWidget(browse)
+    row.browse = browse
     return row
 
 
@@ -171,36 +324,78 @@ def _form() -> QtWidgets.QFormLayout:
     return form
 
 
-class NewServerDialog(QtWidgets.QDialog):
-    """Write the config of a new server and start it."""
+LOCAL, TCP_HERE, NETWORK = "local", "tcp-here", "network"  #: who may reach a server
 
-    START_SERVICE, START_ONCE, SAVE_ONLY = "service", "once", "save"
 
-    def __init__(self, window):
+def _reach(tcp) -> tuple[str, int | None]:
+    """(who may reach it, the port) from a [server] tcp value: none, 8765 or "127.0.0.1:8765"
+    (TCP, but this computer only), "0.0.0.0:8765" (other computers too)."""
+    if tcp is None:
+        return LOCAL, None
+    if isinstance(tcp, int) or (isinstance(tcp, str) and tcp.isdigit()):
+        return TCP_HERE, int(tcp)
+    host, _, port = str(tcp).rpartition(":")
+    port = int(port) if port.isdigit() else None
+    return (TCP_HERE if host.startswith("127.") or host in ("localhost", "::1", "[::1]") else NETWORK), port
+
+
+def _tcp(reach: str, port: int):
+    """The [server] tcp value for a choice of _reach (None: no TCP)."""
+    return None if reach == LOCAL else port if reach == TCP_HERE else f"0.0.0.0:{port}"
+
+
+class ServerDialog(QtWidgets.QDialog):
+    """The config of a server: a new one (written with config.dump, then started), or an
+    existing file (`path`), changed in place with tomlfile so that its comments and whatever
+    is not changed stay as they are, then restarted."""
+
+    SERVICE, ONCE, SAVE, RESTART = "service", "once", "save", "restart"
+
+    def __init__(self, window, path: str | Path | None = None, server=None, select: str | None = None):
         super().__init__(window)
         self.window = window
-        self.setWindowTitle("New server")
-        self.devices: list[DeviceSpec] = [DeviceSpec("scope", "insthub.sim:SimScope")]
+        self.existing = Path(path).expanduser() if path else None
+        self.server = server  #: inventory.Server of a running (or installed) server, when editing its file
         self._arg_edits: dict[str, QtWidgets.QLineEdit] = {}
         self._loading = False
+        if self.existing is not None:
+            self._original = tomlfile.read(self.existing)
+            table, self.devices = read_config(self._original, self.existing.parent)
+            self._server_table = table
+        else:
+            self._original, self._server_table = "", {}
+            self.devices = [DeviceSpec("scope", "insthub.sim:SimScope")]
+        title = f"Edit {self.existing.name}" if self.existing else "New server"
+        self.setWindowTitle(title)
 
-        self.name = QtWidgets.QLineEdit("lab")
-        self.folder = QtWidgets.QLineEdit(str(servers_folder()))
+        self.name = QtWidgets.QLineEdit(str(self._server_table.get("name") or
+                                            (self.existing.stem if self.existing else "lab")))
+        self.folder = QtWidgets.QLineEdit(str(self.existing.parent if self.existing else servers_folder()))
         self.reach = QtWidgets.QComboBox()
-        self.reach.addItem("This computer only", False)
-        self.reach.addItem("Other computers too, on a TCP port", True)
+        self.reach.addItem("This computer only", LOCAL)
+        self.reach.addItem("This computer, also on a TCP port", TCP_HERE)
+        self.reach.addItem("Other computers too, on a TCP port", NETWORK)
         self.port = QtWidgets.QSpinBox()
         self.port.setRange(1, 65535)
-        self.port.setValue(8700)
+        self.port.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.port.setPrefix("port ")
+        reach_now, port = _reach(self._server_table.get("tcp"))
+        self.reach.setCurrentIndex(self.reach.findData(reach_now))
+        self.port.setValue(port or 8700)
+        self._reach_initial = (reach_now, self.port.value())
         reach = QtWidgets.QHBoxLayout()
         reach.setSpacing(8)
         reach.addWidget(self.reach, 1)
         reach.addWidget(self.port)
-        server, box = ui.card()
+        server_card, box = ui.card()
         box.addWidget(ui.label("Server", "h2"))
         form = _form()
         form.addRow(ui.label("Name", "label"), self.name)
-        form.addRow(ui.label("Saved in", "label"), _browse_row(self.folder, self._browse_folder))
+        folder_row = _browse_row(self.folder, self._browse_folder)
+        if self.existing:
+            self.folder.setReadOnly(True)
+            folder_row.browse.hide()
+        form.addRow(ui.label("Saved in", "label"), folder_row)
         form.addRow(ui.label("Reached from", "label"), reach)
         box.addLayout(form)
 
@@ -233,18 +428,23 @@ class NewServerDialog(QtWidgets.QDialog):
         self.dev_folder = QtWidgets.QLineEdit()
         self.dev_folder.setPlaceholderText("where its module is, if it is not an installed package")
         self.open_now = ui.Switch(True)
-        self.open_now.setToolTip("Off: the instrument is opened on first use instead")
+        self.open_now.setToolTip("On: the instrument is opened when the server starts. Off (lazy): on first use, "
+                                 "e.g. for one that is often unplugged or shared with other software")
         self.args_form = _form()
         self.args_note = ui.label("", "small", wrap=True)
         self.extra = QtWidgets.QPlainTextEdit()
         self.extra.setProperty("role", "code")
-        self.extra.setPlaceholderText("more arguments, one per line:  port = \"/dev/ttyUSB0\"")
-        self.extra.setFixedHeight(64)
+        self.extra.setPlaceholderText("more keys, one per line, as in the file:  port = \"/dev/ttyUSB0\"")
+        self.extra.setFixedHeight(70)
         editor = _form()
         editor.addRow(ui.label("Name", "label"), self.dev_name)
         editor.addRow(ui.label("Driver", "label"), driver_row)
         editor.addRow(ui.label("Folder", "label"), _browse_row(self.dev_folder, self._browse_dev_folder))
-        editor.addRow(ui.label("Open at start", "label"), self.open_now)
+        open_row = QtWidgets.QHBoxLayout()
+        open_row.addWidget(self.open_now)
+        self.open_hint = ui.label("", "small")
+        open_row.addWidget(self.open_hint, 1)
+        editor.addRow(ui.label("Open at start", "label"), open_row)
         args = QtWidgets.QVBoxLayout()
         args.setSpacing(6)
         args.addWidget(ui.label("Arguments of its constructor", "label"))
@@ -256,56 +456,67 @@ class NewServerDialog(QtWidgets.QDialog):
         right.addLayout(editor)
         right.addLayout(args)
         right.addStretch(1)
-        devices, box2 = ui.card()
+        devices_card, box2 = ui.card()
         box2.addWidget(ui.label("Devices", "h2"))
         box2.addWidget(ui.label("One per instrument. Each needs a driver: a Python class that talks to it.", "muted",
                                 wrap=True))
         split = QtWidgets.QHBoxLayout()
         split.setSpacing(18)
         split.addLayout(side)
-        split.addLayout(right, 1)
+        self.device_editor = QtWidgets.QWidget()
+        self.device_editor.setLayout(right)
+        right.setContentsMargins(0, 0, 0, 0)
+        split.addWidget(self.device_editor, 1)
         box2.addLayout(split)
 
         self.python = QtWidgets.QLineEdit(sys.executable)
         self.then = QtWidgets.QComboBox()
-        if window._systemd:
-            self.then.addItem("Start it now, and at every login (background service)", self.START_SERVICE)
-        self.then.addItem("Start it now, until it is stopped", self.START_ONCE)
-        self.then.addItem("Only save the file", self.SAVE_ONLY)
-        running, box3 = ui.card()
-        box3.addWidget(ui.label("Running it", "h2"))
+        self.login = ui.Switch(True)
+        self.login.setToolTip("Start the service at every login (and at boot, with lingering on)")
+        running_card, box3 = ui.card()
+        box3.addWidget(ui.label("After saving" if self.existing else "Running it", "h2"))
         form3 = _form()
-        form3.addRow(ui.label("Python", "label"), _browse_row(self.python, self._browse_python))
+        self.python_row = _browse_row(self.python, self._browse_python)
+        if not self.existing:
+            form3.addRow(ui.label("Python", "label"), self.python_row)
         form3.addRow(ui.label("Then", "label"), self.then)
+        self.login_label = ui.label("Start at login", "label")
+        form3.addRow(self.login_label, self.login)
         box3.addLayout(form3)
-        box3.addWidget(ui.label("The Python must be the one that has the drivers' packages; a virtualenv next to "
-                                "the driver or the config is picked by itself.", "small", wrap=True))
+        self.then_note = ui.label("", "small", wrap=True)
+        box3.addWidget(self.then_note)
+        self._fill_then()
 
         area, content = ui.scroll_page(margins=(0, 0, 8, 0), spacing=14)
-        for widget in (server, devices, running):
+        for widget in (server_card, devices_card, running_card):
             content.addWidget(widget)
         content.addStretch(1)
-        self.file_label = ui.label("", "label", select=True)
+        self.file_label = ui.label("", "label")
         self.preview = QtWidgets.QPlainTextEdit()
         self.preview.setProperty("role", "code")
         self.preview.setReadOnly(True)
         self.preview.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        self.removed = ui.label("", "small", wrap=True, select=True)  # the lines saving removes
+        self.removed.setTextFormat(Qt.TextFormat.RichText)
         self.problem = ui.label("", "error", wrap=True)
         file_side = QtWidgets.QVBoxLayout()
         file_side.setSpacing(8)
-        file_side.addWidget(ui.label("The file it writes", "h2"))
+        file_side.addWidget(ui.label("The file after saving" if self.existing else "The file it writes", "h2"))
         file_side.addWidget(self.file_label)
+        if self.existing:
+            file_side.addWidget(ui.label("What saving changes is highlighted.", "small"))
         file_side.addWidget(self.preview, 1)
+        file_side.addWidget(self.removed)
         file_side.addWidget(self.problem)
         columns = QtWidgets.QHBoxLayout()
         columns.setSpacing(20)
         columns.addWidget(area, 1)
         preview_side = QtWidgets.QWidget()
         preview_side.setLayout(file_side)
-        preview_side.setFixedWidth(380)
+        preview_side.setFixedWidth(400)
         columns.addWidget(preview_side)
 
-        self.create = ui.button("Create", "check", kind="primary", slot=self._create)
+        self.create = ui.button("Save" if self.existing else "Create", "check", kind="primary", slot=self._create)
         cancel = ui.button("Cancel", slot=self.reject)
         bottom = QtWidgets.QHBoxLayout()
         bottom.addStretch(1)
@@ -314,17 +525,20 @@ class NewServerDialog(QtWidgets.QDialog):
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(22, 20, 22, 18)
         outer.setSpacing(14)
-        outer.addWidget(ui.label("New server", "h1"))
-        outer.addWidget(ui.label("A server holds the connections to its instruments. Choose its devices; the "
-                                 "config file is written for you, and you can edit it later.", "muted", wrap=True))
+        outer.addWidget(ui.label(title, "h1"))
+        outer.addWidget(ui.label(
+            "Only what you change is written into the file; its comments, and everything else, stay as they are. "
+            "The server reads it when it starts." if self.existing else
+            "A server holds the connections to its instruments. Choose its devices; the config file is written "
+            "for you, and you can edit it later.", "muted", wrap=True))
         outer.addLayout(columns, 1)
         outer.addLayout(bottom)
-        self.resize(1180, 760)
+        self.resize(1200, 780)
 
         for edit in (self.name, self.folder, self.python):
             edit.textChanged.connect(self._update)
-        self.reach.currentIndexChanged.connect(self._update)
-        self.port.valueChanged.connect(self._update)
+        self.reach.currentIndexChanged.connect(self._reach_changed)
+        self.port.valueChanged.connect(self._reach_changed)
         self.then.currentIndexChanged.connect(self._update)
         self.dev_name.textEdited.connect(self._edited)
         self.driver.currentTextChanged.connect(self._driver_changed)
@@ -332,7 +546,29 @@ class NewServerDialog(QtWidgets.QDialog):
         self.open_now.toggled.connect(self._edited)
         self.extra.textChanged.connect(self._edited)
         self._refill_list()
-        self._select(0)
+        names = [d.name for d in self.devices]
+        row = names.index(select) if select in names else 0
+        self.list.setCurrentRow(row)
+        self._select(row)
+
+    def _fill_then(self) -> None:
+        """What may follow the saving: for a new server, how to start it; for an existing file,
+        whether to restart the server that runs it."""
+        then, s, window = self.then, self.server, self.window
+        then.clear()
+        if not self.existing:
+            if window._systemd:
+                then.addItem("Start it as a background service", self.SERVICE)
+            then.addItem("Start it now, until it is stopped", self.ONCE)
+            then.addItem("Only save the file", self.SAVE)
+            return
+        running = s is not None and s.origin == "local"
+        if s is not None and s.service:
+            then.addItem("Restart the service, to use it" if running else "Start the service, to use it",
+                         self.RESTART)
+        elif running and window.started_here(s.pid):
+            then.addItem("Restart the server, to use it", self.RESTART)
+        then.addItem("Only save the file", self.SAVE)
 
     # -- the list of devices --------------------------------------------------
     def _refill_list(self) -> None:
@@ -343,19 +579,20 @@ class NewServerDialog(QtWidgets.QDialog):
             self.list.addItem(d.name or "(no name)")
         self.list.setCurrentRow(min(max(row, 0), len(self.devices) - 1))
         self.list.blockSignals(blocked)
-        self.drop.setEnabled(len(self.devices) > 1)
+        self.drop.setEnabled(len(self.devices) > (0 if self.existing else 1))  # a new server needs a device
 
     def _add(self) -> None:
         taken = {d.name for d in self.devices}
         name = next(f"device{i}" for i in range(1, 1000) if f"device{i}" not in taken)
-        self.devices.append(DeviceSpec(name))
+        self.devices.append(DeviceSpec(name, dirty=True))
         self._refill_list()
         self.list.setCurrentRow(len(self.devices) - 1)
+        self._select(len(self.devices) - 1)
         self.dev_name.setFocus()
         self.dev_name.selectAll()
 
     def _remove(self) -> None:
-        if len(self.devices) > 1:
+        if self.current() is not None and len(self.devices) > (0 if self.existing else 1):
             del self.devices[self.list.currentRow()]
             self._refill_list()
             self._select(self.list.currentRow())
@@ -366,7 +603,9 @@ class NewServerDialog(QtWidgets.QDialog):
 
     def _select(self, row: int) -> None:
         d = self.current()
+        self.device_editor.setEnabled(d is not None)
         if d is None:
+            self._update()
             return
         self._loading = True
         self.dev_name.setText(d.name)
@@ -379,10 +618,15 @@ class NewServerDialog(QtWidgets.QDialog):
         self._update()
 
     # -- editing a device -------------------------------------------------------
+    def _base(self) -> Path | None:
+        """The folder a relative driver folder counts from: the config's."""
+        return self.existing.parent if self.existing else None
+
     def _edited(self, *_) -> None:
         d = self.current()
         if d is None or self._loading:
             return
+        d.dirty = True
         d.name = self.dev_name.text().strip()
         d.driver = self.driver.currentText().strip()
         d.folder = self.dev_folder.text().strip()
@@ -390,6 +634,7 @@ class NewServerDialog(QtWidgets.QDialog):
         d.extra = self.extra.toPlainText()
         for key, edit in self._arg_edits.items():
             d.args[key] = edit.text()
+        self._mark_given()
         item = self.list.currentItem()
         if item is not None:
             item.setText(d.name or "(no name)")
@@ -402,31 +647,48 @@ class NewServerDialog(QtWidgets.QDialog):
         d = self.current()
         if d is not None:
             self._show_args(d)
-            if d.name.startswith("device") and d.driver in EXAMPLES:  # a better name than device1
+            if _placeholder(d) and d.driver in EXAMPLES:  # a better name than device1
                 name = d.driver.partition(":")[2].removeprefix("Sim").lower()
                 if name not in {o.name for o in self.devices}:
                     self.dev_name.setText(name)
-                    self._edited()
+            self._edited()  # (again: what is written depends on the arguments of the driver now chosen)
 
     def _show_args(self, d: DeviceSpec) -> None:
         while self.args_form.rowCount():
             self.args_form.removeRow(0)
         self._arg_edits = {}
-        known = constructor_args(d.driver, d.folder)
-        d.texts = {name for name, _, text in known or () if text}
-        if known is None:
-            self.args_note.setText("Its arguments are not known until its folder is set (or it is an installed "
-                                   "package); type them below." if d.driver else "Choose a driver first.")
-        elif not known:
-            self.args_note.setText("Its constructor takes no arguments (or inherits them); add any below.")
-        else:
+        known = constructor_args(d.driver, d.folder, self._base())
+        if known:  # its own arguments, each in a field (another driver's, typed before, are kept but not written)
+            d.texts = {name for name, _, text in known if text}
+            d.known = {name for name, _, _ in known}
+            fields = [(name, "required" if default is None else default) for name, default, _ in known]
             self.args_note.setText("Leave a field empty to keep the driver's default.")
-        for name, default, _ in known or ():
+        else:  # not known here (or inherited): what the fields hold stays in sight, and is written as it is
+            d.known = None
+            fields = [(name, "") for name, text in d.args.items() if text.strip()]
+            why = ("Its arguments are not known until its folder is set (or it is an installed package)"
+                   if known is None else "Its constructor takes no arguments of its own (or inherits them)")
+            self.args_note.setText(
+                ("Choose a driver first." if not d.driver else f"{why}; give them under more keys.") +
+                (" The fields below hold what was given before, and are written: empty one to leave it out."
+                 if fields else ""))
+        for name, hint in fields:
             edit = QtWidgets.QLineEdit(d.args.get(name, ""))
-            edit.setPlaceholderText("required" if default is None else default)
+            edit.setProperty("hint", hint)
             edit.textEdited.connect(self._edited)
             self._arg_edits[name] = edit
             self.args_form.addRow(ui.label(name, "label"), edit)
+        self._mark_given()
+
+    def _mark_given(self) -> None:
+        """An argument that more keys gives (a list, say) is set there, not in its field: say so."""
+        d = self.current()
+        given = _given_in(self.extra.toPlainText(), d.in_kwargs if d is not None else set())
+        for name, edit in self._arg_edits.items():
+            there = name in given
+            edit.setReadOnly(there)
+            edit.setPlaceholderText("given under more keys, below" if there else edit.property("hint"))
+            edit.setToolTip("Its value is in the more keys below: change it there" if there else "")
 
     def _browse_driver(self) -> None:
         start = self.dev_folder.text().strip() or str(Path.home())
@@ -437,21 +699,21 @@ class NewServerDialog(QtWidgets.QDialog):
         try:
             classes = list(classes_in(path.read_text()))
         except (OSError, SyntaxError, ValueError, UnicodeDecodeError) as e:
-            QtWidgets.QMessageBox.warning(self, "New server", f"Cannot read {path.name}: {e}")
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), f"Cannot read {path.name}: {e}")
             return
         if not classes:
-            QtWidgets.QMessageBox.warning(self, "New server", f"{path.name} defines no class.")
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), f"{path.name} defines no class.")
             return
         choice = classes[0]
         if len(classes) > 1:
-            choice, ok = QtWidgets.QInputDialog.getItem(self, "New server", f"Which class of {path.name} is the "
-                                                        "driver?", classes, 0, False)
+            choice, ok = QtWidgets.QInputDialog.getItem(self, self.windowTitle(), f"Which class of {path.name} is "
+                                                        "the driver?", classes, 0, False)
             if not ok:
                 return
         self.dev_folder.setText(str(path.parent))
         self.driver.setCurrentText(f"{path.stem}:{choice}")
         d = self.current()
-        if d is not None and d.name.startswith("device"):
+        if d is not None and _placeholder(d):
             self.dev_name.setText(choice.lower())
         self._edited()
         self._show_args(self.current())
@@ -475,71 +737,244 @@ class NewServerDialog(QtWidgets.QDialog):
         if path:
             self.python.setText(path)
 
+    def _reach_changed(self, *_) -> None:
+        self._update()
+
     # -- the file ------------------------------------------------------------
     def path(self) -> Path:
+        if self.existing is not None:
+            return self.existing
         return Path(self.folder.text().strip() or servers_folder()).expanduser() / f"{self.name.text().strip()}.toml"
 
-    def text(self) -> str:
-        """The config file, or ValueError saying what is wrong."""
+    def _tcp_wanted(self):
+        """The tcp the form asks for: the file's own if "Reached from" is as it was, and with
+        only the port changed, the file's address with the new port (one network, say)."""
+        now, old = (self.reach.currentData(), self.port.value()), self._server_table.get("tcp")
+        if self.existing is not None and old is not None and now[0] == self._reach_initial[0]:
+            if now == self._reach_initial:
+                return old
+            if isinstance(old, str) and ":" in old:
+                return f"{old.rpartition(':')[0]}:{now[1]}"
+        return _tcp(*now)
+
+    def changes(self) -> tuple[dict, dict, dict]:
+        """What saving changes in the file: (first, changes, renames), `first` the devices removed
+        whose name another one takes (renamed to it, or added), removed before the rest, and the
+        rest as tomlfile.edit takes it.  Only devices changed in the dialog are looked at, and in
+        them only what differs."""
+        old = tomllib.loads(self._original)
+        out, renames, first = {}, {}, {}
         name = self.name.text().strip()
         registry.check_name(name, "server name")
-        server: dict = {"name": name}
-        if self.reach.currentData():
-            server["tcp"] = f"0.0.0.0:{self.port.value()}"
+        server = {}
+        if name != (self._server_table.get("name") or self.existing.stem):
+            server["name"] = name
+        tcp = self._tcp_wanted()
+        if not tomlfile.same(tcp, self._server_table.get("tcp")):
+            server["tcp"] = tcp
+        if server:
+            out[("server",)] = server
         names = [d.name for d in self.devices]
         if len(set(names)) != len(names):
             raise ValueError("two devices have the same name")
-        devices = {d.name: d.table() for d in self.devices}
-        return config.dump(server, devices, comment=(
+        before = old.get("devices", {})
+        kept = {d.was for d in self.devices if d.was is not None}
+        taken = {d.name for d in self.devices}
+        for device in before:
+            if device not in kept:  # removed; first if another device takes its name: it is a new table then
+                (first if device in taken else out)[("devices", device)] = None
+        sub_tables = set(tomlfile.tables(self._original))
+        for d in self.devices:
+            if d.was is None:
+                out[("devices", d.name)] = d.table()
+                continue
+            if d.name != d.was:
+                renames[("devices", d.was)] = ("devices", d.name)
+            if not d.dirty:
+                continue
+            was, table = before.get(d.was, {}), d.table()
+            diff = {k: v for k, v in table.items() if not tomlfile.same(was.get(k), v)}
+            diff.update({k: None for k in was if k not in table})
+            for key in [k for k in diff if ("devices", d.was, k) in sub_tables]:  # written as [devices.X.key]
+                new, old_sub = diff.pop(key), was.get(key) or {}
+                if not isinstance(new, dict) or not new:
+                    out[("devices", d.name, key)] = None  # gone: the table too
+                    if new is not None:
+                        diff[key] = new
+                    continue
+                sub = {k: v for k, v in new.items() if not tomlfile.same(old_sub.get(k), v)}
+                sub.update({k: None for k in old_sub if k not in new})
+                if sub:
+                    out[("devices", d.name, key)] = sub
+            if diff:
+                out[("devices", d.name)] = diff
+        return first, out, renames
+
+    def text(self) -> str:
+        """The file as it will be, or ValueError saying what is wrong."""
+        if self.existing is not None:
+            first, changes, renames = self.changes()
+            text = tomlfile.edit(self._original, first) if first else self._original
+            return tomlfile.edit(text, changes, renames)
+        name = self.name.text().strip()
+        registry.check_name(name, "server name")
+        server: dict = {"name": name}
+        tcp = _tcp(self.reach.currentData(), self.port.value())
+        if tcp is not None:
+            server["tcp"] = tcp
+        names = [d.name for d in self.devices]
+        if len(set(names)) != len(names):
+            raise ValueError("two devices have the same name")
+        return config.dump(server, {d.name: d.table() for d in self.devices}, comment=(
             f"The insthub server \"{name}\", written by insthub gui; edit it freely.\n"
             f"Start it, in this folder, with:  insthub serve {self.path().name}"))
 
+    def _show_changes(self, text: str) -> None:
+        """Highlight in the preview the lines saving writes, and list the ones it removes."""
+        self.removed.clear()
+        if self.existing is None:
+            self.preview.setExtraSelections([])
+            return
+        old, new = self._original.splitlines(), text.splitlines()
+        marks = []
+        for op, a0, a1, b0, b1 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+            if op in ("replace", "insert"):
+                for line in range(b0, b1):
+                    block = self.preview.document().findBlockByNumber(line)
+                    sel = QtWidgets.QTextEdit.ExtraSelection()
+                    sel.format.setBackground(ui.color(ui.current().accent, 0.18))
+                    sel.format.setProperty(QtGui.QTextFormat.Property.FullWidthSelection, True)
+                    sel.cursor = QtGui.QTextCursor(block)
+                    marks.append(sel)
+        self.preview.setExtraSelections(marks)
+        gone = self._gone(text)
+        if gone:
+            shown = "<br>".join(gone[:6])
+            more = f"<br>and {len(gone) - 6} more" if len(gone) > 6 else ""
+            self.removed.setText(f"Removed:<br>{shown}{more}")
+
+    def _gone(self, text: str) -> list[str]:
+        """What saving removes, as HTML: the devices removed, then the keys and tables gone from
+        the rest (a device renamed is compared under its new name: a rename removes nothing)."""
+        old, new = tomllib.loads(self._original), tomllib.loads(text)
+        before = old.get("devices", {})
+        names = {d.was: d.name for d in self.devices if d.was is not None}
+        gone = [f"<code>{_esc(tomlfile.header(('devices', n)))}</code>" for n in before if n not in names]
+        if "devices" in old:
+            old["devices"] = {names[n]: table for n, table in before.items() if n in names}
+            if not old["devices"] and "devices" not in new:
+                del old["devices"]  # (no [devices] header of its own: nothing more is gone than its devices)
+        return gone + _gone(old, new)
+
     def _update(self, *_) -> None:
-        self.port.setVisible(bool(self.reach.currentData()))
-        self.file_label.setText(str(self.path()))
+        self.port.setVisible(self.reach.currentData() != LOCAL)
+        path = str(self.path())
+        self.file_label.setText(self.file_label.fontMetrics().elidedText(path, Qt.TextElideMode.ElideMiddle, 390))
+        self.file_label.setToolTip(path)
+        d = self.current()
+        self.open_hint.setText("" if d is None else "lazy: opened on first use" if d.lazy else "")
+        then = self.then.currentData()
+        service_chosen = then == self.SERVICE
+        self.login.setVisible(service_chosen)
+        self.login_label.setVisible(service_chosen)
+        self.then_note.setText({
+            self.SERVICE: "A systemd user service: it is started again if it crashes, and its output is kept. "
+                          "The Python must be the one that has the drivers' packages; a virtualenv next to the "
+                          "driver or the config is picked by itself.",
+            self.ONCE: "It runs in the background until you stop it (on its page), or, with lingering off, "
+                       "you log out.",
+            self.RESTART: "The server reads its config only when it starts.",
+            self.SAVE: "" if self.existing is None else
+                       "The server reads its config only when it starts: restart it to use the changes.",
+        }.get(then, ""))
         try:
-            self.preview.setPlainText(self.text())
+            text = self.text()
+            shown, now = self.preview.toPlainText(), text.replace("\r\n", "\n")
+            if shown != now:
+                bar = self.preview.verticalScrollBar()
+                at = bar.value()  # the preview stays where it was scrolled to ...
+                self.preview.setPlainText(text)
+                bar.setValue(at)
+                where = _first_change(shown, now) if shown else None
+                if where is not None:  # ... but shows the line this edit changed
+                    self.preview.setTextCursor(QtGui.QTextCursor(self.preview.document().findBlockByNumber(where)))
+                    self.preview.ensureCursorVisible()
+            self._show_changes(text)
             self.problem.clear()
             ok = True
+            unchanged = self.existing is not None and text == self._original
         except ValueError as e:
             self.problem.setText(str(e))
-            ok = False
-        self.create.setEnabled(ok)
-        self.create.setText({self.START_SERVICE: "Create and start", self.START_ONCE: "Create and start",
-                             self.SAVE_ONLY: "Create"}[self.then.currentData()])
+            ok, unchanged = False, False
+        self.create.setEnabled(ok and not unchanged)
+        if self.existing is not None:
+            self.create.setText("Save and restart" if then == self.RESTART and self.server.origin == "local" else
+                                "Save and start" if then == self.RESTART else "Save")
+        else:
+            self.create.setText("Create" if then == self.SAVE else "Create and start")
 
     def _create(self) -> None:
         try:
             text = self.text()
         except ValueError as e:
-            QtWidgets.QMessageBox.warning(self, "New server", str(e))
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), str(e))
+            return
+        if self.existing is not None:
+            self._save(text)
             return
         path, name, python = self.path(), self.name.text().strip(), self.python.text().strip() or sys.executable
         then = self.then.currentData()
-        if then != self.SAVE_ONLY and not os.access(python, os.X_OK):
+        if then != self.SAVE and not os.access(python, os.X_OK):
             QtWidgets.QMessageBox.warning(self, "New server", f"{python} is not a program.")
             return
         if path.exists() and not self.window.confirm("Replace it?", f"{path} exists already. Replace it?", "Replace"):
             return
-        if then != self.SAVE_ONLY and any(s.name == name and s.origin == "local" for s in self.window.servers.values()):
+        if then != self.SAVE and any(s.name == name and s.origin == "local" for s in self.window.servers.values()):
             if not self.window.confirm("A server of that name runs", f"A server named “{name}” is running already, "
                                        "and a second one cannot take its name. Save the file anyway?", "Save"):
                 return
-            then = self.SAVE_ONLY
+            then = self.SAVE
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text)
-        except OSError as e:
+            tomlfile.write(path, text)
+        except (OSError, ValueError) as e:
             QtWidgets.QMessageBox.warning(self, "New server", f"Cannot write {path}: {e}")
             return
         self.accept()
-        if then == self.START_SERVICE:
-            self.window.act(f"Installing {service.PREFIX}{name}", lambda: service.install(path, name, python=python),
-                            f"{service.PREFIX}{name} installed and started")
-        elif then == self.START_ONCE:
+        if then == self.SERVICE:
+            login = self.login.isChecked()
+            self.window.act(f"Installing {service.PREFIX}{name}",
+                            lambda: service.install(path, name, python=python, login=login),
+                            f"{service.PREFIX}{name} installed and started"
+                            + ("" if login else "; it does not start at login"))
+        elif then == self.ONCE:
             self.window.start_server([python, "-m", "insthub", "serve", str(path)], name, cwd=path.parent)
         else:
             self.window.say(f"Saved {path}. Start it with: insthub serve {path}", 10000)
+
+    def _save(self, text: str) -> None:
+        path = self.existing
+        try:
+            now = tomlfile.read(path)
+        except (OSError, UnicodeDecodeError) as e:
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), f"Cannot read {path}: {e}")
+            return
+        if now != self._original and not self.window.confirm(  # changed by somebody else since it was read
+                "The file changed", f"{path} was changed since this dialog read it. Save what is shown here over "
+                "it? Those other changes are then lost; Cancel, and open it again, to see them.", "Save over them"):
+            return
+        try:
+            tomlfile.write(path, text)  # exactly what the preview showed
+        except (OSError, ValueError) as e:
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), f"Cannot write {path}: {e}")
+            return
+        self.accept()
+        if self.then.currentData() == self.RESTART:
+            self.window.restart_server(self.server, after=f"saved {path.name}")
+        else:
+            self.window.say(f"Saved {path.name}; restart the server to use it", 8000)
+
+
+NewServerDialog = ServerDialog  #: its older name
 
 
 # ---------------------------------------------------------------- a background service
@@ -559,6 +994,10 @@ class ServiceDialog(QtWidgets.QDialog):
         form.addRow(ui.label("Server", "label"), _browse_row(self.target, self._browse_target))
         form.addRow(ui.label("Name", "label"), self.name)
         form.addRow(ui.label("Python", "label"), _browse_row(self.python, self._browse_python))
+        self.login = ui.Switch(True)
+        self.login.setToolTip("Off: it runs until you stop it (or, with lingering off, you log out), and you "
+                              "start it again from its page")
+        form.addRow(ui.label("Start at login", "label"), self.login)
         self.command = QtWidgets.QLineEdit()
         self.command.setProperty("role", "code")
         self.command.setReadOnly(True)
@@ -571,14 +1010,16 @@ class ServiceDialog(QtWidgets.QDialog):
         box.setContentsMargins(22, 20, 22, 18)
         box.setSpacing(12)
         box.addWidget(ui.label("Keep a server running", "h1"))
-        box.addWidget(ui.label("It starts now and at every login, and is started again if it crashes (a systemd "
-                               "user service). Python must be the interpreter that has the drivers' packages: a "
-                               "virtualenv next to the server file is picked by itself.", "muted", wrap=True))
+        box.addWidget(ui.label("It starts now and, unless you switch it off below, at every login; it is started "
+                               "again if it crashes (a systemd user service). Python must be the interpreter that "
+                               "has the drivers' packages: a virtualenv next to the server file is picked by "
+                               "itself.", "muted", wrap=True))
         box.addLayout(form)
         box.addWidget(ui.label("It runs:", "small"))
         box.addWidget(self.command)
         box.addLayout(bottom)
-        self.resize(680, 0)
+        self.setMinimumWidth(680)
+        self.adjustSize()  # tall enough for its text: the fields are not squashed
 
     def _browse_target(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Server to keep running", str(Path.home()),
@@ -625,12 +1066,16 @@ class ServiceDialog(QtWidgets.QDialog):
             return
         self.accept()
 
+        login = self.login.isChecked()
+
         def install():
-            service.install(target, name, python=python)
-            return service.linger_hint()
+            service.install(target, name, python=python, login=login)
+            return service.linger_hint() if login else None
 
         def done(hint):
             message = f"{service.PREFIX}{name} installed and started"
+            if not login:
+                return message + "; it does not start at login"
             return message + (f"; it starts at login (at boot: {hint})" if hint else "")
 
         self.window.act(f"Installing {service.PREFIX}{name}", install, done)
@@ -678,6 +1123,9 @@ class RemoteDialog(QtWidgets.QDialog):
         self.list = QtWidgets.QListWidget()
         self.list.setProperty("card", True)
         self.list.itemChanged.connect(self._count)
+        keep = self.list.sizePolicy()
+        keep.setRetainSizeWhenHidden(True)  # its room stays where it will be, not between the other rows
+        self.list.setSizePolicy(keep)
         self.list.hide()
         self.add = ui.button("Add", "plus", kind="primary", slot=self._add)
         self.add.setEnabled(False)
@@ -734,7 +1182,8 @@ class RemoteDialog(QtWidgets.QDialog):
             item = QtWidgets.QListWidgetItem(f"{name}  ·  {d['type']}" + (f"  ({'; '.join(note)})" if note else ""))
             item.setData(Qt.ItemDataRole.UserRole, name)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked if known.get(name) != self.address else Qt.CheckState.Unchecked)
+            hidden = name in local or known.get(name) == self.address  # found here first, or listed already
+            item.setCheckState(Qt.CheckState.Unchecked if hidden else Qt.CheckState.Checked)
             self.list.addItem(item)
         self.status.setText(f"“{info.get('server', '?')}” (pid {info.get('pid', '?')}) has "
                             f"{len(devices)} device{'s' * (len(devices) != 1)}"

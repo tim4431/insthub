@@ -12,11 +12,13 @@ by reference), on this machine (Unix socket) or on another one (TCP).
 """
 from __future__ import annotations
 
-import asyncio
 import collections
 import logging
+import os
+import sys
 import threading
 import time
+import uuid
 import weakref
 from concurrent.futures import Future, InvalidStateError
 
@@ -33,6 +35,33 @@ from .errors import (
 )
 
 _log = logging.getLogger("insthub")
+
+
+#: Sent with a pause, so that this program can tell its own pause from somebody else's, also on a
+#: server it reaches over TCP (which sees an address, not a process).
+PROCESS_TOKEN = uuid.uuid4().hex[:16]
+
+
+def program_label() -> str:
+    """What this program is called, for others to see: "experiment.py", "insthub pause"."""
+    argv = sys.argv or [""]
+    path = (argv[0] or "").replace("\\", "/")
+    name = os.path.basename(path)
+    if name in ("insthub", "insthub.exe") or path.endswith("insthub/__main__.py"):  # the command, python -m insthub
+        words = iter(argv[1:])
+        for word in words:  # its subcommand: the first word that is not an option (or an option's value)
+            if word in ("-a", "--address"):
+                next(words, None)
+            elif not word.startswith("-"):
+                return f"insthub {word}"
+        return "insthub"
+    if name == "__main__.py":  # python -m some_package
+        return os.path.basename(os.path.dirname(path)) or "python"
+    if name in ("", "-", "-c"):  # python -c, python - <<EOF, an interactive python
+        return "python"
+    if name == "ipykernel_launcher.py":
+        return "Jupyter"
+    return name
 
 
 # ---------------------------------------------------------------- futures
@@ -52,6 +81,8 @@ class CallFuture(Future):
                                "running on the device)") from None
 
     def __await__(self):
+        import asyncio  # here, not at the top: only asyncio programs await, and every program imports this
+
         return asyncio.wrap_future(self).__await__()
 
 
@@ -151,6 +182,8 @@ class Subscription:
 
     async def aget(self) -> Frame:
         """`get()` for asyncio."""
+        import asyncio
+
         loop = asyncio.get_running_loop()
         while True:
             with self._cond:
@@ -251,8 +284,13 @@ class _LocalTransport:
     def closed(self) -> bool:
         return not self._server._running
 
-    def info(self) -> dict:
+    @property
+    def hello(self) -> dict:
+        """What a socket connection's hello would say."""
         return self._server._hello()
+
+    def info(self) -> dict:
+        return self.hello
 
     def request(self, device, method, args, kwargs) -> CallFuture:
         fut = CallFuture()
@@ -308,7 +346,7 @@ class _SocketTransport:
             raise ConnectionLost(f"cannot connect to {self.address}: {e}") from None
         try:
             sock.sendall(wire.MAGIC)
-            reader = wire.FrameReader(sock)
+            reader = wire.FrameReader(sock, wire.TO_CLIENT)  # it skips what a newer server may send besides
             reader.read_magic()
             mtype, _, body, buffers = reader.read()
             if mtype != wire.HELLO:
@@ -500,6 +538,28 @@ def _log_failure(fut: Future) -> None:
 
 
 # ---------------------------------------------------------------- proxies
+def meta_text(meta: dict) -> str:
+    """The metadata of a value (see device.META_KEYS) in words, as `insthub info` and the
+    window say it: "10 to 24000 MHz, in steps of 0.5", "one of 'VPP', 'VRMS'"."""
+
+    def number(value) -> str:
+        return f"{value:g}" if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
+
+    unit = f" {meta['unit']}" if meta.get("unit") else ""
+    low, high = meta.get("min"), meta.get("max")
+    if low is not None and high is not None:
+        parts = [f"{number(low)} to {number(high)}{unit}"]
+    elif low is not None or high is not None:
+        parts = [f"at least {number(low)}{unit}" if low is not None else f"at most {number(high)}{unit}"]
+    else:
+        parts = [unit.strip()] if unit else []
+    if meta.get("step") is not None:
+        parts.append(f"in steps of {number(meta['step'])}")
+    if meta.get("choices") is not None:
+        parts.append("one of " + ", ".join(map(repr, meta["choices"])))
+    return ", ".join(parts)
+
+
 class RemoteMethod:
     """A command of a remote device.  Call it, or use `.future()` (don't wait),
     `.notify()` (don't even want the result) or `await .aio()`."""
@@ -523,6 +583,8 @@ class RemoteMethod:
 
     async def aio(self, *args, **kwargs):
         """The call as a coroutine."""
+        import asyncio
+
         return await asyncio.wrap_future(self._t.request(self._device, self._name, args, kwargs))
 
     def __repr__(self) -> str:
@@ -599,23 +661,46 @@ class Bus:
         """Open the hardware session now, without waiting for the reconnect interval."""
         return self._t.request(self.name, "$open", (), {}).result(self.timeout)
 
+    def pause(self, by: str | None = None) -> dict:
+        """Close the hardware session and refuse every command, property and periodic task
+        (calls raise DevicePaused; tasks do not run) until resume(), e.g. while the vendor's
+        software uses the instrument.  Calls from now on are refused at once; this returns once
+        the command running now (if any) has finished and the session is closed.  `by`: how to
+        name this program to the people who see the pause (default: its script's name)."""
+        return self._t.request(self.name, "$pause", (by or program_label(), PROCESS_TOKEN), {}).result(self.timeout)
+
+    def resume(self) -> dict:
+        """End a pause.  The session is opened again at once if it was open when the device was
+        paused; otherwise (a lazy device not used yet) on first use.  Returns the status."""
+        return self._t.request(self.name, "$resume", (), {}).result(self.timeout)
+
     def with_timeout(self, timeout: float | None) -> DeviceProxy:
         """A proxy of the same device whose blocking calls give up after `timeout` seconds."""
         return DeviceProxy(self._t, self.name, timeout, self._info)
 
     def help(self) -> str:
-        """Printable list of commands, properties and streams."""
+        """Printable list of commands, properties and streams, with units, limits and choices,
+        and what is dangerous."""
         info = self.describe()
-        lines = [f"{info['name']}: {info['type']} at {self.address}"]
+        about = ["simulated"] if info.get("simulated") else []
+        if info.get("extension"):
+            about.append(f"extension {info['extension']} {info.get('extension_version') or ''}".rstrip())
+        lines = [f"{info['name']}: {info['type']} at {self.address}" + (f"  ({', '.join(about)})" if about else "")]
         if info.get("doc"):
             lines.append(info["doc"])
-        for title, key in (("commands", "commands"), ("properties", "properties")):
+        for key in ("commands", "properties"):
             if info[key]:
-                lines.append(f"\n{title}:")
+                lines.append(f"\n{key}:")
             for name, item in sorted(info[key].items()):
+                notes = [] if key == "commands" or item["settable"] else ["read-only"]
+                if item.get("meta"):
+                    notes.append(meta_text(item["meta"]))
+                if item.get("dangerous"):
+                    notes.append("dangerous" if key == "commands" else "dangerous to write")
+                lines.append(f"  {name}{item.get('signature', '')}" + (f"  ({'; '.join(notes)})" if notes else ""))
                 first = (item.get("doc") or "").split("\n")[0]
-                tail = "  (read-only)" if key == "properties" and not item["settable"] else ""
-                lines.append(f"  {name}{item.get('signature', '')}{tail}" + (f"\n      {first}" if first else ""))
+                lines += [f"      {first}"] if first else []
+                lines += [f"      {param}: {meta_text(meta)}" for param, meta in (item.get("params") or {}).items()]
         if info["streams"]:
             lines.append("\nstreams:")
             for name, item in sorted(info["streams"].items()):
@@ -702,6 +787,17 @@ class Client:
     def info(self) -> dict:
         """Server name, pid, addresses and device names."""
         return self._t.info()
+
+    @property
+    def features(self) -> frozenset[str]:
+        """What the server does beyond protocol 1 ("pause", ...), from its hello.  Empty for a
+        server older than this list."""
+        return frozenset(self._t.hello.get("features", ()))
+
+    def supports(self, feature: str) -> bool:
+        """Whether the server has a feature: ask before relying on a server call or key that an
+        older insthub may not have."""
+        return feature in self.features
 
     def devices(self) -> list[str]:
         return list(self.info()["devices"])

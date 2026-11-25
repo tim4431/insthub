@@ -2,8 +2,9 @@
 
 A server started in a terminal stops when the terminal closes.  This module
 registers it as a systemd *user* service instead: started when you log in (or
-at boot, see `linger_hint`), restarted if it crashes, its output kept in the
-journal.  Nothing here needs root.
+at boot, see `linger_hint`) unless it is told not to (`login=False`, `disable`),
+restarted if it crashes, its output kept in the journal.  Nothing here needs
+root.
 
 There is one convention for every server, whatever instrument it drives:
 
@@ -14,21 +15,27 @@ There is one convention for every server, whatever instrument it drives:
                 or a .py script
 
 Before writing the unit, `install` makes sure that Python can import insthub
-and, for a config, every driver it names.  It refuses to run from the user-wide
-`insthub` command (a uv tool or pipx environment), which has no drivers.
+and, for a config, every driver it names, and that each device's keys fit its
+driver (config.check); what config.check warns about is passed on as a
+ConfigWarning.  It refuses to run from the user-wide `insthub` command (a uv
+tool or pipx environment), which has no drivers.
 
 What stays outside: anything that gives the operating system access to the
 hardware (udev rules, kernel modules, groups).  That belongs to the driver.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import warnings
 from pathlib import Path
 
 from . import registry
+from .config import ConfigWarning
 from .errors import BusError
 
 PREFIX = "insthub-"
@@ -69,26 +76,80 @@ def tool_environment(prefix: str | None = None) -> str | None:
     return None
 
 
-_CHECK = "import sys\nfrom insthub import config\nif sys.argv[1].endswith('.toml'):\n    config.check(sys.argv[1])\n"
-
-
-def check_python(target: str | Path, python: str) -> None:
-    """Make sure `python` can serve `target`: it imports insthub and, for a
-    .toml config, every driver of it (without creating a device), from the
-    folder the service will run in.  Raises BusError saying what is missing."""
-    target = Path(target).expanduser().resolve()
+#: What check_python runs in the service's Python: `python -c _CHECK target report`.  It writes
+#: its report to the file `report` (not to stdout, which drivers may write to as well), as JSON:
+#: the problem, if any; what would fix it, by the kind of error ("file": the config file;
+#: "environment": another Python, or packages installed into this one; for a driver's own error,
+#: neither); and config.check's warnings, not those of the drivers' libraries.  Besides
+#: config.check it uses only the standard library, and it falls back to what an older insthub
+#: raises (a plain ValueError for a problem of the file), so any insthub there will do.
+_CHECK = """\
+import json, sys, warnings
+report = {"problem": None, "fixes": [], "warnings": []}
+with warnings.catch_warnings(record=True) as caught:
     try:
-        result = subprocess.run([python, "-c", _CHECK, str(target)], capture_output=True, text=True, timeout=120,
-                                check=False, cwd=target.parent)
-    except OSError as e:
-        raise BusError(f"cannot run {python}: {e}") from None
-    except subprocess.TimeoutExpired:
-        raise BusError(f"{python} took more than 120 s to import the drivers of {target.name}") from None
-    if result.returncode != 0:
-        last = (result.stderr.strip().splitlines() or ["(no output)"])[-1]
-        raise BusError(f"{python} cannot serve {target.name}: {last}\n"
-                       "The service runs this Python, so it needs insthub and the drivers' packages. "
-                       "Install them there, or pass --python with the Python that has them.")
+        from insthub import config
+        if sys.argv[1].endswith(".toml"):
+            config.check(sys.argv[1])
+    except Exception as e:
+        cfg = sys.modules.get("insthub.config")
+        of_file = getattr(cfg, "ConfigError", ValueError)  # an older insthub has none: a ValueError
+        # insthub's own errors say what they are; others (from a driver's module, ...) by their kind
+        said = isinstance(e, (of_file, ImportError, getattr(cfg, "DriverError", ())))
+        report["problem"] = str(e) if said else f"{type(e).__name__}: {e}"
+        if isinstance(e, of_file):
+            report["fixes"].append("file")
+        # drivers that cannot be loaded, alone or among the file's problems; not an ImportError's
+        # subclass, such as two folders' modules of one name: no Python fixes that
+        if any(type(u) in (ImportError, ModuleNotFoundError) for u in [e, *getattr(e, "unloadable", ())]):
+            report["fixes"].append("environment")
+    ours = getattr(sys.modules.get("insthub.config"), "ConfigWarning", ())
+    report["warnings"] = [str(w.message) for w in caught if issubclass(w.category, ours)]
+with open(sys.argv[2], "w") as f:
+    json.dump(report, f)
+"""
+
+#: What to do about a problem that check_python found, by what would fix it.
+_FIXES = {
+    "file": "Fix {file}, then install again.",
+    "environment": "The service runs this Python, so it needs insthub and the drivers' packages. "
+                   "Install them there, or pass --python with the Python that has them.",
+}
+
+
+def check_python(target: str | Path, python: str) -> list[str]:
+    """Make sure `python` can serve `target`: it imports insthub and, for a .toml
+    config, every driver of it (without creating a device), from the folder the
+    service will run in, and each device's keys fit its driver.  Raises BusError
+    saying what is missing or wrong, and what to do about it.  Returns the
+    warnings, such as a driver that imports Qt, which a server without a screen
+    may not have."""
+    target = Path(target).expanduser().resolve()
+    with tempfile.TemporaryDirectory(prefix="insthub-check-") as folder:
+        report_file = Path(folder) / "report.json"
+        try:
+            result = subprocess.run([python, "-c", _CHECK, str(target), str(report_file)], cwd=target.parent,
+                                    capture_output=True, text=True, timeout=120, check=False)
+        except OSError as e:
+            raise BusError(f"cannot run {python}: {e}") from None
+        except subprocess.TimeoutExpired:
+            raise BusError(f"{python} took more than 120 s to import the drivers of {target.name}") from None
+        report = _report(report_file)
+    if report is None:  # it did not get that far: not a Python, or one that crashed
+        problem = (result.stderr.strip().splitlines() or ["(no output)"])[-1]
+        report = {"problem": problem, "fixes": ["environment"]}
+    if report["problem"]:
+        advice = [_FIXES[fix].format(file=target.name) for fix in report["fixes"]]
+        raise BusError("\n".join([f"{python} cannot serve {target.name}: {report['problem']}", *advice]))
+    return report["warnings"]
+
+
+def _report(path: Path) -> dict | None:
+    """What _CHECK reported, or None if it did not get that far."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def unit_text(name: str, target: str | Path, python: str | None = None) -> str:
@@ -123,10 +184,12 @@ def _systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return result
 
 
-def install(target: str | Path, name: str | None = None, start: bool = True, python: str | None = None) -> Path:
+def install(target: str | Path, name: str | None = None, start: bool = True, python: str | None = None,
+            login: bool | None = None) -> Path:
     """Register the server of `target` as the service insthub-NAME and start it.
     Installing again under the same name replaces the old definition.
-    `python`: the interpreter the service runs (default: this one)."""
+    `python`: the interpreter the service runs (default: this one).
+    `login`: start it at every login (default: as `start`); False: only when started by hand."""
     target = Path(target).expanduser().resolve()
     name = name or target.stem
     if python is None:
@@ -144,15 +207,19 @@ def install(target: str | Path, name: str | None = None, start: bool = True, pyt
             f"environment: run its insthub (e.g.  ~/Code/mydriver/.venv/bin/insthub service install {target.name})"
             " or pass --python.")
     text = unit_text(name, target, python)
-    check_python(target, python)
+    for message in check_python(target, python):
+        warnings.warn(message, ConfigWarning, stacklevel=2)
     folder = unit_dir()
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{PREFIX}{name}.service"
     existed = path.exists()
     path.write_text(text)
     _systemctl("daemon-reload")
-    if start:
+    if start if login is None else login:
         _systemctl("enable", path.name)
+    elif existed:  # a new definition: the new choice holds
+        _systemctl("disable", path.name, check=False)
+    if start:
         _systemctl("restart" if existed else "start", path.name)
     return path
 
@@ -180,6 +247,16 @@ def start(name: str) -> None:
 def stop(name: str) -> None:
     """Stop until the next login or `start` (it stays installed)."""
     _systemctl("stop", _unit(name))
+
+
+def enable(name: str) -> None:
+    """Start it at every login from now on (it is not started now)."""
+    _systemctl("enable", _unit(name))
+
+
+def disable(name: str) -> None:
+    """No longer start it at login (a running one keeps running)."""
+    _systemctl("disable", _unit(name))
 
 
 def restart(name: str) -> None:

@@ -26,11 +26,16 @@ class DeviceNotFound(BusError, LookupError):
 
 
 class UnknownCommand(BusError, AttributeError):
-    """The device has no such command, property or stream."""
+    """The device has no such command, property, parameter or stream."""
 
 
 class DeviceNotConnected(BusError):
     """The server is up, but its hardware session could not be opened."""
+
+
+class DevicePaused(DeviceNotConnected):
+    """Somebody paused the device (`dev.bus.pause()`, `insthub pause`, the window's Pause):
+    none of its commands, properties or periodic tasks run until it is resumed."""
 
 
 class SubscriptionClosed(BusError):
@@ -64,8 +69,18 @@ _BUILTINS = {
         AssertionError, EOFError,
     )
 }
-_OWN = {cls.__name__: cls for cls in (DeviceNotFound, UnknownCommand, DeviceNotConnected, ConnectionLost)}
+_OWN = {cls.__name__: cls for cls in (DeviceNotFound, UnknownCommand, DevicePaused, DeviceNotConnected,
+                                       ConnectionLost)}
 _remote_classes: dict[type, type] = {}
+
+
+def did_you_mean(word: str, names) -> str:
+    """The end of a message about a misspelled name: "; did you mean 'port'?", or "" if no
+    name is close."""
+    import difflib  # here, not at the top: only a mistake needs it
+
+    close = difflib.get_close_matches(word, list(names), n=1)
+    return f"; did you mean {close[0]!r}?" if close else ""
 
 
 def describe_exception(exc: BaseException) -> list:

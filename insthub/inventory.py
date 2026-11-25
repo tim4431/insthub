@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from . import registry, service
-from .client import Client, _SocketTransport, connect, discover
+from .client import PROCESS_TOKEN, Client, _SocketTransport, connect, discover
 from .device import summarize
 from .errors import BusError
 
@@ -40,7 +40,7 @@ ACTION_TIMEOUT = 120.0
 PREVIEW_POINTS = 160  #: a trace preview keeps the lowest and highest value of this many slices
 PREVIEW_PIXELS = 160  #: the long side of an image preview
 PREVIEW_LIMIT = 4_000_000  #: elements; a larger frame gets no preview (over TCP: an eighth of it)
-GOOD, BUSY, BAD, IDLE = "good", "busy", "bad", "idle"  #: statuses (widgets.STATUS has their colours)
+GOOD, BUSY, BAD, IDLE, PAUSED = "good", "busy", "bad", "idle", "paused"  #: statuses (widgets.STATUS: colours)
 
 
 # ---------------------------------------------------------------- the blocking half (worker threads only)
@@ -184,7 +184,7 @@ def command_name(argv: list[str]) -> str:
     exe, args = os.path.basename(argv[0]), argv[1:]
     if exe.startswith("python"):
         while args and args[0].startswith("-") and args[0] not in ("-m", "-c"):
-            args = args[1:]  # interpreter options
+            args = args[2:] if args[0] in ("-X", "-W", "--check-hash-based-pycs") else args[1:]  # its options
         if args[:1] == ["-m"] and len(args) > 1:
             if args[1] == "ipykernel_launcher":
                 return "Jupyter kernel"
@@ -246,6 +246,22 @@ def tail(path: Path, lines: int = 500) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
+def served(argv: list[str]) -> str | None:
+    """What a server's command line runs: the config after `insthub serve` (or `python -m insthub
+    serve`), else the script a Python runs ("python my_server.py settings.toml": the .py)."""
+    args = argv[1:]
+    if "serve" in args:
+        before = [os.path.basename(a) for a in [argv[0], *args[:args.index("serve")]]]
+        if "insthub" in before or "insthub.exe" in before:  # the command, `python -m insthub` or its script
+            return next((a for a in args[args.index("serve") + 1:] if a.endswith(".toml")), None)
+    if os.path.basename(argv[0]).startswith("python"):
+        while args and args[0].startswith("-") and args[0] not in ("-m", "-c"):
+            args = args[2:] if args[0] in ("-X", "-W", "--check-hash-based-pycs") else args[1:]  # its options
+        if args and args[0].endswith(".py"):
+            return args[0]
+    return None
+
+
 def server_file(s: Server) -> Path | None:
     """The .toml config or .py script a server runs: from its service, else from its command line."""
     argv, cwd = [], None
@@ -260,11 +276,11 @@ def server_file(s: Server) -> Path | None:
             cwd = os.readlink(f"/proc/{s.pid}/cwd")
         except OSError:
             cwd = None
-    for arg in reversed(argv[1:]):
-        if arg.endswith((".toml", ".py")):
-            path = Path(arg) if os.path.isabs(arg) or cwd is None else Path(cwd) / arg
-            return path if path.is_file() else None
-    return None
+    arg = served(argv) if argv else None
+    if arg is None:
+        return None
+    path = Path(arg) if os.path.isabs(arg) or cwd is None else Path(cwd) / arg
+    return path if path.is_file() else None
 
 
 # ---------------------------------------------------------------- previews (worker threads)
@@ -441,14 +457,50 @@ def server_state(s: Server) -> tuple[str, str, str]:
     return GOOD, "running", "Running."
 
 
-def device_state(d: dict | None) -> tuple[str, str, str]:
-    """(status, word, sentence) of a device, from its describe(); None: its server does not answer."""
+def paused_here(paused: dict, local: bool = True) -> bool:
+    """Whether this window paused the device (status["paused"]), on this computer or another."""
+    return paused.get("token") == PROCESS_TOKEN or bool(local and paused.get("pid") == os.getpid())
+
+
+def paused_by(paused: dict, local: bool = True) -> str:
+    """Who paused a device, from its status["paused"]: 'this window', what the program called
+    itself ('insthub pause', 'experiment.py'), its name from its process, or its computer."""
+    pid, peer, label = paused.get("pid"), paused.get("peer"), paused.get("by")
+    if paused_here(paused, local):
+        return "this window"
+    host = peer.rpartition(":")[0] if peer else ""
+    where = f" on {host}" if host and host not in ("127.0.0.1", "::1", "localhost") else ""
+    if label:
+        return label + where
+    if pid and local:
+        name = program_name(pid)
+        return name if not name.startswith("pid ") else f"a program that has ended ({name})"
+    if peer:
+        return f"a program{where or ' on this computer'}"
+    return "somebody"
+
+
+def device_state(d: dict | None, local: bool = True) -> tuple[str, str, str]:
+    """(status, word, sentence) of a device, from its describe(); None: its server does not answer.
+    `local`: its server runs on this computer (so the pid of who paused it means a program here)."""
     if d is None:
         return IDLE, "unknown", "Unknown: its server does not answer."
     st = d["status"]
+    paused = st.get("paused")  # None from a server older than this window
+    if paused:
+        who = paused_by(paused, local)
+        busy = st["busy"] if st["busy"] not in (None, "$pause") else None
+        if busy or st["connected"]:  # only the pause itself closes the session: until then, it is pausing
+            return BUSY, "pausing", f"Pausing (asked by {who}): " + (
+                "the instrument is being opened; it is closed again once that is done." if busy == "$open" else
+                f"waiting for {busy} to finish." if busy else
+                "the session is closed once what it is doing (a periodic task, say) has finished.")
+        return PAUSED, "paused", (f"Paused since {clock(paused['since'])} by {who}: none of its commands, "
+                                  "properties or periodic tasks run, and the instrument is left alone, until it "
+                                  "is resumed.")
     if st["busy"]:
         queued = f" (+{st['queued']} waiting)" if st["queued"] else ""
-        word = "connecting" if st["busy"] == "$open" else f"busy: {st['busy']}"
+        word = "connecting" if st["busy"] in ("$open", "$resume") else f"busy: {st['busy']}"
         sentence = (f"Connected since {clock(st['since'])} ({ago(time.time() - st['since'])})."
                     if st["connected"] and st.get("since") else "Opening the instrument session...")
         return BUSY, word + queued, sentence

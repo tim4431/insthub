@@ -26,6 +26,7 @@ import time
 import weakref
 
 from . import codec, registry, wire
+from ._version import __version__
 from .device import Device, _Cmd, wrap
 from .errors import BusError, DeviceNotFound, UnknownCommand, describe_exception
 
@@ -35,6 +36,13 @@ _log = logging.getLogger("insthub")
 #: (Windows) the server listens on a loopback TCP port instead; clients find it
 #: through the registry file in both cases.
 _UNIX_SOCKETS = hasattr(socket, "AF_UNIX") and os.name != "nt"
+
+#: What this server does beyond protocol 1, announced in its hello: a client asks
+#: (`Client.supports("pause")`) before it relies on a newer server call or key, so
+#: that old and new insthub versions can share a lab.  Add a name with each one.
+#: "meta": describe() may carry metadata (units, limits, choices) and what a device is
+#: (extension, simulated); "dangerous": it marks what is dangerous to use.
+FEATURES = frozenset({"pause", "meta", "dangerous"})
 
 _local_lock = threading.Lock()
 _local_servers: dict[str, Server] = {}
@@ -256,14 +264,12 @@ class _Conn:
             sock.settimeout(10.0)
             hello, _ = codec.encode(server._hello())
             sock.sendall(wire.MAGIC + wire.frame(wire.HELLO, 0, hello)[0])
-            reader = wire.FrameReader(sock)
+            reader = wire.FrameReader(sock, wire.TO_SERVER)  # it skips what a newer client may send besides
             reader.read_magic()
             sock.settimeout(None)
             dispatch, decode = server._dispatch, codec.decode
             while True:
-                mtype, tag, body, buffers = reader.read()
-                if mtype != wire.CALL:
-                    raise ConnectionError(f"unexpected message type {mtype}")
+                _, tag, body, buffers = reader.read()  # a CALL
                 reply = _RemoteReply(self, tag) if tag else _discard
                 try:
                     device, method, args, kwargs = decode(body, buffers)
@@ -345,7 +351,7 @@ class Server:
         with self._lock:
             if device.name in self._devices:
                 raise ValueError(f"server {self.name!r} already has a device named {device.name!r}")
-            _ = device._rt  # build the command table now: mistakes surface here, not in a thread
+            device._rt.build()  # (again) now, with all it declares: mistakes surface here, not in a thread
             self._devices[device.name] = device
             if self._running:
                 device._rt.start()
@@ -520,8 +526,9 @@ class Server:
             sock.close()
 
     def _hello(self) -> dict:
-        return {"server": self.name, "pid": os.getpid(), "protocol": wire.PROTOCOL,
-                "devices": sorted(self._devices), "addresses": list(self.addresses), "started": self.started_at}
+        return {"server": self.name, "pid": os.getpid(), "protocol": wire.PROTOCOL, "version": __version__,
+                "features": sorted(FEATURES), "devices": sorted(self._devices), "addresses": list(self.addresses),
+                "started": self.started_at}
 
     def _register(self) -> None:
         if not self.addresses:  # in-process only: nothing for another process to find
@@ -631,6 +638,31 @@ def _b_release(rt, args, reply, conn):
     rt.submit(_Cmd("$release", release, needs_open=False), (), {}, reply)
 
 
+def _who(conn, args) -> dict:
+    """Who asked: what the program says it is (args[0], e.g. "insthub gui"), its process id (a
+    program on this computer) or its address (over TCP), and its token (args[1]: how it knows its
+    own pause)."""
+    who = {"pid": os.getpid()} if conn is None else \
+        {k: v for k, v in conn.summary().items() if k in ("pid", "peer") and v is not None}
+    if args and isinstance(args[0], str) and args[0].strip():
+        who["by"] = args[0].strip()[:80]
+    if len(args) > 1 and isinstance(args[1], str) and args[1]:
+        who["token"] = args[1][:64]
+    return who
+
+
+def _b_pause(rt, args, reply, conn):
+    if not rt.running:
+        raise BusError(f"device {rt.dev.name!r} is not running (server stopped?)")
+    who = _who(conn, args)
+    rt.pause(who)  # at once: what comes in from now on is refused, without waiting for the command under way
+    rt.submit(_Cmd("$pause", lambda: rt.pause_now(who), needs_open=False, while_paused=True), (), {}, reply)
+
+
+def _b_resume(rt, args, reply, conn):
+    rt.submit(_Cmd("$resume", rt.resume_now, needs_open=False, while_paused=True), (), {}, reply)
+
+
 def _b_task(rt, args, reply, conn):
     name, enabled, interval = args
     task = rt.tasks.get(name)
@@ -663,7 +695,7 @@ def _b_subscribe(rt, args, reply, conn):
 _BUILTINS = {
     "$describe": _b_describe, "$status": _b_status, "$state": _b_state, "$latest": _b_latest,
     "$get": _b_get, "$set": _b_set, "$open": _b_open, "$release": _b_release, "$task": _b_task,
-    "$subscribe": _b_subscribe,
+    "$subscribe": _b_subscribe, "$pause": _b_pause, "$resume": _b_resume,
 }
 
 

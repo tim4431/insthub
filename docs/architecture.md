@@ -168,6 +168,33 @@ Two more details:
   can also ask `self.subscribers("ch1")` and skip an expensive readout that
   nobody is watching.
 
+## What a device says about itself
+
+Any client can ask a device to describe itself (`$describe`), and every
+generic tool is built on the answer: `insthub info`, the window's device
+page, the AI agents' tools. The answer holds:
+
+| Part | What it says |
+|---|---|
+| `commands` | each command's signature and docstring; optionally `params`, the metadata of its parameters, and `dangerous` |
+| `properties` | each property's docstring and whether it can be written; optionally `meta` and `dangerous` (writing it is) |
+| `streams`, `tasks`, `status` | its streams with their last frame, its periodic tasks, whether it is connected |
+| `extension`, `extension_version`, `simulated` | optionally, what the device is: the extension it belongs to, and whether it talks to a simulator |
+
+*Metadata* has five words: `unit`, `min`, `max`, `step` and `choices`
+(`device.META_KEYS`). It is advice for whoever shows or chooses a value, never
+checked by insthub: an instrument that also takes `"auto"` still gets it, and
+the driver stays the place that refuses what is out of range. The device page
+picks its controls from it, and agents read units instead of guessing them.
+
+*Dangerous* marks what can harm the instrument, the sample or a person. The
+window asks before it runs; the agents' tools refuse it unless the agent uses
+the one tool for it, `call_dangerous` (see [agents](agents.md#dangerous-commands)).
+
+Every one of these keys is optional, and only there when it says something.
+A client older than them ignores them, and a newer client reading an older
+server simply finds none.
+
 ## Where the programs are, and how they reach each other
 
 There are three situations, and client code is the same in all of them.
@@ -245,7 +272,9 @@ per subscription that uses a callback.
 device thread every 0.1 s, *between* requests. It is how a device acquires and
 publishes continuously without a second thread fighting over the instrument.
 A waiting request is always served before the next run of a task, so a busy
-acquisition loop does not make commands sluggish.
+acquisition loop does not make commands sluggish. A device's `poll` (`{"temperature":
+1.0}`, also from a config file) makes such tasks without a method: `poll:temperature`
+reads the property and publishes the value on the stream of the same name.
 
 **Commands marked `concurrent=True`** are the one exception to the waiting
 line. They only read values the device has already cached, so they are answered
@@ -263,6 +292,7 @@ of a long sweep.
 | A client reads a stream too slowly, or freezes. | Keeps only the newest frame for it. Never waits for it. | `sub.dropped` goes up. |
 | A client program crashes. | Removes its subscriptions. Requests it had already sent still run. | Nothing. |
 | The server program crashes or is restarted. | Nothing can be done from inside. | Calls under way raise `ConnectionLost`. The next call reconnects. Subscriptions resume by themselves when the server is back. |
+| Somebody pauses the device (Pause in the window, `insthub pause`, `dev.bus.pause()`). | Refuses every call from then on, lets the command already running finish, then closes the session. Runs none of its commands, properties or periodic tasks until it is resumed. | Calls raise `DevicePaused` (a `DeviceNotConnected`) at once. `pause()` itself returns once the running command has finished. |
 | The server is stopped (Ctrl-C, or its service is stopped). | Lets the running command finish, cancels the ones still waiting, closes every instrument. | Waiting calls raise an error. |
 
 Two promises are worth spelling out:
@@ -292,6 +322,19 @@ Besides plain values and arrays, tuples, sets, complex numbers and dataclasses
 survive the trip as what they were. The exact list is in the
 [guide](guide.md#what-can-be-sent), and the byte layout is at the top of
 `insthub/wire.py`.
+
+A connection starts with the bytes `INSTHUB1` from both sides, then the
+server's *hello*: its name, process id, devices, the protocol number, the
+insthub version it runs and its *features*, a list of what it can do beyond
+the first version of the protocol (`"pause"`, `"meta"`, `"dangerous"`, ...). A
+lab runs several insthub versions at once (servers started before a `git
+pull`, other computers), so:
+
+- a program asks before it uses something newer:
+  `insthub.connect(address).supports("pause")`. An older server has no list,
+  so the answer is no;
+- a server or client that receives a kind of message it does not know skips it
+  and carries on, instead of closing the connection.
 
 ## How fast it is
 
@@ -365,6 +408,8 @@ sequenceDiagram
   not counted among its watchers.
 - **Properties** are read only when a device's page opens, and **commands** run
   only when you ask. Both wait in the device's line like any other request.
+  The control for each property, and the hints under a command, come from the
+  device's description (its metadata), not from reading the instrument.
 - **Live view** opens `insthub view` as a program of its own.
 
 ## Why it is built this way

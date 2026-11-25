@@ -7,15 +7,16 @@ how each one is reached, and the controls to look after them and set them up.
     a device     is the instrument connected (and if not, why), what it is doing, which
                  programs watch it; its properties to read and change, its streams, its
                  periodic tasks (a switch each), its state, and its commands to run.
-                 Connect now / Release / Live view.
+                 Connect now / Release / Pause and Resume / Live view / Edit in its config.
     Servers      a card per server: running here, installed as a service, or on another
                  computer (devices.toml)
     a server     its process, addresses, service, devices and the programs connected to it.
-                 Start / Stop / Restart / Logs / Remove.
+                 Start / Stop / Restart / Logs / Remove; Starts at login; Edit its config
+                 (forms.ServerDialog, which changes the file in place, comments kept).
     AI agents    giving Claude Code or another agent the instruments; which are connected
     Settings     appearance, previews, notifications, start at login, the files insthub uses
     Add          a new server (its config file is written for you), a server file to keep
-                 running as a service, devices on another computer
+                 running as a service (at login or not), devices on another computer
 
 It is made of four layers, each knowing only the ones below it:
 
@@ -47,6 +48,7 @@ import numpy as np
 
 from . import forms, launcher, pages, registry, service
 from . import widgets as ui
+from .client import PROCESS_TOKEN
 from .inventory import (
     BAD,
     BUSY,
@@ -55,9 +57,13 @@ from .inventory import (
     PREVIEW_LIMIT,
     Backend,
     Server,
+    clock,
     device_state,
     elements,
+    paused_by,
+    paused_here,
     preview_stream,
+    server_file,
     server_log,
     server_state,
     spawn,
@@ -135,9 +141,12 @@ class Manager(QtWidgets.QMainWindow):
         self._systemd = False
         self._remote_error: str | None = None  # devices.toml cannot be read
         self._viewers: list = []
-        self._spawned: list = []
+        self._spawned: list = []  # servers this window started: Popen objects (cwd in .insthub_cwd)
         self._logs: dict[str, pages.LogDialog] = {}
         self._detail: tuple | None = None  # ("device", key, name) or ("server", key) while one is shown
+        self.login_pending: dict[str, bool] = {}  # service -> the Starts at login asked, until it is done
+        self.restarting: dict[str, dict] = {}  # server key -> a restart under way (see restart_server)
+        self._follow: str | None = None  # the key whose page to show again once its restart is over
         self._back: tuple | str = "devices"  # where the device page goes back to
 
         self.setWindowTitle("insthub")
@@ -198,8 +207,8 @@ class Manager(QtWidgets.QMainWindow):
         self.new_server = item("plus", "New server...", "Choose drivers for your instruments; insthub writes the "
                                "config file and starts the server", self.new_server_dialog)
         self.add_service = item("servers", "Keep a server running...", "Run an existing .toml config or .py "
-                                "server in the background, at every login (systemd user service)",
-                                self.add_service_dialog)
+                                "server in the background, at login or only when you start it (systemd user "
+                                "service)", self.add_service_dialog)
         self.add_remote = item("globe", "Devices on another computer...", "Ask a server on another computer which "
                                "devices it has and list them in devices.toml", self.remote_dialog)
         menu.addSeparator()
@@ -291,6 +300,12 @@ class Manager(QtWidgets.QMainWindow):
     # -- looking -------------------------------------------------------------
     def refresh(self) -> None:
         self._viewers = [p for p in self._viewers if p.poll() is None]  # reap closed viewers
+        for p in self._spawned:  # a server this window started that failed (at start, often) says why
+            if (p.poll() or 0) > 0 and not getattr(p, "insthub_stopping", False):
+                name = getattr(p, "insthub_name", "a server")
+                lines = [line for line in tail(server_log(name), 40).splitlines() if line.strip()]
+                self.say(f"{name} ended with an error: {lines[-1] if lines else f'exit code {p.returncode}'}"
+                         + (f" (its log: {server_log(name)})" if lines else ""), 15000)
         self._spawned = [p for p in self._spawned if p.poll() is None]  # and servers that ended
         if not self._scanning:
             self._scanning = True
@@ -434,6 +449,15 @@ class Manager(QtWidgets.QMainWindow):
     def render(self) -> None:
         """Bring the sidebar and the page on show up to date (the others catch up when shown)."""
         servers = self._ordered()
+        for key, mark in list(self.restarting.items()):  # a restart is over once its new process is seen
+            proc, back = mark["proc"], self._restarted(mark)
+            if back is None and not (proc is not None and proc.poll() is not None):
+                continue
+            del self.restarting[key]  # (a new process that ended at once: refresh() says why)
+            if back is not None and self._follow == key and self.pages.currentWidget() is self.servers_page:
+                self._follow = None
+                self.open_server(back)  # its page again, where the restart left it (renders)
+                return
         self.sidebar.sync(servers, len(self.agents()), self._scanned)
         page = self.pages.currentWidget()
         if page is self.devices_page:
@@ -449,7 +473,10 @@ class Manager(QtWidgets.QMainWindow):
         elif page is self.server_page:
             s = self.servers.get(self._detail[1])
             if s is None:
+                key = self._detail[1]
                 self.show_page("servers")
+                if key in self.restarting:  # it comes back on its own once the server is up again
+                    self._follow = key
             else:
                 self.server_page.show_server(s)
         elif page is self.agents_page:
@@ -478,6 +505,17 @@ class Manager(QtWidgets.QMainWindow):
         self.pages.setCurrentWidget(self.device_page)
         self.sidebar.select("servers" if from_server else "devices")
         self.render()
+
+    def _restarted(self, mark: dict) -> str | None:
+        """The key of the server a restart started, once a scan sees it (another pid than before;
+        under its key, or the new process's pid, or its service's name)."""
+        for key, s in self.servers.items():
+            if s.origin != "local" or s.pid is None or s.pid == mark["old"]:
+                continue
+            if key == mark["key"] or (mark["proc"] is not None and s.pid == mark["proc"].pid) or \
+                    (mark["unit"] is not None and (s.service or {}).get("name") == mark["unit"]):
+                return key
+        return None
 
     def open_server(self, key: str) -> None:
         if key not in self.servers:
@@ -519,19 +557,32 @@ class Manager(QtWidgets.QMainWindow):
             return
         d = s.device(name)
         connected = bool(d and d["status"]["connected"])
+        paused = bool(d and d["status"].get("paused"))
         menu = QtWidgets.QMenu(self)
+        menu.setToolTipsVisible(True)
 
-        def item(icon, text, slot, enabled=True):
+        def item(icon, text, slot, enabled=True, tip=""):
             action = menu.addAction(ui.icon(icon), text)
             action.setEnabled(enabled)
+            action.setToolTip(tip)
             action.triggered.connect(lambda *_: slot())
 
         item("forward", "Open", lambda: self.open_device(key, name))
-        item("live", "Live view", lambda: self.live_view(s, name), d is not None and self.can_view(s)[0])
+        live_ok, why = self.can_view(s, d)
+        item("live", "Live view", lambda: self.live_view(s, name), live_ok, why)
         menu.addSeparator()
-        item("power", "Connect now", lambda: self.device_action(s, name, "$open"), d is not None and not connected)
-        item("release", "Release", lambda: self.device_action(s, name, "$release"), connected)
+        can_pause, why = self.can_pause(d)
+        if paused:
+            item("start", "Resume", lambda: self.device_action(s, name, "$resume"), tip=pages.RESUME_TIP)
+        else:
+            item("pause", "Pause", lambda: self.device_action(s, name, "$pause"), can_pause, why or pages.PAUSE_TIP)
+        item("power", "Connect now", lambda: self.device_action(s, name, "$open"),
+             d is not None and not connected and not paused)
+        item("release", "Release", lambda: self.device_action(s, name, "$release"), connected, pages.RELEASE_TIP)
         menu.addSeparator()
+        config = server_file(s)
+        if config is not None and config.suffix == ".toml":
+            item("edit", f"Edit in {config.name}...", lambda: self.edit_config(key, name))
         item("copy", "Copy its name", lambda: self.copy(name))
         menu.exec(pos)
 
@@ -544,15 +595,20 @@ class Manager(QtWidgets.QMainWindow):
         running, u = s.origin == "local", s.service
         if u and not running:
             menu.addAction(ui.icon("start"), "Start").triggered.connect(lambda *_: self.service_action(s, "start"))
-        if u:
+        if running and (u or self.started_here(s.pid)):  # a service, or a server this window started
             menu.addAction(ui.icon("refresh"), "Restart").triggered.connect(
-                lambda *_: self.service_action(s, "restart"))
+                lambda *_: self.restart_server(s, ask=True))
         if u and running:
             menu.addAction(ui.icon("stop"), "Stop").triggered.connect(lambda *_: self.service_action(s, "stop"))
         elif running and s.pid and s.pid != os.getpid():
             menu.addAction(ui.icon("stop"), "Stop").triggered.connect(lambda *_: self.stop_server(s))
         if u or (running and server_log(s.name).is_file()):
             menu.addAction(ui.icon("logs"), "Logs").triggered.connect(lambda *_: self.show_logs(s))
+        config = server_file(s)
+        if config is not None and config.suffix == ".toml":
+            menu.addSeparator()
+            menu.addAction(ui.icon("edit"), f"Edit {config.name}...").triggered.connect(
+                lambda *_: self.edit_config(key))
         menu.exec(pos)
 
     # -- managing ------------------------------------------------------------
@@ -561,15 +617,51 @@ class Manager(QtWidgets.QMainWindow):
 
     def device_action(self, s: Server, device: str, method: str) -> None:
         address = s.address
-        doing = {"$open": f"Connecting {device}", "$release": f"Releasing {device}"}[method]
+        doing = {"$open": f"Connecting {device}", "$release": f"Releasing {device}", "$pause": f"Pausing {device}",
+                 "$resume": f"Resuming {device}"}[method]
+        d = s.device(device) or {"status": {}}
+        st = d["status"]
+        if method == "$resume" and st.get("paused") and not paused_here(st["paused"], s.origin == "local"):
+            who = paused_by(st["paused"], s.origin == "local")
+            if not self.confirm(f"Resume {device}?", f"{who} paused {device} at {clock(st['paused']['since'])}, "
+                                "perhaps to use the instrument by hand. Resume it anyway? Its commands run again, "
+                                "and it reconnects if it was connected.", "Resume"):
+                return
+        if method == "$pause":
+            users = sorted({c["program"] for c in (s.probe or {}).get("clients") or ()
+                            if any(sub.startswith(device + "/") for sub in c.get("subscriptions", ()))})
+            busy = st.get("busy")
+            if (users or busy) and not self.confirm(
+                    f"Pause {device}?", (f"{', '.join(users)} {'is' if len(users) == 1 else 'are'} watching it. "
+                                         if users else "") + (f"It is running {busy}; the pause waits for it. "
+                                                              if busy else "") +
+                    "While it is paused, every program's calls to it fail. Pause it?", "Pause"):
+                return
+        def call():
+            if method not in ("$pause", "$resume"):
+                return self.backend.call(address, device, method)
+            args = ("insthub gui", PROCESS_TOKEN) if method == "$pause" else ()
+            try:  # its reply waits for the command under way: do not wait for a long one here
+                return self.backend.call(address, device, method, *args, timeout=5.0)
+            except TimeoutError:
+                return None  # it takes effect once that command has finished: the tile says so
 
         def result(status):
+            if status is None:
+                running = st.get("busy") or "what it is doing (a periodic task, say)"
+                return f"{device}: pausing; it is closed once {running} finishes" if method == "$pause" else \
+                    f"{device}: resuming once {running} finishes" if st.get("busy") else \
+                    f"{device}: resuming; opening the instrument takes a while"
+            if status.get("paused"):
+                return f"{device}: paused; its commands fail until you resume it"
             if status["connected"]:
-                return f"{device}: connected"
+                return f"{device}: connected" + (" again" if method == "$resume" else "")
+            if status["error"] is None:
+                return f"{device}: resumed; it opens on first use" if method == "$resume" else f"{device}: not opened"
             return f"{device}: {status['error']}" if status["error"] == "released" else \
                 f"{device}: not connected ({status['error']})"
 
-        self.act(doing, lambda: self.backend.call(address, device, method), result)
+        self.act(doing, call, result)
 
     def task_action(self, s: Server, device: str, task: str, on: bool) -> None:
         address = s.address
@@ -577,11 +669,24 @@ class Manager(QtWidgets.QMainWindow):
                  lambda: self.backend.call(address, device, "$task", task, on, None, timeout=10.0),
                  f"{device}.{task}: {'running' if on else 'stopped'}")
 
-    def can_view(self, s: Server) -> tuple[bool, str]:
+    def can_view(self, s: Server, d: dict | None = None) -> tuple[bool, str]:
+        """Whether Live view makes sense, and if not, why (with `d`: for this device)."""
         if not s.address or s.address.startswith("inproc://"):
             return False, "Only for servers in other programs"
         if importlib.util.find_spec("pyqtgraph") is None:
             return False, "Live plots need pyqtgraph: pip install 'insthub[gui]'"
+        if d is not None and not any(n != "state" for n in d["streams"]):
+            return False, "It publishes no streams to plot"
+        if d is not None and d["status"].get("paused"):
+            return False, "It is paused: it publishes nothing until it is resumed"
+        return True, ""
+
+    @staticmethod
+    def can_pause(d: dict | None) -> tuple[bool, str]:
+        if d is None:
+            return False, "Its server does not answer"
+        if "paused" not in d["status"]:
+            return False, "Its server runs an older insthub, which cannot pause a device"
         return True, ""
 
     def live_view(self, s: Server, device: str) -> None:
@@ -608,7 +713,8 @@ class Manager(QtWidgets.QMainWindow):
         unit = f"{service.PREFIX}{name}"
         questions = {
             "stop": ("Stop", f"Stop the service {unit}?\n\nIts devices close their instruments. It starts again "
-                             "at the next login, or with Start."),
+                             "with Start" + (", or the next time your services start (at login, or at boot with "
+                                             "lingering)." if s.service.get("enabled") else ".")),
             "restart": ("Restart", f"Restart {unit}?\n\nPrograms using it get an error for calls under way, then "
                                    "reconnect by themselves."),
             "remove": ("Remove", f"Remove the service {unit}?\n\nIt is stopped and no longer starts at login. The "
@@ -649,12 +755,124 @@ class Manager(QtWidgets.QMainWindow):
     def start_server(self, command: list[str], name: str, cwd: str | Path | None = None) -> None:
         """Start a server in the background (it outlives the window; Stop on its page ends it)."""
         try:
-            self._spawned.append(spawn(command, name, cwd))
+            proc = spawn(command, name, cwd)
         except OSError as e:
             QtWidgets.QMessageBox.warning(self, "insthub", f"Cannot start {name}.\n\n{e}")
             return
+        proc.insthub_cwd, proc.insthub_name = cwd, name
+        self._spawned.append(proc)
         self.say(f"Starting {name}...", 4000)
         QtCore.QTimer.singleShot(800, self.refresh)
+
+    def restart_server(self, s: Server, after: str = "", ask: bool = False) -> None:
+        """Start a server again, to use a changed config: its service, or one this window started.
+        `ask`: confirm first (a click on Restart; not after Save, which asked already)."""
+        done = f"{after}; " if after else ""
+        if s.key in self.restarting:
+            self.say(f"{s.name} is restarting", 4000)
+            return
+        proc = next((p for p in self._spawned if p.pid == s.pid and p.poll() is None), None)
+        if not s.service and proc is None:
+            self.say(f"{done}restart {s.name} where you started it, to use the changes", 8000)
+            return
+        if ask and not self.confirm(f"Restart {s.name}?", f"Restart {s.name}?\n\nPrograms using it get an error "
+                                    "for calls under way, then reconnect by themselves.", "Restart"):
+            return
+        key = s.key
+        mark = {"key": key, "old": s.pid, "proc": None, "unit": (s.service or {}).get("name")}
+        self.restarting[key] = mark  # one restart at a time; the page comes back once it is over
+
+        def over():
+            if self.restarting.get(key) is mark:  # (not a later restart's)
+                del self.restarting[key]
+                self.render()
+
+        QtCore.QTimer.singleShot(30_000, over)  # it did not come back in time: stop waiting for it
+        if s.service:
+            name = s.service["name"]
+            what = "restart" if s.origin == "local" else "start"
+            failed = []
+
+            def run():
+                try:
+                    getattr(service, what)(name)
+                except BaseException:
+                    failed.append(True)
+                    raise
+
+            self.act(f"{'Restarting' if what == 'restart' else 'Starting'} {service.PREFIX}{name}", run,
+                     f"{done}{service.PREFIX}{name} {what}ed", after=lambda: over() if failed else None)
+            return
+        command, name, cwd = list(proc.args), s.name, getattr(proc, "insthub_cwd", None)
+        proc.insthub_stopping = True  # (its end is not news)
+
+        def stop_and_start():  # all on the worker: if the window is quit meanwhile, the server still starts
+            proc.terminate()  # SIGTERM: the server closes its instruments, then ends
+            proc.wait(30)
+            new = spawn(command, name, cwd)
+            new.insthub_cwd, new.insthub_name = cwd, name
+            return new
+
+        def started(new):
+            self._spawned.append(new)
+            mark["proc"] = new
+            self.say(f"{done}{name} restarted", 5000)
+            QtCore.QTimer.singleShot(800, self.refresh)
+
+        def failed(exc):
+            self.say(f"Cannot restart {name}: {pages.error_text(exc)}", 8000)
+            over()
+
+        self.say(f"Restarting {name}...", 0)
+        self.submit(self.actions, stop_and_start, started, failed)
+
+    def set_login(self, s: Server, on: bool) -> None:
+        """Start a service at every login, or no longer."""
+        name = s.service["name"]
+        if name in self.login_pending:  # the last change is not done yet
+            return
+        self.login_pending[name] = on  # what the switch shows until systemd has done it (and a scan saw it)
+        shown = getattr(self.server_page, "server", None)
+        if shown is not None and (shown.service or {}).get("name") == name:
+            self.server_page.login.setEnabled(False)  # now, not at the next refresh: no second click meanwhile
+
+        def over():
+            if self.login_pending.get(name) == on:
+                self.login_pending.pop(name, None)
+
+        failed = []
+
+        def change():
+            try:
+                (service.enable if on else service.disable)(name)
+            except BaseException:
+                failed.append(True)
+                raise
+
+        def after():  # done: what the switch shows comes from the scans again (at once if it was refused)
+            if failed:
+                over()
+                self.render()
+            else:
+                QtCore.QTimer.singleShot(2 * self._refresh_ms + 300, over)
+
+        self.act(f"{'Enabling' if on else 'Disabling'} {service.PREFIX}{name} at login", change,
+                 f"{service.PREFIX}{name} " + ("starts at every login" if on else "no longer starts at login"),
+                 after=after)
+
+    def edit_config(self, key: str, select: str | None = None) -> None:
+        """Change a server's config file in the window (its comments are kept)."""
+        s = self.servers.get(key)
+        path = server_file(s) if s is not None else None
+        if path is None or path.suffix != ".toml":
+            self.say("Its server does not run from a .toml config file that this computer can open", 6000)
+            return
+        try:
+            dialog = forms.ServerDialog(self, path, server=s, select=select)
+        except (OSError, ValueError, TypeError, UnicodeDecodeError) as e:
+            QtWidgets.QMessageBox.warning(self, "insthub", f"Cannot read {path}.\n\n{e}")
+            return
+        dialog.exec()
 
     def started_here(self, pid: int | None) -> bool:
         """Whether this window started that process (and it still runs)."""
@@ -664,7 +882,7 @@ class Manager(QtWidgets.QMainWindow):
         self.start_server([sys.executable, "-m", "insthub", "sim"], "sim")
 
     def new_server_dialog(self) -> None:
-        forms.NewServerDialog(self).exec()
+        forms.ServerDialog(self).exec()
 
     def add_service_dialog(self) -> None:
         forms.ServiceDialog(self).exec()
@@ -697,7 +915,7 @@ class Manager(QtWidgets.QMainWindow):
             if s.service:
                 now["service", s.service["name"]] = (GOOD, "", "", None)
             for name in s.probe["devices"] if s.probe else ():
-                status, word, sentence = device_state(s.device(name))
+                status, word, sentence = device_state(s.device(name), s.origin == "local")
                 now["device", s.key, name] = (status, f"{name} on {s.name}: {word}", sentence, ("device", s.key, name))
         if self.tray is not None:
             for key, (status, headline, sentence, select) in now.items():

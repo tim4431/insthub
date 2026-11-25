@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 
 import numpy as np
 import pytest
@@ -24,6 +25,12 @@ def spin(seconds, until=lambda: False):
         app.processEvents()
         time.sleep(0.01)
     return until()
+
+
+@pytest.fixture(autouse=True)
+def no_real_services(monkeypatch):
+    """Not the services installed on this computer: a test that needs some gives its own."""
+    monkeypatch.setattr(service, "units", list)
 
 
 @pytest.fixture(autouse=True)
@@ -172,6 +179,110 @@ def test_properties_are_read_and_set_in_place(window):
         assert spin(3, lambda: server.devices["lamp"]._on is True)
 
 
+class Rig(insthub.Device):
+    """A rig whose settings say what they take."""
+
+    simulated = True
+    extension, extension_version = "rig-ext", "0.4"
+
+    def open(self):
+        self.values, self.fired = {"mode": "CW", "level": 2.5, "gain": "auto"}, 0
+
+    def _get(name):
+        return lambda self: self.values[name]
+
+    def _set(name):
+        return lambda self, value: self.values.__setitem__(name, value)
+
+    mode = insthub.prop(_get("mode"), _set("mode"), choices=["CW", "pulsed"])
+    level = insthub.prop(_get("level"), _set("level"), unit="V", min=0, max=10, step=0.5, dangerous=True)
+    gain = insthub.prop(_get("gain"), _set("gain"), unit="dB", min=0, max=40)  # it says "auto" for now
+
+    @insthub.command(dangerous=True, params={"ms": {"unit": "ms", "min": 0}})
+    def fire(self, ms=10):
+        self.fired += 1
+        return ms
+
+
+def test_controls_follow_what_a_device_says_and_dangerous_asks_first(window, monkeypatch):
+    with insthub.Server("t", [Rig("rig")]) as server:
+        rig = server.devices["rig"]
+        assert spin(5, lambda: word(window, "device", "local:t", "rig") == "connected")
+        assert spin(3, lambda: ("local:t", "rig") in window.devices_page.tiles)
+        tile = window.devices_page.tiles["local:t", "rig"]
+        assert tile.view.badge == "SIM" and "not a measurement" in tile.view.tip
+        window.open_device("local:t", "rig")
+        page = window.device_page
+        assert not page.header.badge.isHidden() and page.extension.text() == "rig-ext 0.4"
+        rows = page.props.rows
+        assert spin(3, lambda: all(row.loaded for row in rows.values()))
+        mode, level, gain = rows["mode"], rows["level"], rows["gain"]
+        assert mode.editor is mode.choice and mode.choice.currentText() == "CW"
+        assert level.editor is level.number and level.number.text() == "2.5 V" and level.number.maximum() == 10
+        assert gain.editor is gain.edit and gain.edit.text() == "auto"     # what a spin box cannot show
+        mode.choice.activated.emit(1)                                        # a choice is sent at once
+        assert spin(3, lambda: rig.values["mode"] == "pulsed")
+
+        answers = []
+        monkeypatch.setattr(window, "confirm", lambda *a: answers.append(a[0]) or a[0].startswith("Set"))
+        level.number.setValue(4)
+        level.apply()
+        assert answers == ["Set rig.level?"] and spin(3, lambda: level.value == 4.0)   # set, and read again
+        monkeypatch.setattr(window, "confirm", lambda *a: answers.append(a[0]) and False)
+        level.number.setValue(6)
+        level.number.submitted.emit()                                        # Enter
+        assert answers[-1] == "Set rig.level?" and level.number.value() == 4  # declined: shows what it has
+        spin(0.2)
+        assert rig.values["level"] == 4.0
+
+        commands = page.commands
+        commands.choose("fire")
+        assert "ms: at least 0 ms" in commands.chosen.text() and "asked before it runs" in commands.chosen.text()
+        assert commands.table.item(0, 2).text().startswith("Dangerous")
+        commands.run()                                                       # declined
+        assert answers[-1] == "Run rig.fire?" and commands.result.toPlainText() == ""
+        monkeypatch.setattr(window, "confirm", lambda *a: True)
+        commands.args.setText("ms=5")
+        commands.run()
+        assert spin(3, lambda: commands.result.toPlainText() == "5") and rig.fired == 1
+
+
+class Shutter:
+    """A driver whose output is an accessor pair: get_output() and set_output(on)."""
+
+    def __init__(self):
+        self.on = False
+
+    def get_output(self):
+        return self.on
+
+    def set_output(self, on):
+        self.on = on
+
+
+def test_writing_a_property_whose_setter_is_dangerous_asks_first(window, monkeypatch):
+    shutter = insthub.wrap(Shutter, "shutter", accessors=True, dangerous=["set_output"])  # the command is marked
+    with insthub.Server("t", [shutter]):
+        assert spin(5, lambda: word(window, "device", "local:t", "shutter") == "connected")
+        window.open_device("local:t", "shutter")
+        rows = window.device_page.props.rows
+        assert spin(3, lambda: "output" in rows and rows["output"].loaded)
+        asked = []
+        monkeypatch.setattr(window, "confirm", lambda *a: asked.append(a[0]) and False)
+        window.device_page.props.write("output", True)  # what a property's editor does
+        spin(0.2)
+        assert asked == ["Set shutter.output?"] and shutter.target.on is False
+
+
+def test_number_box_shows_numbers_as_typed():
+    qt.application()
+    box = ui.NumberBox()
+    box.set_meta({"unit": "MHz", "min": 10, "max": 24000})
+    box.setValue(1000.25)
+    assert box.text() == "1000.25 MHz" and box.fits(24000) and not box.fits(9)
+    assert not ui.NumberBox().fits(1e-12) and ui.NumberBox().fits(-0.001)  # too small for its decimals: no
+
+
 def test_commands_are_run_from_their_tab(window):
     with insthub.Server("t", [sim.Loopback()]):
         assert spin(5, lambda: word(window, "device", "local:t", "loopback") == "connected")
@@ -309,7 +420,7 @@ def test_services_and_remote_devices(monkeypatch, tmp_path):
 
             window.open_server("local:t")
             page = window.server_page
-            assert "insthub-t · active · starts at login" in page.service.text()
+            assert "insthub-t · active" in page.service.text() and page.login.isChecked()
             assert page.start.isHidden() and not page.restart.isHidden()
             page.restart.click()
             page.stop.click()                                                 # a service is stopped by systemd
@@ -517,7 +628,7 @@ def test_new_server_writes_its_config_and_starts_it(window, monkeypatch, tmp_pat
     dialog._add()
     dialog.driver.setCurrentText("insthub.sim:Loopback")
     assert dialog.dev_name.text() == "loopback"                              # named after the driver
-    dialog.reach.setCurrentIndex(1)
+    dialog.reach.setCurrentIndex(dialog.reach.findData(forms.NETWORK))
     dialog.port.setValue(8799)
     assert '[devices.loopback]\ndriver = "insthub.sim:Loopback"' in dialog.preview.toPlainText()
     dialog.dev_name.setText("scope")                                         # two of the same name: refused
@@ -526,13 +637,560 @@ def test_new_server_writes_its_config_and_starts_it(window, monkeypatch, tmp_pat
     dialog.dev_name.setText("echo")
     dialog.dev_name.textEdited.emit("echo")
     assert dialog.create.isEnabled()
-    dialog.then.setCurrentIndex(dialog.then.findData(dialog.START_ONCE))
+    dialog.then.setCurrentIndex(dialog.then.findData(dialog.ONCE))
     dialog.create.click()
     path = tmp_path / "servers" / "bench.toml"
     kwargs, devices = config.load(path)
     assert kwargs == {"name": "bench", "tcp": "0.0.0.0:8799"} and [d.name for d in devices] == ["scope", "echo"]
     assert devices[0].points == 500
     assert started == [([sys.executable, "-m", "insthub", "serve", str(path)], "bench")]
+
+
+def test_pause_and_resume_from_the_window(window):
+    with insthub.Server("t", [Lamp("lamp")]) as server:
+        assert spin(5, lambda: word(window, "device", "local:t", "lamp") == "connected")
+        window.open_device("local:t", "lamp")
+        page = window.device_page
+        assert page.pause.text() == "Pause" and page.edit_file.isEnabled() is False   # in this process: no file
+        page.pause.click()
+        assert spin(5, lambda: word(window, "device", "local:t", "lamp") == "paused")
+        assert server.devices["lamp"].connected is False
+        assert spin(3, lambda: page.pause.text() == "Resume") and not page.connect_now.isEnabled()
+        assert "Paused since" in page.instrument.text() and "by this window" in page.instrument.text()
+        view = pages.device_view(window.servers["local:t"], "lamp")
+        assert view.status == "paused" and view.icon == "pause" and view.message.startswith("Paused since")
+        with pytest.raises(insthub.DevicePaused):
+            _ = server.device("lamp").on
+        page.pause.click()                                                   # Resume
+        assert spin(5, lambda: word(window, "device", "local:t", "lamp") == "connected")
+        assert spin(3, lambda: page.pause.text() == "Pause")
+
+
+class BlinkingLamp(Lamp):
+    blinks = 0
+
+    @insthub.command
+    def blink(self, times: int = 1) -> int:
+        """Blink it."""
+        BlinkingLamp.blinks += times
+        return times
+
+
+def test_a_program_knows_its_own_pause_over_tcp_too():
+    with insthub.Server("t", [Lamp("lamp")], tcp=0, ipc=False) as server, insthub.connect(server.addresses[-1]) as c:
+        paused = c.device("lamp").bus.pause()["paused"]                        # what the window sends: a token
+        assert "pid" not in paused and paused["peer"].startswith("127.0.0.1:")
+        assert inventory.paused_here(paused) and inventory.paused_by(paused) == "this window"
+        c.device("lamp").bus.resume()
+        paused = c._t.request("lamp", "$pause", ("experiment.py",), {}).result(5)["paused"]      # no token
+        assert not inventory.paused_here(paused) and inventory.paused_by(paused) == "experiment.py"
+        c.device("lamp").bus.resume()
+
+
+def test_the_window_knows_its_own_pause_and_runs_nothing_while_paused(window, monkeypatch):
+    asked = []
+    monkeypatch.setattr(window, "confirm", lambda *a: asked.append(a[0]) or True)
+    with insthub.Server("t", [BlinkingLamp("lamp")], tcp=0) as server:
+        assert spin(5, lambda: word(window, "device", "local:t", "lamp") == "connected")
+        window.open_device("local:t", "lamp")
+        page = window.device_page
+        level = page.props.rows["level"]
+        assert spin(3, lambda: level.edit.text() == "0.5")
+        page.pause.click()
+        assert spin(5, lambda: word(window, "device", "local:t", "lamp") == "paused")
+        assert spin(3, lambda: "by this window" in page.instrument.text())
+        sets = []
+        monkeypatch.setattr(page.props, "write", lambda *a: sets.append(a))
+        assert spin(3, lambda: level.edit.isReadOnly())
+        level.edit.returnPressed.emit()                                      # Enter in a held field: nothing
+        page.commands.choose("blink")
+        assert not page.commands.run_button.isEnabled()
+        page.commands.args.returnPressed.emit()                              # nor in the arguments line
+        spin(0.3)
+        assert sets == [] and BlinkingLamp.blinks == 0 and "paused" not in page.commands.result.toPlainText()
+        page.pause.click()                                                   # Resume: its own pause, no question
+        assert spin(5, lambda: word(window, "device", "local:t", "lamp") == "connected")
+        assert asked == []
+        with insthub.connect(server.addresses[-1]) as other:                 # another program's pause (no token) ...
+            other._t.request("lamp", "$pause", ("experiment.py",), {}).result(5)
+        assert spin(5, lambda: word(window, "device", "local:t", "lamp") == "paused")
+        assert spin(3, lambda: "by experiment.py" in page.instrument.text())
+        page.pause.click()                                                   # ... is resumed only when confirmed
+        assert spin(5, lambda: asked == ["Resume lamp?"])
+
+
+def test_restart_of_a_server_started_here_asks_runs_once_and_comes_back(window, monkeypatch):
+    class Proc:
+        def __init__(self, pid):
+            self.pid, self.args = pid, ["python", "-m", "insthub", "serve", "x.toml"]
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            time.sleep(0.2)
+
+        def wait(self, timeout=None):
+            return 0
+
+    spawned = []
+    monkeypatch.setattr(manager, "spawn", lambda *a: spawned.append(a) or Proc(4343))
+    window._spawned.append(Proc(4242))
+    s = type("S", (), {"service": None, "pid": 4242, "name": "x", "key": "local:x", "origin": "local"})()
+    answers = [False, True, True]
+    monkeypatch.setattr(window, "confirm", lambda *a: answers.pop(0))
+    window.restart_server(s, ask=True)                                     # Cancel: nothing happens
+    spin(0.3)
+    assert spawned == [] and not window.restarting
+    window.restart_server(s, ask=True)
+    window.restart_server(s, ask=True)                                     # a second click while it restarts:
+    assert spin(3, lambda: len(spawned) == 1) and not spin(0.5, lambda: len(spawned) > 1)
+    assert answers == [True]                                               # not even asked
+    window._detail = ("server", "local:x")                                 # its page, while it is gone ...
+    window.pages.setCurrentWidget(window.server_page)
+    window.render()
+    assert window.pages.currentWidget() is window.servers_page and window._follow == "local:x"
+    opened = []
+    monkeypatch.setattr(window, "open_server", opened.append)
+    monkeypatch.setattr(window, "servers", {"local:x": type("S", (), {**vars(type(s)), "pid": 4343})()})
+    window.render()                                                        # ... comes back once it is up
+    assert opened == ["local:x"] and not window.restarting and window._follow is None
+
+
+def test_a_refused_start_at_login_change_shows_the_real_state_at_once(monkeypatch):
+    unit = {"enabled": True, "command": '"python" "-m" "insthub" "serve" "t.toml"', "unit": "u", "name": "t",
+            "state": "active", "sub": "running", "pid": os.getpid()}
+    monkeypatch.setattr(service, "units", lambda: [unit])
+    monkeypatch.setattr(service, "disable", lambda name: (_ for _ in ()).throw(service.BusError("no luck")))
+    monkeypatch.setattr(manager.QtWidgets.QMessageBox, "warning", lambda *a: None)
+    qt.application()
+    with insthub.Server("t", [sim.Loopback()]):
+        window = manager.Manager(refresh_ms=1000)
+        try:
+            assert spin(5, lambda: "local:t" in window.servers and window.servers["local:t"].service)
+            window.open_server("local:t")
+            page = window.server_page
+            page.login.click()                                               # off: refused
+            assert spin(3, lambda: not window.login_pending)                 # at once, not seconds later
+            assert spin(3, lambda: page.login.isChecked() and page.login.isEnabled())
+        finally:
+            window.close()
+            spin(0.1)
+
+
+def test_start_at_login_is_switched_on_the_server_page(monkeypatch):
+    unit = {"enabled": True, "command": '"python" "-m" "insthub" "serve" "t.toml"', "unit": "u", "name": "t",
+            "state": "active", "sub": "running", "pid": os.getpid()}
+    monkeypatch.setattr(service, "units", lambda: [unit])
+    calls = []
+    for action in ("enable", "disable"):
+        monkeypatch.setattr(service, action, lambda name, action=action: calls.append((action, name)))
+    qt.application()
+    with insthub.Server("t", [sim.Loopback()]):
+        window = manager.Manager(refresh_ms=150)
+        try:
+            assert spin(5, lambda: "local:t" in window.servers and window.servers["local:t"].service)
+            window.open_server("local:t")
+            page = window.server_page
+            assert not page.login_row.isHidden() and page.login.isChecked()
+            assert "started when you log in" in page.login_row.hint.text()
+            page.login.click()                                               # off
+            assert not page.login.isEnabled()                                # at once: no second click meanwhile
+            assert spin(3, lambda: calls == [("disable", "t")])
+            spin(0.3)                                                        # scans still say it is enabled ...
+            assert not page.login.isChecked()                                # ... but the switch shows what was asked
+            unit["enabled"] = False
+            assert spin(3, lambda: not page.login.isChecked() and page.login.isEnabled()
+                        and "only when you start it" in page.login_row.hint.text())
+            page.login.click()                                               # on again
+            assert spin(3, lambda: calls[-1] == ("enable", "t"))
+        finally:
+            window.close()
+            spin(0.1)
+
+
+EDITED = """# The bench.  Comments like this one must survive an edit.
+
+[server]
+name = "bench"   # how clients find it
+
+# a box on the serial port
+[devices.box]
+driver = "boxdriver:Box"
+path = "{folder}"
+port = "18"            # a string that looks like a number
+gain = 1
+
+[devices.echo]
+driver = "insthub.sim:Loopback"
+"""
+
+
+def test_a_config_is_edited_in_place(window, tmp_path):
+    (tmp_path / "boxdriver.py").write_text("class Box:\n    def __init__(self, port, gain=1, mode='fast'):\n"
+                                           "        pass\n")
+    path = tmp_path / "bench.toml"
+    path.write_text(EDITED.format(folder=tmp_path))
+    dialog = forms.ServerDialog(window, path, select="box")
+    assert dialog.windowTitle() == "Edit bench.toml" and dialog.name.text() == "bench"
+    assert [dialog.list.item(i).text() for i in range(dialog.list.count())] == ["box", "echo"]
+    assert dialog.dev_name.text() == "box" and set(dialog._arg_edits) == {"port", "gain", "mode"}
+    assert dialog._arg_edits["port"].text() == "18" and dialog._arg_edits["mode"].placeholderText() == "fast"
+    assert not dialog.create.isEnabled()                                     # nothing changed yet
+    assert [dialog.then.itemData(i) for i in range(dialog.then.count())] == [dialog.SAVE]   # no server runs it
+    dialog._arg_edits["gain"].setText("3")
+    dialog._arg_edits["gain"].textEdited.emit("3")
+    dialog.open_now.click()                                                  # lazy
+    dialog.list.setCurrentRow(1)
+    dialog._remove()                                                         # echo goes
+    assert dialog.create.isEnabled() and dialog.create.text() == "Save"
+    dialog.create.click()
+    text = path.read_text()
+    assert text.startswith("# The bench.  Comments like this one must survive an edit.\n")
+    assert 'name = "bench"   # how clients find it' in text and "# a box on the serial port" in text
+    assert 'port = "18"            # a string that looks like a number' in text   # untouched, and still text
+    assert "gain = 3\n" in text and "lazy = true" in text and "echo" not in text
+    kwargs, devices = config.load(path)
+    assert kwargs == {"name": "bench"} and [d.name for d in devices] == ["box"] and not devices[0].open_on_start
+    assert "saved" in window.toast.text().lower()
+
+
+TOUCHY = r"""# a config with values that are easy to spoil
+[server]
+name = "rig"
+tcp = 8765          # an SSH tunnel: this computer only
+
+# the box
+[devices.box]
+driver = "boxdriver:Box"
+path = "."           # relative: the config's folder
+port = 5             # text by default, a number here
+term = "\r\n"
+prefix = ""
+label = "  padded  "
+when = 2024-01-01
+timeout = nan
+gains = [1, 2]       # per channel
+
+[devices.box.kwargs]
+path = "/dev/serial/by-id/usb-1"   # the driver's own path argument
+
+[devices.odd]        # no driver: insthub could not start it, but it must not block other changes
+note = "unfinished"
+"""
+
+
+def _box(tmp_path):
+    (tmp_path / "boxdriver.py").write_text("class Box:\n    def __init__(self, port='COM1', term='\\n', prefix='>',"
+                                           " label='', when=None, timeout=1.0, path='', mode='a'):\n        pass\n")
+    path = tmp_path / "rig.toml"
+    path.write_text(TOUCHY)
+    return path
+
+
+def test_editing_writes_only_what_was_changed(window, tmp_path):
+    path = _box(tmp_path)
+    dialog = forms.ServerDialog(window, path, select="box")
+    assert dialog.dev_name.text() == "box" and "port" in dialog._arg_edits        # its folder counts from the file's
+    assert dialog._arg_edits["path"].text() == "/dev/serial/by-id/usb-1"          # its own path, from kwargs
+    assert "when = 2024-01-01" in dialog.extra.toPlainText()
+    assert dialog.reach.currentData() == forms.TCP_HERE and dialog.port.value() == 8765
+    assert not dialog.create.isEnabled()                                          # nothing changed: nothing to save
+    dialog.name.setText("rig2")                                                   # a change elsewhere ...
+    assert dialog.preview.toPlainText() == TOUCHY.replace('name = "rig"', 'name = "rig2"')   # ... changes only it
+    dialog.reach.setCurrentIndex(dialog.reach.findData(forms.LOCAL))              # away and back: no change
+    dialog.reach.setCurrentIndex(dialog.reach.findData(forms.TCP_HERE))
+    assert "tcp = 8765          # an SSH tunnel" in dialog.preview.toPlainText()
+    dialog.reach.setCurrentIndex(dialog.reach.findData(forms.NETWORK))            # the port is kept
+    assert 'tcp = "0.0.0.0:8765"          # an SSH tunnel' in dialog.preview.toPlainText()
+    dialog.reach.setCurrentIndex(dialog.reach.findData(forms.TCP_HERE))
+    dialog._arg_edits["mode"].setText("b")
+    dialog._arg_edits["mode"].textEdited.emit("b")                                 # one argument of box
+    dialog._arg_edits["path"].setText("/dev/ttyS1")
+    dialog._arg_edits["path"].textEdited.emit("/dev/ttyS1")
+    dialog.dev_name.setText("psu")
+    dialog.dev_name.textEdited.emit("psu")                                        # and its name
+    dialog.create.click()
+    text = path.read_text()
+    assert "# the box\n[devices.psu]\n" in text and "[devices.psu.kwargs]" in text and "[devices.box" not in text
+    doc = tomllib.loads(text)
+    psu = doc["devices"]["psu"]
+    assert psu["path"] == "." and psu["kwargs"] == {"path": "/dev/ttyS1"} and psu["mode"] == "b"
+    assert psu["port"] == 5 and psu["term"] == "\r\n" and psu["prefix"] == "" and psu["label"] == "  padded  "
+    assert str(psu["when"]) == "2024-01-01" and psu["gains"] == [1, 2] and psu["timeout"] != psu["timeout"]
+    assert 'gains = [1, 2]       # per channel' in text and doc["server"] == {"name": "rig2", "tcp": 8765}
+    assert doc["devices"]["odd"] == {"note": "unfinished"}
+
+
+def _type(edit, text):
+    edit.setText(text)
+    edit.textEdited.emit(text)
+
+
+KWARGS = """[devices.box]
+driver = "boxdriver:Box"
+path = "."
+gain = 3
+close = "shutdown"     # insthub's: what it calls at the end
+
+[devices.box.kwargs]
+port = "COM1"
+extra_thing = 1
+
+[devices.echo]
+driver = "insthub.sim:Loopback"
+lazy = true
+reconnect_interval = 9
+"""
+
+
+def _kwargs(tmp_path):
+    (tmp_path / "boxdriver.py").write_text(
+        "class Box:\n    def __init__(self, port, gain=1, mode='fast', close=None, channels=()):\n        pass\n\n"
+        "class Other:\n    def __init__(self, port, speed=1):\n        pass\n")
+    path = tmp_path / "k.toml"
+    path.write_text(KWARGS)
+    return path
+
+
+def test_arguments_are_written_where_the_file_gives_them(window, tmp_path):
+    dialog = forms.ServerDialog(window, _kwargs(tmp_path), select="box")
+    e = dialog._arg_edits
+    assert e["port"].text() == "COM1" and e["close"].text() == ""           # insthub's close is not the argument
+    assert 'close = "shutdown"' in dialog.extra.toPlainText() and "kwargs.extra_thing = 1" in dialog.extra.toPlainText()
+    _type(e["port"], "COM2")                                                  # under kwargs, where it was
+    box = tomllib.loads(dialog.preview.toPlainText())["devices"]["box"]
+    assert box["kwargs"]["port"] == "COM2" and "port" not in box and box["close"] == "shutdown"
+    dialog.extra.setPlainText('close = "shutdown"')                           # a kwargs.* line deleted: it goes
+    assert "extra_thing" not in dialog.preview.toPlainText() and "port = \"COM2\"" in dialog.preview.toPlainText()
+    dialog.extra.setPlainText('close = "shutdown"\nchannels = [1, 2]')        # an argument given there ...
+    assert e["channels"].isReadOnly() and "more keys" in e["channels"].placeholderText()   # ... not in its field
+    dialog.extra.setPlainText('close = "shutdown"')
+    assert not e["channels"].isReadOnly()
+    _type(e["gain"], "5")
+    dialog.driver.setCurrentText("boxdriver:Other")                           # another driver by mistake ...
+    assert "gain" not in tomllib.loads(dialog.preview.toPlainText())["devices"]["box"]
+    dialog.driver.setCurrentText("boxdriver:Box")                             # ... and back: nothing lost
+    assert dialog._arg_edits["gain"].text() == "5"
+    assert tomllib.loads(dialog.preview.toPlainText())["devices"]["box"]["gain"] == 5
+    assert "Removed:" in dialog.removed.text() and "extra_thing = 1" in dialog.removed.text()
+
+
+def test_the_docs_kwargs_path_example_with_a_driver_not_readable_here(window, tmp_path):
+    path = tmp_path / "psu.toml"
+    path.write_text('[devices.psu]\ndriver = "mydriver:PowerSupply"\npath = "nowhere"\n\n'
+                    '[devices.psu.kwargs]\npath = "/dev/serial/by-id/usb-1"\n')
+    dialog = forms.ServerDialog(window, path)
+    assert dialog.extra.toPlainText() == 'kwargs.path = "/dev/serial/by-id/usb-1"'   # not the driver's folder
+    dialog.open_now.click()
+    assert not dialog.problem.text() and dialog.create.isEnabled()
+    doc = tomllib.loads(dialog.preview.toPlainText())["devices"]["psu"]
+    assert doc == {"driver": "mydriver:PowerSupply", "path": "nowhere", "lazy": True,
+                   "kwargs": {"path": "/dev/serial/by-id/usb-1"}}
+
+
+def test_names_freed_in_the_same_edit_can_be_taken(window, tmp_path):
+    path = _kwargs(tmp_path)
+    dialog = forms.ServerDialog(window, path, select="echo")
+    dialog._remove()                                                          # echo goes, and a new echo comes:
+    dialog._add()
+    _type(dialog.dev_name, "echo")
+    dialog.driver.setCurrentText("insthub.sim:SimScope")
+    assert tomllib.loads(dialog.preview.toPlainText())["devices"]["echo"] == {"driver": "insthub.sim:SimScope"}
+    assert "<code>[devices.echo]</code>" in dialog.removed.text()            # nothing of the old one is kept
+
+    dialog = forms.ServerDialog(window, path, select="echo")
+    dialog._remove()
+    dialog.list.setCurrentRow(0)
+    _type(dialog.dev_name, "echo")                                            # box takes the removed one's name
+    assert not dialog.problem.text(), dialog.problem.text()
+    text = dialog.preview.toPlainText()
+    assert list(tomllib.loads(text)["devices"]) == ["echo"] and "[devices.echo.kwargs]" in text
+    assert 'driver = "boxdriver:Box"' in text and "lazy" not in text
+
+    dialog = forms.ServerDialog(window, path, select="box")                   # and two swap their names
+    _type(dialog.dev_name, "x")
+    dialog.list.setCurrentRow(1)
+    _type(dialog.dev_name, "box")
+    dialog.list.setCurrentRow(0)
+    _type(dialog.dev_name, "echo")
+    assert not dialog.problem.text(), dialog.problem.text()
+    devices = tomllib.loads(dialog.preview.toPlainText())["devices"]
+    assert devices["echo"]["driver"] == "boxdriver:Box" and devices["box"]["driver"] == "insthub.sim:Loopback"
+    assert not dialog.removed.text()                                          # renames remove nothing
+    dialog.create.click()
+    assert tomllib.loads(path.read_text())["devices"] == devices
+
+
+def test_arguments_stay_in_sight_when_the_driver_changes(window, tmp_path):
+    path = _kwargs(tmp_path)
+    (tmp_path / "boxdriver.py").write_text(
+        "class Box:\n    def __init__(self, port, gain=1, mode='fast', close=None, channels=()):\n        pass\n\n"
+        "class BoxV2(Box):\n    pass\n\n"
+        "class Other:\n    def __init__(self, port, speed=1):\n        pass\n")
+    dialog = forms.ServerDialog(window, path, select="box")
+    _type(dialog._arg_edits["gain"], "5")
+    dialog.driver.setCurrentText("boxdriver:BoxV2")                           # inherits its constructor:
+    assert set(dialog._arg_edits) == {"port", "gain"}                         # what the fields hold stays
+    assert dialog._arg_edits["gain"].text() == "5" and "written" in dialog.args_note.text()
+    box = tomllib.loads(dialog.preview.toPlainText())["devices"]["box"]
+    assert box["gain"] == 5 and box["kwargs"]["port"] == "COM1" and box["driver"] == "boxdriver:BoxV2"
+    dialog.driver.setCurrentText("boxdriver:Box")                             # its own fields again
+    assert dialog._arg_edits["gain"].text() == "5" and dialog._arg_edits["port"].text() == "COM1"
+    assert dialog.extra.toPlainText() == 'close = "shutdown"\nkwargs.extra_thing = 1'   # never rewritten
+    dialog.driver.setCurrentText("nomodule:Thing")                            # not readable here: the same
+    assert set(dialog._arg_edits) == {"port", "gain"}
+
+    dialog = forms.ServerDialog(window, path, select="box")                   # typed a key at a time ...
+    _type(dialog._arg_edits["gain"], "5")
+    for i in range(len("boxdriver:"), len("boxdriver:Other") + 1):
+        dialog.driver.setCurrentText("boxdriver:Other"[:i])
+    typed = dialog.preview.toPlainText()
+    dialog = forms.ServerDialog(window, path, select="box")                   # ... or chosen at once: the same
+    _type(dialog._arg_edits["gain"], "5")
+    dialog.driver.setCurrentText("boxdriver:Other")
+    assert typed == dialog.preview.toPlainText()
+    assert "gain" not in tomllib.loads(typed)["devices"]["box"] and 'close = "shutdown"' in typed
+
+
+def test_a_key_given_twice_points_to_the_one_in_effect(window, tmp_path):
+    (tmp_path / "boxdriver.py").write_text("class Box:\n    def __init__(self, port, gain=1):\n        pass\n")
+    path = tmp_path / "twice.toml"
+    path.write_text('[devices.box]\ndriver = "boxdriver:Box"\npath = "."\nport = "COM1"\n'
+                    'kwargs = { port = "COM9" }\n')
+    dialog = forms.ServerDialog(window, path)
+    port = dialog._arg_edits["port"]
+    assert port.text() == "COM9" and not port.isReadOnly()                    # kwargs wins: its field is it
+    assert dialog.extra.toPlainText() == 'port = "COM1"'
+
+
+def test_renamed_and_added_under_the_old_name_and_other_small_things(window, tmp_path):
+    path = _kwargs(tmp_path)
+    dialog = forms.ServerDialog(window, path, select="echo")
+    _type(dialog.dev_name, "echo_old")                                        # keep the old one under a new name
+    dialog._add()
+    _type(dialog.dev_name, "echo")                                            # and add a new one
+    dialog.driver.setCurrentText("insthub.sim:SimScope")
+    assert not dialog.problem.text(), dialog.problem.text()
+    devices = tomllib.loads(dialog.preview.toPlainText())["devices"]
+    assert devices["echo_old"]["lazy"] is True and devices["echo"] == {"driver": "insthub.sim:SimScope"}
+    assert not dialog.removed.text()
+
+    path.write_text('[devices.device_psu]\ndriver = "insthub.sim:Loopback"\n')
+    dialog = forms.ServerDialog(window, path)
+    dialog.driver.setCurrentText("insthub.sim:SimSynth")                     # an existing device keeps its name
+    assert dialog.dev_name.text() == "device_psu"
+    dialog._add()
+    dialog.driver.setCurrentText("insthub.sim:SimSynth")                     # a new device1 is named after it
+    assert dialog.dev_name.text() == "synth"
+
+    path.write_text('[server]\nname = "bare"\n')                              # no devices, no [devices]
+    dialog = forms.ServerDialog(window, path)
+    dialog.name.setText("bare2")
+    assert not dialog.removed.text()
+
+
+def test_a_new_port_keeps_the_address_and_the_preview_keeps_its_place(window, tmp_path):
+    path = tmp_path / "n.toml"
+    path.write_text('[server]\nname = "n"\ntcp = "192.168.1.5:8765"   # the lab network only\n\n'
+                    + "".join(f'[devices.d{i}]\ndriver = "insthub.sim:Loopback"\n\n' for i in range(40)))
+    dialog = forms.ServerDialog(window, path, select="d39")
+    dialog.resize(1200, 780)
+    dialog.show()
+    dialog.port.setValue(8766)
+    assert 'tcp = "192.168.1.5:8766"   # the lab network only' in dialog.preview.toPlainText()
+    dialog.port.setValue(8765)
+    bar = dialog.preview.verticalScrollBar()
+    dialog.open_now.click()                                                   # a change at the bottom: shown
+    assert spin(1, lambda: bar.value() > 0)
+    at = bar.maximum()
+    bar.setValue(at)
+    dialog.extra.setPlainText("reconnect_interval = 2")                       # more, below it: it stays there
+    assert bar.value() == at
+    bar.setValue(0)
+    dialog.name.setText("n2")                                                 # a change at the top: shown
+    assert bar.value() == 0
+    dialog.list.setCurrentRow(20)
+    dialog.open_now.click()                                                   # then one further down: shown too
+    assert spin(1, lambda: bar.value() > 0)
+    dialog.hide()
+
+
+def test_saving_when_the_file_vanished_or_changed(window, tmp_path, monkeypatch):
+    path = _box(tmp_path)
+    warned = []
+    monkeypatch.setattr(forms.QtWidgets.QMessageBox, "warning", lambda *a: warned.append(a[2]))
+    dialog = forms.ServerDialog(window, path)
+    dialog.name.setText("rig2")
+    path.unlink()
+    dialog.create.click()                                                         # no crash: it says why
+    assert warned and "Cannot read" in warned[0] and not path.exists()
+    path.write_text(TOUCHY.replace("# the box", "# changed meanwhile"))
+    monkeypatch.setattr(window, "confirm", lambda *a: True)                       # Save over them
+    shown = dialog.preview.toPlainText()
+    dialog.create.click()
+    assert path.read_text() == shown                                              # exactly what was shown
+
+
+def test_only_insthub_configs_are_edited(window, tmp_path):
+    assert inventory.served(["python3", "srv.py", "settings.toml"]) == "srv.py"     # its own settings: not ours
+    assert inventory.served(["/v/bin/python", "-m", "insthub", "serve", "lab.toml"]) == "lab.toml"
+    assert inventory.served(["python3", "-X", "dev", "-W", "ignore", "-u", "srv.py"]) == "srv.py"
+    other = tmp_path / "devices.toml"
+    other.write_text('[devices]\nscope = "tcp://h:1"\n')
+    with pytest.raises(ValueError, match="not an insthub server"):
+        forms.ServerDialog(window, other)
+    empty = tmp_path / "empty.toml"
+    empty.write_text('[server]\nname = "x"\n')
+    dialog = forms.ServerDialog(window, empty)                                     # no devices: none made up
+    assert dialog.devices == [] and not dialog.device_editor.isEnabled()
+    dialog.name.setText("y")
+    assert 'name = "y"' in dialog.preview.toPlainText() and dialog.create.isEnabled()
+
+
+def test_editing_restarts_the_server_that_reads_the_config(window, tmp_path, monkeypatch):
+    path = tmp_path / "edited.toml"
+    path.write_text('[server]\nname = "edited"\n\n[devices.scope]\ndriver = "insthub.sim:SimScope"\n')
+    window.start_server([sys.executable, "-m", "insthub", "serve", str(path)], "edited", cwd=tmp_path)
+    try:
+        assert spin(15, lambda: word(window, "device", "local:edited", "scope") == "connected")
+        s = window.servers["local:edited"]
+        assert window.started_here(s.pid) and inventory.server_file(s) == path
+        opened = []
+        monkeypatch.setattr(forms.ServerDialog, "exec", lambda self: opened.append(self))
+        window.edit_config("local:edited", "scope")                         # what "Edit in its config..." does
+        dialog, = opened
+        assert dialog.then.currentData() == dialog.RESTART and dialog.create.text().startswith("Save")
+        dialog._arg_edits["points"].setText("64")
+        dialog._arg_edits["points"].textEdited.emit("64")
+        assert dialog.create.text() == "Save and restart"
+        first = s.pid
+        dialog.create.click()
+        assert spin(20, lambda: "local:edited" in window.servers and window.servers["local:edited"].pid
+                    not in (None, first) and word(window, "device", "local:edited", "scope") == "connected")
+        assert "points = 64" in path.read_text()
+        assert insthub.device("scope").get_waveform().volts.shape == (64,)   # the new config is in effect
+    finally:
+        for proc in window._spawned:
+            proc.terminate()
+            proc.wait(10)
+
+
+def test_editing_a_service_config_starts_it(window, monkeypatch, tmp_path):
+    path = tmp_path / "rig.toml"
+    path.write_text('[devices.echo]\ndriver = "insthub.sim:Loopback"\n')
+    monkeypatch.setattr(service, "units", lambda: [{"name": "rig", "state": "inactive", "sub": "dead", "pid": None,
+                                                    "enabled": False, "unit": "u",
+                                                    "command": f'"python" "-m" "insthub" "serve" "{path}"'}])
+    started = []
+    monkeypatch.setattr(service, "start", lambda name: started.append(name))
+    assert spin(5, lambda: "service:rig" in window.servers)
+    dialog = forms.ServerDialog(window, path, server=window.servers["service:rig"])
+    assert dialog.then.currentData() == dialog.RESTART and "Start the service" in dialog.then.currentText()
+    dialog.open_now.click()
+    assert dialog.create.text() == "Save and start"
+    dialog.create.click()
+    assert spin(3, lambda: started == ["rig"]) and "lazy = true" in path.read_text()
 
 
 def test_drivers_are_read_without_running_them(tmp_path):
@@ -570,6 +1228,10 @@ def test_devices_on_another_computer_are_added_to_devices_toml(window):
         dialog.where.setText(address.removeprefix("tcp://"))
         dialog.ask()
         assert spin(5, lambda: dialog.list.count() == 1)
+        item = dialog.list.item(0)
+        if "runs here" in item.text():                                  # found here first: not ticked for you
+            assert item.checkState() == qt.QtCore.Qt.CheckState.Unchecked and not dialog.add.isEnabled()
+            item.setCheckState(qt.QtCore.Qt.CheckState.Checked)
         assert "“far”" in dialog.status.text() and dialog.add.text() == "Add 1 device"
         dialog.add.click()
         assert registry.static_devices() == {"echo": address}
@@ -684,3 +1346,12 @@ def test_launcher(tmp_path, monkeypatch, capsys):
         assert result.returncode == 0, result.stdout + result.stderr
     assert cli.main(["gui", "--uninstall"]) == 0
     assert not menu.exists() and not shortcut.exists() and not icon.exists() and not autostart.exists()
+
+
+def test_a_server_started_here_that_fails_says_why(window, monkeypatch):
+    said = []
+    monkeypatch.setattr(window, "say", lambda text, ms=5000: said.append(text))
+    code = "import sys; print('error: [devices.psu] needs a driver'); sys.exit(1)"
+    window.start_server([sys.executable, "-c", code], "broken")
+    assert spin(10, lambda: any("broken ended with an error: error: [devices.psu] needs a driver" in t
+                                for t in said)), said

@@ -6,7 +6,9 @@ devices; manager.py fills these widgets in.
     stylesheet(), palette() the Qt stylesheet and palette made from the current theme
     icon(), draw_icon()     line icons on a 16 x 16 grid, drawn (no icon theme needed)
     Pill                    a status: a coloured dot and a word, on a tint of the colour
+    Tag                     a word in a box beside a title, such as SIM
     Switch                  an on/off toggle
+    NumberBox               a spin box for a number with a unit and limits, shown as typed
     NavButton               an entry of the sidebar, with a count beside it
     GridFlow                a layout of equal columns, as many as fit the width
     Tile, TileView          a card painted from a description: icon, title, a preview
@@ -33,7 +35,8 @@ import numpy as np
 from .qt import QtCore, QtGui, QtWidgets, Signal
 
 Qt = QtCore.Qt
-STATUS = {"good": "#0ca30c", "busy": "#c98500", "bad": "#d03b3b", "idle": "#898781"}  #: in both themes alike
+STATUS = {"good": "#0ca30c", "busy": "#c98500", "bad": "#d03b3b", "idle": "#898781",  #: in both themes alike
+          "paused": "#7563e0"}  # held on purpose: neither fine nor broken
 
 
 @dataclasses.dataclass(frozen=True)
@@ -189,7 +192,7 @@ QPushButton:disabled {{ color: {t.muted}; background: {t.window}; border-color: 
 QPushButton[kind="primary"] {{ background: {t.accent}; border-color: {t.accent}; color: {t.on_accent};
                                font-weight: 600; }}
 QPushButton[kind="primary"]:hover {{ background: {t.accent_hover}; border-color: {t.accent_hover}; }}
-QPushButton[kind="primary"]:disabled {{ background: {t.border}; border-color: {t.border}; color: {t.muted}; }}
+QPushButton[kind="primary"]:disabled {{ background: {t.window}; border-color: {t.border}; color: {t.muted}; }}
 QPushButton[kind="ghost"] {{ background: transparent; border-color: transparent; }}
 QPushButton[kind="ghost"]:hover {{ background: {t.hover}; }}
 QPushButton[kind="ghost"]:disabled {{ background: transparent; border-color: transparent; }}
@@ -203,11 +206,22 @@ QPushButton::menu-indicator {{ image: none; width: 0px; }}
 QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
     background: {t.surface}; border: 1px solid {t.strong}; border-radius: 8px; padding: 5px 8px;
     selection-background-color: {t.accent}; selection-color: {t.on_accent}; }}
-QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus {{ border-color: {t.accent}; }}
+QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QAbstractSpinBox:focus {{ border-color: {t.accent}; }}
 QLineEdit:read-only {{ background: {t.inset}; }}
-QLineEdit:disabled, QComboBox:disabled {{ color: {t.muted}; background: {t.inset}; }}
+QLineEdit:disabled, QComboBox:disabled, QAbstractSpinBox:disabled {{ color: {t.muted}; background: {t.inset}; }}
 QPlainTextEdit[role="code"], QLineEdit[role="code"] {{ font-family: monospace; background: {t.inset}; }}
 QComboBox::drop-down {{ border: none; width: 26px; }}
+QAbstractSpinBox {{ padding-right: 24px; }}
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{ subcontrol-origin: border; width: 22px;
+    border: none; background: transparent; }}
+QAbstractSpinBox::up-button {{ subcontrol-position: top right; border-top-right-radius: 8px; }}
+QAbstractSpinBox::down-button {{ subcontrol-position: bottom right; border-bottom-right-radius: 8px; }}
+QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {{ background: {t.hover}; }}
+QAbstractSpinBox::up-arrow {{ image: url("{_asset("up", t.ink2)}"); width: 10px; height: 10px; }}
+QAbstractSpinBox::down-arrow {{ image: url("{_asset("down", t.ink2)}"); width: 10px; height: 10px; }}
+QAbstractSpinBox::up-arrow:disabled, QAbstractSpinBox::up-arrow:off {{ image: url("{_asset("up", t.muted)}"); }}
+QAbstractSpinBox::down-arrow:disabled, QAbstractSpinBox::down-arrow:off {{
+    image: url("{_asset("down", t.muted)}"); }}
 QComboBox::down-arrow {{ image: url("{_asset("down", t.ink2)}"); width: 12px; height: 12px; }}
 QComboBox::down-arrow:disabled {{ image: url("{_asset("down", t.muted)}"); }}
 QComboBox QAbstractItemView {{ background: {t.surface}; border: 1px solid {t.border}; padding: 4px;
@@ -356,6 +370,7 @@ _ICONS = {
     "back": lambda p: _line(p, 10, 3, 5, 8, 10, 13),
     "forward": lambda p: _line(p, 6, 3, 11, 8, 6, 13),
     "down": lambda p: _line(p, 4, 6, 8, 10, 12, 6),
+    "up": lambda p: _line(p, 4, 10, 8, 6, 12, 10),
     "live": lambda p: _line(p, 1.5, 8.5, 4.5, 8.5, 6.5, 3.5, 9.5, 12.5, 11.5, 8.5, 14.5, 8.5),
     "more": lambda p: [_spot(p, x, 8, 1.35) for x in (3.5, 8, 12.5)],
     "search": lambda p: (p.drawEllipse(_pt(7, 7), 4.5, 4.5), p.drawLine(_pt(10.4, 10.4), _pt(14, 14))),
@@ -366,6 +381,8 @@ _ICONS = {
     "logs": lambda p: (_rect(p, 1.75, 2.75, 12.5, 10.5, 2), _line(p, 4.5, 6, 6.5, 8, 4.5, 10),
                        p.drawLine(_pt(8, 10), _pt(11.5, 10))),
     "stop": lambda p: _rect(p, 3.5, 3.5, 9, 9, 1.5),
+    "pause": lambda p: (_rect(p, 4, 3, 2.8, 10, 1), _rect(p, 9.2, 3, 2.8, 10, 1)),
+    "edit": lambda p: (_line(p, 3, 13, 3.5, 10, 11, 2.5, 13.5, 5, 6, 12.5, 3, 13), p.drawLine(_pt(9.5, 4), _pt(12, 6.5))),
     "start": lambda p: p.drawPolygon(QtGui.QPolygonF([_pt(5, 3), _pt(13, 8), _pt(5, 13)])),
     "trash": lambda p: (p.drawLine(_pt(2.5, 4.5), _pt(13.5, 4.5)), _line(p, 6, 4.5, 6.5, 2.5, 9.5, 2.5, 10, 4.5),
                         _line(p, 4, 4.5, 4.8, 13.5, 11.2, 13.5, 12, 4.5)),
@@ -507,6 +524,10 @@ def paint_pill(p: QtGui.QPainter, x: float, y: float, status: str, text: str, fo
         p.setPen(QtGui.QPen(QtGui.QColor(t.muted), 1.4))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(centre, 3.2, 3.2)
+    elif status == "paused":  # two bars, like a pause button
+        p.setBrush(QtGui.QColor(STATUS[status]))
+        for dx in (-3.2, 1.0):
+            p.drawRoundedRect(QtCore.QRectF(centre.x() + dx, centre.y() - 4, 2.2, 8), 1, 1)
     else:
         p.setBrush(QtGui.QColor(STATUS[status]))
         p.drawEllipse(centre, 3.6, 3.6)
@@ -549,6 +570,51 @@ class Pill(QtWidgets.QWidget):
         p.end()
 
 
+def tag_width(font: QtGui.QFont, text: str) -> float:
+    return QtGui.QFontMetricsF(font).horizontalAdvance(text) + 12
+
+
+def paint_tag(p: QtGui.QPainter, x: float, y: float, text: str, font: QtGui.QFont, height: float = 18) -> float:
+    """A word in a box (SIM), in the accent colour, with its left edge at x; returns its width.  It
+    says what something is, not how it is, so it never takes a status colour."""
+    t = _current
+    width = tag_width(font, text)
+    rect = QtCore.QRectF(x, y, width, height)
+    p.save()
+    p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    p.setPen(QtGui.QPen(color(t.accent, 0.55), 1))
+    p.setBrush(QtGui.QColor(t.accent_soft))
+    p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 5, 5)
+    p.setPen(QtGui.QColor(t.accent))
+    p.setFont(font)
+    p.drawText(rect, _flags(Qt.AlignmentFlag.AlignCenter), text)
+    p.restore()
+    return width
+
+
+class Tag(QtWidgets.QWidget):
+    """A word in a box beside a title (see paint_tag)."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._text = text
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+
+    def text(self) -> str:
+        return self._text
+
+    def _font(self) -> QtGui.QFont:
+        return scaled(self.font(), 0.8, _SEMIBOLD)
+
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(math.ceil(tag_width(self._font(), self._text)) + 2, 22)
+
+    def paintEvent(self, event) -> None:
+        p = QtGui.QPainter(self)
+        paint_tag(p, 1, (self.height() - 18) / 2, self._text, self._font())
+        p.end()
+
+
 class Switch(_Ring, QtWidgets.QAbstractButton):
     """An on/off toggle (a checkable button)."""
 
@@ -587,6 +653,48 @@ class Switch(_Ring, QtWidgets.QAbstractButton):
         p.setBrush(color("#ffffff", alpha))
         p.drawEllipse(knob)
         p.end()
+
+
+class NumberBox(QtWidgets.QDoubleSpinBox):
+    """A spin box for a number with a unit and limits (set_meta), which shows it as it is typed
+    (2500, 0.001) rather than with a fixed count of decimals.  Enter emits `submitted`."""
+
+    submitted = Signal()
+    DECIMALS = 9
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setLocale(QtCore.QLocale.c())  # typed as on the command line: a point, never a comma
+        self.setDecimals(self.DECIMALS)
+        self.set_meta({})
+
+    def set_meta(self, meta: dict) -> None:
+        """Its limits, step and unit, from a value's metadata (see device.META_KEYS).  Without a
+        step, each click changes the digit before the last one shown."""
+        def number(key, default):
+            value = meta.get(key)
+            return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+
+        self.setRange(number("min", -1e12), number("max", 1e12))
+        step = number("step", None)
+        self.setSingleStep(step or 1.0)
+        self.setStepType(QtWidgets.QAbstractSpinBox.StepType.DefaultStepType if step else
+                         QtWidgets.QAbstractSpinBox.StepType.AdaptiveDecimalStepType)
+        self.setSuffix(f" {meta['unit']}" if meta.get("unit") else "")
+
+    def fits(self, value: float) -> bool:
+        """Whether it can show `value` as it is: within its limits, and not too small for its decimals."""
+        return self.minimum() <= value <= self.maximum() and math.isclose(round(value, self.DECIMALS), value,
+                                                                          rel_tol=1e-9)
+
+    def textFromValue(self, value: float) -> str:
+        text = f"{value:.{self.DECIMALS}f}".rstrip("0").rstrip(".")
+        return "0" if text == "-0" else text
+
+    def keyPressEvent(self, event) -> None:
+        super().keyPressEvent(event)
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.submitted.emit()
 
 
 class NavButton(_Ring, QtWidgets.QAbstractButton):
@@ -854,6 +962,7 @@ class TileView:
     figures: tuple = ()  #: ((label, value), ...): up to six
     caption: str = ""
     tip: str = ""
+    badge: str = ""  #: a word in a box beside the title, such as SIM
 
 
 class Tile(_Ring, QtWidgets.QWidget):
@@ -938,11 +1047,17 @@ class Tile(_Ring, QtWidgets.QWidget):
         title = scaled(self.font(), 1.08, _SEMIBOLD)
         small = scaled(self.font(), 0.92)
         fm, fs = QtGui.QFontMetricsF(title), QtGui.QFontMetricsF(small)
+        top = badge.center().y() - (fm.height() + fs.height()) / 2
+        room = right - left
+        if v.badge:  # right after the title, which gives up room for it if it must
+            tag_font = scaled(self.font(), 0.78, _SEMIBOLD)
+            room -= tag_width(tag_font, v.badge) + 8
+            shown = fm.elidedText(v.title, Qt.TextElideMode.ElideRight, room)
+            paint_tag(p, left + fm.horizontalAdvance(shown) + 8, top + (fm.height() - 18) / 2, v.badge, tag_font)
         p.setFont(title)
         p.setPen(QtGui.QColor(t.ink))
-        top = badge.center().y() - (fm.height() + fs.height()) / 2
-        p.drawText(QtCore.QRectF(left, top, right - left, fm.height()), _flags(*_LEFT),
-                   fm.elidedText(v.title, Qt.TextElideMode.ElideRight, right - left))
+        p.drawText(QtCore.QRectF(left, top, room, fm.height()), _flags(*_LEFT),
+                   fm.elidedText(v.title, Qt.TextElideMode.ElideRight, room))
         p.setFont(small)
         p.setPen(QtGui.QColor(t.muted))
         p.drawText(QtCore.QRectF(left, top + fm.height(), right - left, fs.height()), _flags(*_LEFT),

@@ -6,7 +6,7 @@ The agent starts this program and talks to it on stdin/stdout using the Model
 Context Protocol. It is an ordinary insthub client: it finds devices the way
 `insthub.device()` does, and the servers do not know it exists.
 
-Six generic tools cover every device, however many there are, because devices
+Seven generic tools cover every device, however many there are, because devices
 describe themselves:
 
     list_devices()                       every device on the bus, in brief
@@ -15,6 +15,11 @@ describe themselves:
     set(device, property, value)         write a property
     call(device, command, args, kwargs)  run a command
     snapshot(device, stream, fresh)      a frame of a stream, published after the call started
+    call_dangerous(device, command, ...) run a command marked dangerous, or write such a property
+
+`set` and `call` refuse what a device marks dangerous (see _danger).  Only
+`call_dangerous` runs it, so a user can let an agent use every other tool
+without being asked, and still be asked before anything dangerous.
 
 Results are JSON. Bulk data goes to files (see render.py). The protocol part is
 the stdio subset of MCP that tools need, written out here so that insthub needs
@@ -37,7 +42,7 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__, client, registry
-from .errors import RemoteError
+from .errors import DevicePaused, RemoteError
 from .render import Renderer
 
 _log = logging.getLogger("insthub.mcp")
@@ -48,9 +53,12 @@ PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 INSTRUCTIONS = """\
 insthub gives access to lab instruments. Each instrument is a device hosted by an insthub server on this \
 computer or the lab network. list_devices shows them all. describe(device) gives the signature and docstring \
-(units, ranges) of each command, plus its properties and streams. call, get and set act on the real instrument. \
-snapshot returns live data a device publishes; with fresh=1 (the default) it waits for a frame published after \
-the call started, so the frame reflects settings changed just before.
+(units, ranges) of each command, plus its properties and streams, with their units, limits and choices ("meta", \
+"params") where the device states them. call, get and set act on the real instrument. A command or property \
+marked "dangerous" can harm the instrument, the sample or a person: call and set refuse it; call_dangerous runs \
+it, so use it only when the user wants that. A device marked "simulated" talks to a simulator: its data is not \
+a measurement. snapshot returns live data a device publishes; with fresh=1 (the default) it waits for a frame \
+published after the call started, so the frame reflects settings changed just before.
 Results are JSON. Arrays longer than 64 elements, long text and bytes are saved to files and summarized as \
 {"array": "float32[1001]", "min": ..., "max": ..., "file": ...}; load them with numpy.load(file). plot=true \
 adds a PNG of the arrays. To pass saved data back to a device, use {"$file": path} as an argument value."""
@@ -60,13 +68,19 @@ _PLOT = {"type": "boolean", "default": False, "description": "Also return a PNG 
 _TIMEOUT = {"type": "number", "description": "Seconds to wait for the reply (default: the server's, 60 s)."}
 _BULK = (" Arrays longer than 64 elements, long text and bytes come back as a summary with a file path "
          "(load it with numpy.load).")
+_CALL = {"type": "object", "properties": {
+    "device": _DEVICE, "command": {"type": "string"},
+    "args": {"type": "array", "items": {}, "description": "Positional arguments."},
+    "kwargs": {"type": "object", "description": "Keyword arguments."},
+    "timeout": _TIMEOUT, "plot": _PLOT}, "required": ["device", "command"]}
 
 TOOLS = [
     {
         "name": "list_devices",
         "title": "List instruments",
-        "description": "Every device on the insthub bus: its server, type, whether its hardware is connected, "
-                       "and the names of its commands, properties and streams. Start here.",
+        "description": "Every device on the insthub bus: its server, type, whether its hardware is connected "
+                       "(\"simulated\": true means it is a simulator, not an instrument), its extension, and the "
+                       "names of its commands, properties and streams. Start here.",
         "inputSchema": {"type": "object", "properties": {}},
         "annotations": {"readOnlyHint": True},
     },
@@ -76,7 +90,9 @@ TOOLS = [
         "description": "One device in full: the signature and docstring of every command, its properties "
                        "(settable or read-only), its streams with their last frame, periodic tasks, status, "
                        "and its state dict (cached settings). The docstrings document the instrument: units, "
-                       "ranges, meaning.",
+                       "ranges, meaning. Where the device states them, \"meta\" (of a property) and \"params\" "
+                       "(of a command's parameters) give unit, min, max, step and choices; \"dangerous\": true "
+                       "marks what only call_dangerous runs.",
         "inputSchema": {"type": "object", "properties": {"device": _DEVICE}, "required": ["device"]},
         "annotations": {"readOnlyHint": True},
     },
@@ -93,7 +109,8 @@ TOOLS = [
         "name": "set",
         "title": "Write a property",
         "description": "Write a property of a device. The driver checks the value and raises an error if the "
-                       "instrument does not accept it. Returns ok.",
+                       "instrument does not accept it. Returns ok. A property marked dangerous is refused: "
+                       "see call_dangerous.",
         "inputSchema": {"type": "object", "properties": {
             "device": _DEVICE, "property": {"type": "string"},
             "value": {"description": "Any JSON value, or {\"$file\": path} for saved data."},
@@ -109,12 +126,11 @@ TOOLS = [
                        "and later calls to that device wait behind it. Every device also answers $release "
                        "(close the instrument session so other software can use it; the next call reopens it), "
                        "$open (reopen now) and $task (args: [task_name, enabled true/false/null, interval in "
-                       "s or null])." + _BULK,
-        "inputSchema": {"type": "object", "properties": {
-            "device": _DEVICE, "command": {"type": "string"},
-            "args": {"type": "array", "items": {}, "description": "Positional arguments."},
-            "kwargs": {"type": "object", "description": "Keyword arguments."},
-            "timeout": _TIMEOUT, "plot": _PLOT}, "required": ["device", "command"]},
+                       "s or null]). A paused device (\"paused\" in list_devices) refuses every call: a person "
+                       "paused it, usually to use the instrument by hand, so tell the user instead of calling "
+                       "$resume, unless they ask you to. A command marked dangerous is refused (and so is $set "
+                       "of a property marked dangerous): see call_dangerous." + _BULK,
+        "inputSchema": _CALL,
         "annotations": {"readOnlyHint": False},
     },
     {
@@ -125,13 +141,23 @@ TOOLS = [
                        "fresh=N it returns the N-th frame published after the call starts, so the frame "
                        "reflects settings changed before the call (use 2 if a frame could have been mid-"
                        "acquisition at that moment). fresh=0 returns the last frame already published, "
-                       "however old." + _BULK,
+                       "however old (from a paused device, marked \"paused\": true)." + _BULK,
         "inputSchema": {"type": "object", "properties": {
             "device": _DEVICE, "stream": {"type": "string"},
             "fresh": {"type": "integer", "minimum": 0, "default": 1},
             "timeout": {"type": "number", "default": 10, "description": "Seconds to wait for the frame."},
             "plot": _PLOT}, "required": ["device", "stream"]},
         "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "call_dangerous",
+        "title": "Run a dangerous command",
+        "description": "Run a command that the device marks dangerous (it can harm the instrument, the sample "
+                       "or a person: firing a laser, switching on a high voltage), or write a property marked "
+                       "dangerous with command \"$set\" and args [property, value]. Use it only when the user "
+                       "asked for exactly this. Otherwise it works like call." + _BULK,
+        "inputSchema": _CALL,
+        "annotations": {"readOnlyHint": False, "destructiveHint": True},
     },
 ]
 
@@ -153,7 +179,7 @@ class Reply:
 
 # ---------------------------------------------------------------- the tools
 class Tools:
-    """The six tools as plain methods (testable without any MCP machinery).
+    """The seven tools as plain methods (testable without any MCP machinery).
     Each returns a `Reply`; errors become a Reply with error=True."""
 
     def __init__(self, renderer: Renderer | None = None, timeout: float = 60.0):
@@ -188,6 +214,18 @@ class Tools:
     def _bus(self, device: str, timeout: float | None = None) -> client.Bus:
         bus = self._client(client.locate(device)).device(device).bus
         return bus.with_timeout(self.timeout if timeout is None else float(timeout)).bus
+
+    def _safe_bus(self, device: str, command: str, args: list, timeout: float | None) -> client.Bus:
+        """The device's bus, if running `command` with `args` on it is not dangerous; else
+        PermissionError, which says to use call_dangerous.  The device is asked each time, so
+        that a server restarted with new marks is never trusted from memory."""
+        bus = self._bus(device, timeout)
+        what = _danger(bus.describe(), command, args)
+        if what:
+            how = f'"$set", [{args[0]!r}, value]' if command == "$set" else f"{command!r}, ..."
+            raise PermissionError(f"{device}: {what} is marked dangerous, so this tool refuses it. If the user wants "
+                                  f"exactly this, use call_dangerous({device!r}, {how}); they may be asked first.")
+        return bus
 
     def _reply(self, value, name: str, plot: bool, axis: dict | None = None, wrap=None) -> Reply:
         r = self.renderer.render(value, name, axis=axis, plot=plot)
@@ -245,13 +283,15 @@ class Tools:
         bus = self._bus(device)
         d = bus.describe()
         now = time.time()
-        out = {"name": d["name"], "type": d["type"]}
+        out = {"name": d["name"], "type": d["type"], **_about(d)}
         if d.get("doc"):
             out["doc"] = d["doc"]
         out["status"] = {k: v for k, v in d["status"].items() if v is not None}
-        out["commands"] = {n: _drop_empty({"signature": c["signature"], "doc": c["doc"]})
+        out["commands"] = {n: _drop_empty({"signature": c["signature"], "doc": c["doc"], "params": c.get("params"),
+                                           "dangerous": c.get("dangerous")})
                            for n, c in sorted(d["commands"].items())}
-        out["properties"] = {n: _drop_empty({"doc": p["doc"], "readonly": not p["settable"] or None})
+        out["properties"] = {n: _drop_empty({"doc": p["doc"], "readonly": not p["settable"] or None,
+                                             "meta": p.get("meta"), "dangerous": p.get("dangerous")})
                              for n, p in sorted(d["properties"].items())}
         out["streams"] = {n: _drop_empty({"doc": s["doc"], "kind": s["kind"], "frames": s["seq"] or None,
                                           "age_s": round(now - s["time"], 3) if s["time"] else None})
@@ -267,22 +307,43 @@ class Tools:
         return self._reply(self._bus(device, timeout).get(property), f"{device}-{property}", plot)
 
     def set(self, device: str, property: str, value, timeout: float | None = None) -> Reply:
-        self._bus(device, timeout).set(property, _resolve(value))
+        self._safe_bus(device, "$set", [property], timeout).set(property, _resolve(value))
         return Reply("ok")
 
     def call(self, device: str, command: str, args=None, kwargs=None, timeout: float | None = None,
              plot: bool = False) -> Reply:
-        args, kwargs = _as_list(args), _as_dict(kwargs)
-        result = self._bus(device, timeout).call(command, *_resolve(args), **_resolve(kwargs))
-        return self._reply(result, f"{device}-{command}", plot)
+        args = _as_list(args)
+        return self._run(self._safe_bus(device, command, args, timeout), command, args, kwargs, plot)
+
+    def call_dangerous(self, device: str, command: str, args=None, kwargs=None, timeout: float | None = None,
+                       plot: bool = False) -> Reply:
+        return self._run(self._bus(device, timeout), command, _as_list(args), kwargs, plot)
+
+    def _run(self, bus: client.Bus, command: str, args: list, kwargs, plot: bool) -> Reply:
+        if command == "$pause" and not args:  # say who paused it: the refusals then do not blame a person
+            args = [_AGENT, client.PROCESS_TOKEN]
+        try:
+            result = bus.call(command, *_resolve(args), **_resolve(_as_dict(kwargs)))
+        except TimeoutError:
+            if command != "$pause":
+                raise
+            # its reply waits for what runs now, but the pause is in effect already: say so, not "no reply"
+            st = bus.status()
+            result = {**st, "note": "pausing: it refuses every call already; its session is closed once "
+                                    f"{st.get('busy') or 'what it is doing'} finishes (list_devices shows it paused)"}
+        return self._reply(result, f"{bus.name}-{command}", plot)
 
     def snapshot(self, device: str, stream: str, fresh: int = 1, timeout: float = 10.0, plot: bool = False) -> Reply:
         bus = self._bus(device)
-        streams = bus.describe()["streams"]
+        described = bus.describe()
+        streams = described["streams"]
         if stream not in streams:  # subscribing would create it on the server; say what there is instead
             raise LookupError(f"{device} has no stream {stream!r} (it has: {', '.join(sorted(streams)) or 'none'}; "
                               "a stream that is not declared appears after its first frame)")
         fresh = max(0, int(fresh))
+        paused = described["status"].get("paused")
+        if paused and (fresh or not streams[stream]["seq"]):  # it publishes nothing: do not wait for a frame
+            raise _paused_refusal(device, paused)
         end = time.monotonic() + float(timeout)
         try:
             with bus.subscribe(stream, retained=fresh == 0) as sub:
@@ -290,7 +351,10 @@ class Tools:
                 for _ in range(fresh - 1):
                     frame = sub.get(max(0.0, end - time.monotonic()))
         except TimeoutError:
-            last = bus.describe()["streams"].get(stream) or {}
+            now = bus.describe()
+            if now["status"].get("paused"):  # paused while waiting
+                raise _paused_refusal(device, now["status"]["paused"]) from None
+            last = now["streams"].get(stream) or {}
             if not last.get("seq"):
                 why = "nothing has been published on it yet"
             else:
@@ -298,16 +362,45 @@ class Tools:
             raise TimeoutError(f"no new frame on {device}.{stream} within {timeout:g} s ({why})") from None
         meta = self.renderer.render(frame.meta, f"{device}-{stream}-meta").value
         head = {"stream": stream, "seq": frame.seq, "age_s": round(frame.age, 3), "meta": meta}
+        if paused:  # fresh=0: the last frame from before the pause
+            head["paused"] = True
         return self._reply(frame.data, f"{device}-{stream}", plot, axis=frame.meta,
                            wrap=lambda data: {**head, "data": data})
 
 
+def _paused_refusal(device: str, paused: dict) -> DevicePaused:
+    """What a snapshot of a paused device says, worded like the device's own refusal of a call."""
+    by = f" by {paused['by']}" if paused.get("by") else ""
+    since = time.strftime("%H:%M:%S", time.localtime(paused["since"]))
+    return DevicePaused(f"{device} is paused (since {since}{by}): it publishes nothing until it is resumed "
+                        f"(insthub resume {device})")
+
+
+def _danger(described: dict, command: str, args: list) -> str | None:
+    """What is dangerous about running `command` with `args`, as the device's describe() marks
+    it ("its command 'fire'", "writing its property 'voltage'"), or None.  `$set` counts as the
+    property it writes.  The other `$` commands manage the session ($open, $release, $task,
+    $pause, $resume), not the instrument's settings."""
+    if command == "$set":
+        prop = described["properties"].get(args[0]) if args and isinstance(args[0], str) else None
+        return f"writing its property {args[0]!r}" if prop and prop.get("dangerous") else None
+    found = described["commands"].get(command)
+    return f"its command {command!r}" if found and found.get("dangerous") else None
+
+
+def _about(d: dict) -> dict:
+    """What a device says it is, for agents: its extension, and whether it is a simulator."""
+    return {k: d[k] for k in ("extension", "extension_version", "simulated") if d.get(k)}
+
+
 def _brief(server: str, d: dict) -> dict:
     st = d["status"]
-    out = {"server": server, "type": d["type"]}
+    out = {"server": server, "type": d["type"], **_about(d)}
     if d.get("doc"):
         out["doc"] = d["doc"]
     out["connected"] = st["connected"]
+    if st.get("paused"):
+        out["paused"] = True
     if st.get("error"):
         out["error"] = st["error"]
     if st.get("busy"):
@@ -326,7 +419,19 @@ def _json(value) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+_PAUSED = ("A person paused it, usually to use the instrument by hand: tell the user, and do not resume it "
+           "unless they ask you to.")
+
+
+_AGENT = "an AI agent (insthub mcp)"  #: how a pause made through `call(device, "$pause")` is labelled
+_PAUSED_BY_AGENT = ("An AI agent paused it, perhaps you at the user's request: resume it ($resume) only if this "
+                    "conversation paused it and is done with what the pause was for; else tell the user.")
+
+
 def _error_text(e: BaseException) -> str:
+    if isinstance(e, DevicePaused):  # not the hint for people ("insthub resume ..."): what an agent should do
+        text = str(e).rpartition(" (insthub resume")[0] or str(e)
+        return f"DevicePaused: {text}. {_PAUSED_BY_AGENT if f' by {_AGENT}' in text else _PAUSED}"
     if isinstance(e, RemoteError):
         text = f"{e.remote_type}: {e}"
         tb = e.remote_traceback.strip().splitlines()
