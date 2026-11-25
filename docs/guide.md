@@ -307,6 +307,48 @@ without being copied. See `examples/04_server_with_gui.py`.
 panel per stream (traces, images, strip charts for numbers) and a table of the
 device's state.
 
+### The manager window
+
+`insthub gui` opens a window that shows every server on this computer, the
+installed services that are not running, and the servers of other computers
+listed in `devices.toml`. Under each server are its devices, each with a
+status dot: connected, busy, released, or not connected and why.
+
+Select a device to see whether its instrument is connected and since when,
+what it is doing, its streams and how fast they arrive, its periodic tasks
+(with a switch each), its state, its commands, and which programs are watching
+it. Its buttons open the instrument session now (**Connect now**), close it for
+other software (**Release**), or open its live plots (**Live view**).
+
+Select a server to see its process, its addresses, its service and the
+programs connected to it. A service can be started, stopped, restarted and
+removed there, and its log read. A server started by hand can be stopped.
+**Add service...** keeps a new server running in the background.
+
+The window is an ordinary client: it needs only Qt, never waits for a server,
+and can be closed and reopened at any time without affecting anything.
+
+Closing the window does not stop it: it goes on watching from an icon in the
+tray (the top bar), which gets a red dot while something is broken. Its menu
+lists the servers, and its **Quit** closes the window for good. Your servers
+are separate programs and keep running either way. When a device loses its
+instrument, a server stops answering or a service fails, a notification says
+so; click it to see what broke. The tray menu can turn notifications off, and
+**Start at login** starts the window in the tray each time you log in
+(`insthub gui --tray`). Starting `insthub gui` while it already runs brings up
+the window that is there. Desktops without a tray (GNOME without its
+AppIndicator extension) close the window as usual.
+
+To start it from an icon instead of a terminal, run once:
+
+```bash
+insthub gui --install          # applications menu and desktop; --no-desktop for the menu only
+```
+
+The launcher runs the window with the Python that installed it. On GNOME,
+right-click its icon in the dock and pin it to keep it there.
+`insthub gui --uninstall` removes it again.
+
 ## Command line
 
 ```
@@ -319,8 +361,10 @@ insthub watch DEVICE [STREAM]                  print frames as they arrive
 insthub release DEVICE                         close the instrument session, e.g. for the vendor's software
 insthub reopen DEVICE                          open it again now (any command does so too)
 insthub view DEVICE                            live plots
+insthub gui [--tray | --install]               the manager window (stays in the tray); --install adds an icon
 insthub serve CONFIG.toml                      host the devices of a config file
-insthub service install | list | remove | logs keep servers running in the background
+insthub service install | list | start | stop | restart | remove | logs
+                                               keep servers running in the background
 insthub sim [--gui]                            simulated instruments to try things on
 insthub bench                                  speed on this computer
 ```

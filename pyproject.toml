@@ -25,6 +25,9 @@ insthub = "insthub.cli:main"
 [tool.setuptools.packages.find]
 include = ["insthub*"]
 
+[tool.setuptools.package-data]
+insthub = ["insthub.svg"]   # the icon of `insthub gui`
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

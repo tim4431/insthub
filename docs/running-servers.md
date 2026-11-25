@@ -50,9 +50,13 @@ This writes a small *systemd user service*, starts it, and from then on:
 | `insthub service install TARGET [--name NAME]` | register and start; run it again to replace the definition |
 | `insthub service list` | what is installed and whether it is running |
 | `insthub service logs NAME [-f]` | its output; `-f` follows it live |
+| `insthub service restart NAME` | restart, after changing code or config |
+| `insthub service stop NAME` | stop until the next login or `start` |
+| `insthub service start NAME` | start it again |
 | `insthub service remove NAME` | stop it and remove it |
-| `systemctl --user restart insthub-NAME` | restart, after changing code or config |
-| `systemctl --user stop insthub-NAME` | stop until the next login or `start` |
+
+The same controls, and the log, are in the manager window (`insthub gui`): select
+the server, or the service if it is not running.
 
 Nothing here needs administrator rights. Two details:
 
@@ -121,7 +125,7 @@ owner, and keeping them apart is what lets insthub stay general.
 | Hold the session, order the requests, reconnect | one thread per device, waiting line, link errors | **insthub** (`Device`, `wrap`) |
 | Move commands and data between programs | calls, futures, streams | **insthub** |
 | Keep servers running in the background | start at login, restart on crash, logs | **insthub** (`insthub service`) |
-| A desktop icon for an application with a window | a `.desktop` launcher | **that application** |
+| A desktop icon for an application with a window | a `.desktop` launcher | **that application** (insthub's own window: `insthub gui --install`) |
 | Decide what the experiment does | sequences, scans, analysis | **your scripts** |
 
 The reasoning behind the first and the fifth row, which are the two that put
@@ -208,6 +212,7 @@ the instruments, so open a TCP port only on a network you trust.
 | Sockets and announcements of running servers | `$XDG_RUNTIME_DIR/insthub/` (for example `/run/user/1000/insthub/`); override with `INSTHUB_DIR` |
 | Addresses of devices on other computers | `~/.config/insthub/devices.toml`; override with `INSTHUB_DEVICES` |
 | Service definitions | `~/.config/systemd/user/insthub-NAME.service` |
+| The launcher of `insthub gui` | `~/.local/share/applications/insthub.desktop`, its icon under `~/.local/share/icons/`, and a copy on the desktop |
 
 A server and its clients must use the same first folder to find each other by
 name. They do when both run under your account in a normal login session or as

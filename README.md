@@ -32,6 +32,10 @@ What you get:
   with one line of Python or four lines of config.
 - **Nothing else to run.** There is no central service. Each server stands
   alone, and insthub knows nothing about any particular instrument.
+- **A window to keep an eye on it all.** `insthub gui` shows every server and
+  device, whether each instrument is connected and which programs are using
+  it, with buttons to reconnect, release, restart and read logs. Closed, it
+  keeps watching from the tray and tells you when something breaks.
 
 It needs Python 3.11 or later, `numpy` and `msgpack`. Live plotting also needs
 `pyqtgraph` and a Qt binding.
@@ -54,6 +58,7 @@ insthub call scope measure VPP
 insthub set synth frequency 2500
 insthub watch scope ch1              # the live trace, as text
 insthub view scope                   # the live trace, as a plot
+insthub gui                          # every server and device, and how each is connected
 python examples/03_experiment.py    # a script that uses all three at once
 ```
 
@@ -103,8 +108,8 @@ for frame in thermo.subscribe("temperature"):
 
 ## Status
 
-- 175 tests cover calls, streams, device lifecycle, finding servers,
-  reconnecting, the command line, services and the GUI. Run them with
+- 189 tests cover calls, streams, device lifecycle, finding servers,
+  reconnecting, the command line, services and the GUIs. Run them with
   `python -m pytest tests` (about 12 s).
 - Developed and tested on Linux with Python 3.11, 3.12 and 3.14. Written to
   run on Windows, but never run there.
@@ -129,6 +134,7 @@ insthub/
   config.py     servers from a TOML file
   service.py    insthub service: background services
   qt.py         helpers for Qt GUIs             viewer.py   the generic live viewer
+  manager.py    insthub gui: the manager window launcher.py the launcher icon of insthub gui
   sim.py        simulated instruments           bench.py    insthub bench
   cli.py        the insthub command
 docs/           the three pages above

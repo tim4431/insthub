@@ -20,6 +20,7 @@ import logging
 import os
 import signal
 import socket
+import struct
 import threading
 import time
 import weakref
@@ -221,13 +222,33 @@ def _discard(ok, value) -> None:
 
 
 # ---------------------------------------------------------------- connection
+def _peer_pid(sock: socket.socket) -> int | None:
+    """Process id of the program at the other end of a Unix socket (Linux only)."""
+    if not hasattr(socket, "SO_PEERCRED") or sock.family != getattr(socket, "AF_UNIX", None):
+        return None
+    try:
+        pid, _uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                              struct.calcsize("3i")))
+    except OSError:
+        return None
+    return pid or None
+
+
 class _Conn:
     def __init__(self, server: Server, sock: socket.socket, peer):
         self.server, self.sock, self.peer = server, sock, peer
+        self.pid = _peer_pid(sock)
+        self.since = time.time()
         self.sender = _Sender(sock, self._abort)
         self.subs: dict[int, tuple] = {}  # subscription id -> (runtime, stream name, sink)
         self.closed = False
         self._lock = threading.Lock()
+
+    def summary(self) -> dict:
+        """Who is connected and what it watches (for `info`)."""
+        peer = f"{self.peer[0]}:{self.peer[1]}" if isinstance(self.peer, tuple) and len(self.peer) >= 2 else None
+        return {"pid": self.pid, "peer": peer, "since": self.since,
+                "subscriptions": sorted({f"{rt.dev.name}/{stream}" for rt, stream, _ in list(self.subs.values())})}
 
     def run(self) -> None:
         server, sock = self.server, self.sock
@@ -548,8 +569,8 @@ class Server:
                 old[0].remove_sink(old[1], old[2])
                 conn.sender.discard(old[2].slot)
             return None
-        if method == "info":
-            return self._hello()
+        if method == "info":  # what the registry file says, plus the programs connected right now
+            return {**self._hello(), "clients": [c.summary() for c in list(self._conns)]}
         if method == "devices":
             return {name: dev._rt.describe() for name, dev in list(self._devices.items())}
         raise UnknownCommand(f"unknown server command {method!r}")

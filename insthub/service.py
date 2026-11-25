@@ -103,28 +103,71 @@ def install(target: str | Path, name: str | None = None, start: bool = True, pyt
     return path
 
 
-def remove(name: str) -> None:
-    """Stop the service and delete its unit."""
+def _unit(name: str) -> str:
     path = unit_dir() / f"{PREFIX}{name}.service"
     if not path.exists():
         raise BusError(f"no service {PREFIX}{name} (see `insthub service list`)")
+    return path.name
+
+
+def remove(name: str) -> None:
+    """Stop the service and delete its unit."""
+    path = unit_dir() / _unit(name)
     _systemctl("disable", "--now", path.name, check=False)
     path.unlink()
     _systemctl("daemon-reload")
     _systemctl("reset-failed", path.name, check=False)
 
 
+def start(name: str) -> None:
+    _systemctl("start", _unit(name))
+
+
+def stop(name: str) -> None:
+    """Stop until the next login or `start` (it stays installed)."""
+    _systemctl("stop", _unit(name))
+
+
+def restart(name: str) -> None:
+    """Restart, e.g. after changing the server's code or config."""
+    _systemctl("restart", _unit(name))
+
+
 def units() -> list[dict]:
-    """The installed services: name, state ("active", "failed", "inactive", ...), enabled, command."""
+    """The installed services: name, state ("active", "failed", "inactive", "activating", ...), sub
+    (systemd's detail, e.g. "auto-restart" while it waits to restart a crashed server), enabled,
+    pid (of the running server, else None) and command."""
+    paths = sorted(unit_dir().glob(f"{PREFIX}*.service"))
+    if not paths:
+        return []
+    out = _systemctl("show", "--property=Id,ActiveState,SubState,UnitFileState,MainPID",
+                     *(path.name for path in paths), check=False).stdout
+    shown = {}
+    for block in out.split("\n\n"):
+        props = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
+        if "Id" in props:
+            shown[props["Id"]] = props
     found = []
-    for path in sorted(unit_dir().glob(f"{PREFIX}*.service")):
+    for path in paths:
         command = next((line.split("=", 1)[1] for line in path.read_text().splitlines()
                         if line.startswith("ExecStart=")), "")
-        state = _systemctl("is-active", path.name, check=False).stdout.strip() or "unknown"
-        enabled = _systemctl("is-enabled", path.name, check=False).stdout.strip() == "enabled"
-        found.append({"name": path.stem[len(PREFIX):], "state": state, "enabled": enabled,
-                      "command": command, "unit": str(path)})
+        props = shown.get(path.name, {})
+        pid = int(props.get("MainPID") or 0)
+        found.append({"name": path.stem[len(PREFIX):], "state": props.get("ActiveState") or "unknown",
+                      "sub": props.get("SubState", ""), "enabled": props.get("UnitFileState") == "enabled",
+                      "pid": pid or None, "command": command, "unit": str(path)})
     return found
+
+
+def journal(name: str, lines: int = 200) -> str:
+    """The service's recent output, as text."""
+    command = ["journalctl", "--user", "-u", f"{PREFIX}{name}.service", "-n", str(lines), "--no-pager",
+               "-o", "short-iso"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise BusError(f"cannot read the log of {PREFIX}{name}: {e}") from None
+    return result.stdout or result.stderr
 
 
 def logs(name: str, follow: bool = False, lines: int = 50) -> int:
