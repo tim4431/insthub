@@ -50,12 +50,26 @@ claude mcp add --scope user insthub -- /path/to/venv/bin/insthub mcp
 Other MCP clients (Claude Desktop, other agents) take the same command and
 arguments in their own configuration.
 
+The manager window does the same with a click: in `insthub gui`, **AI
+agents...** shows the command and the JSON for this installation, with the full
+path filled in, and sets it up for Claude Code (or removes it again).
+
 Options of `insthub mcp`:
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--data DIR` | `$INSTHUB_DATA`, else `.insthub/` in the folder the agent was started in | where results too large to return inline are saved |
 | `--timeout S` | 60 | how long a call may take before the agent is told it is still running; the agent can ask for longer per call |
+
+## Seeing what an agent does
+
+An agent's `insthub mcp` is an ordinary client, so `insthub gui` shows it like
+any other program, named after the agent that started it: "AI agent (Claude
+Code)" among the programs connected to a server, and among the watchers of the
+streams it takes snapshots of. The toolbar counts the agents connected, the
+tray menu lists them, and the tray announces each new one ("An AI agent is
+using the instruments"). This is how to notice that an agent is acting on
+real hardware while you are doing something else.
 
 ## How the agent finds the instruments
 

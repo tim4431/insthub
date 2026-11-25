@@ -324,16 +324,21 @@ Select a server to see its process, its addresses, its service and the
 programs connected to it. A service can be started, stopped, restarted and
 removed there, and its log read. A server started by hand can be stopped.
 **Add service...** keeps a new server running in the background.
+**AI agents...** lets an AI agent such as Claude Code use the instruments (see
+[agents](agents.md)); a connected agent is listed as "AI agent (Claude Code)"
+and counted in the toolbar.
 
 The window is an ordinary client: it needs only Qt, never waits for a server,
 and can be closed and reopened at any time without affecting anything.
 
 Closing the window does not stop it: it goes on watching from an icon in the
-tray (the top bar), which gets a red dot while something is broken. Its menu
+tray (the top bar). Its lower-right node is a status light: green while all is
+well, red while something is broken. Its menu
 lists the servers, and its **Quit** closes the window for good. Your servers
 are separate programs and keep running either way. When a device loses its
 instrument, a server stops answering or a service fails, a notification says
-so; click it to see what broke. The tray menu can turn notifications off, and
+so; click it to see what broke. A notification also says when an AI agent
+starts using the instruments. The tray menu can turn notifications off, and
 **Start at login** starts the window in the tray each time you log in
 (`insthub gui --tray`). Starting `insthub gui` while it already runs brings up
 the window that is there. Desktops without a tray (GNOME without its

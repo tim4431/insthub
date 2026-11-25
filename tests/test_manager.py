@@ -1,4 +1,5 @@
 """The manager window (`insthub gui`) and its launcher, run without a display."""
+import json
 import os
 import shutil
 import subprocess
@@ -223,6 +224,116 @@ def test_tray_keeps_watching_and_tells_when_something_breaks(settings, monkeypat
         finally:
             window._shutdown()
             spin(0.1)
+
+
+def test_tray_icon_is_a_status_light():
+    qt.application()
+
+    def pixel(status, x, y):
+        return qt.QtGui.QColor(manager._tray_icon(status).pixmap(32, 32).toImage().pixel(x, y))
+
+    assert pixel(None, 16, 16).lightness() > 200                         # the hub: white, like the top bar's icons
+    assert pixel("good", 25, 25).name() == "#33d17a" and pixel("bad", 25, 25).name() == "#ed333b"
+    assert pixel(None, 25, 25).lightness() > 200                         # no light: an ordinary node
+
+
+class Agent:
+    """`insthub mcp` started the way an agent starts it, asked to list the devices."""
+
+    def __init__(self):
+        self.proc = subprocess.Popen([sys.executable, "-m", "insthub", "mcp"], env=os.environ.copy(), text=True,
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def ask(self, mid, method, params=None):
+        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": mid, "method": method, "params": params or {}})
+                              + "\n")
+        self.proc.stdin.flush()
+        return json.loads(self.proc.stdout.readline())
+
+    def list_devices(self):
+        self.ask(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                   "clientInfo": {"name": "test", "version": "0"}})
+        return self.ask(2, "tools/call", {"name": "list_devices", "arguments": {}})
+
+    def stop(self):
+        self.proc.stdin.close()
+        self.proc.wait(10)
+        self.proc.stdout.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="programs are named from /proc")
+def test_ai_agents_are_shown_and_announced(settings, monkeypatch):
+    assert manager.agent_name(["/home/u/.local/bin/claude", "--output-format", "stream-json"]) == "Claude Code"
+    assert manager.agent_name(["/usr/bin/python3", "my_agent.py"]) == "my_agent.py"
+    assert manager.agent_name([]) == "unknown"
+    qt.application()
+    with insthub.Server("t", [sim.Loopback()]):
+        window = manager.Manager(refresh_ms=150, tray=True)
+        told = []
+        monkeypatch.setattr(window.tray, "showMessage", lambda title, text, *a: told.append((title, text)))
+        agent = Agent()
+        try:
+            assert spin(5, lambda: word(window, "device", "local:t", "loopback") == "connected")
+            assert not window.agents()
+            assert "loopback" in agent.list_devices()["result"]["content"][0]["text"]
+            assert spin(5, lambda: window.agents())
+            (pid, (name, servers)), = window.agents().items()
+            assert pid == agent.proc.pid and name.startswith("AI agent (pytest") and servers == ["t"]
+            assert manager.program_name(agent.proc.pid) == name
+            assert "1 AI agent connected" in window.summary.text()
+            assert spin(3, lambda: told)
+            assert told == [("An AI agent is using the instruments", f"{name} connected to t.")]
+            assert f"{name} on t" in window.tray.toolTip()
+            assert f"{name} on t" in [a.text() for a in window.tray.menu.actions()]
+            select(window, "server", "local:t")
+            assert spin(3, lambda: window.server_page.clients.rowCount() == 1)
+            assert window.server_page.clients.item(0, 0).text() == name
+            agent.stop()
+            assert spin(5, lambda: not window.agents())                  # gone when it leaves
+        finally:
+            if agent.proc.poll() is None:
+                agent.stop()
+            window._shutdown()
+            spin(0.1)
+
+
+def test_agents_dialog_sets_up_claude_code(window, monkeypatch):
+    real_which = shutil.which
+    installed = {"yes": True}
+    monkeypatch.setattr(manager.shutil, "which",
+                        lambda name: ("/usr/bin/claude" if installed["yes"] else None) if name == "claude"
+                        else real_which(name))
+    registered, calls = set(), []
+
+    def claude(*args):
+        calls.append(args)
+        if args[:2] == ("mcp", "get"):
+            code = 0 if args[2] in registered else 1
+        elif args[:2] == ("mcp", "add"):
+            registered.add(args[4])
+            code = 0
+        else:
+            registered.discard(args[4])
+            code = 0
+        return subprocess.CompletedProcess(("claude", *args), code, "", "")
+
+    monkeypatch.setattr(manager, "_claude", claude)
+    window.agents_dialog()
+    dialog = window._agents_dialog
+    assert spin(3, lambda: dialog.status.text() == "not set up yet")
+    assert not dialog.setup.isHidden() and dialog.remove.isHidden()
+    dialog.setup.click()
+    assert spin(3, lambda: "set up, for all your projects" in dialog.status.text())
+    add = next(c for c in calls if c[:2] == ("mcp", "add"))
+    assert add[:6] == ("mcp", "add", "--scope", "user", "insthub", "--") and add[-1] == "mcp"
+    assert add[6:] == tuple(manager.mcp_command())
+    dialog.remove.click()
+    assert spin(3, lambda: dialog.status.text() == "not set up yet")
+    assert "none right now" in dialog.connected.text()
+    installed["yes"] = False
+    dialog.check()
+    assert "not installed here" in dialog.status.text() and dialog.setup.isHidden()
+    dialog.hide()
 
 
 def test_one_window_at_a_time():

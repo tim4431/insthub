@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import json
 import os
+import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -112,7 +115,7 @@ class Backend:
             if c.get("pid") == os.getpid() or (own and c.get("peer") == own):
                 continue  # this window's own connection
             program = program_name(c["pid"]) if c.get("pid") else (c.get("peer") or "?")
-            clients.append({**c, "program": program})
+            clients.append({**c, "program": program, "agent": program.startswith(AGENT)})
         return {"info": info, "devices": devices, "states": states, "clients": clients, "latency": latency}
 
     def call(self, address: str, device: str, method: str, *args, timeout: float = ACTION_TIMEOUT):
@@ -129,13 +132,48 @@ class Backend:
             self.forget(address)
 
 
+AGENT = "AI agent"  #: how a program connected through `insthub mcp` is named
+
+
 def program_name(pid: int) -> str:
-    """A short name for a process on this computer (Linux), else 'pid N'."""
+    """A short name for a process on this computer (Linux), else 'pid N'.  An `insthub mcp`
+    is named after the agent that started it: 'AI agent (Claude Code)'."""
+    argv = _cmdline(pid)
+    if not argv:
+        return f"pid {pid}"
+    name = command_name(argv)
+    if name.split()[:2] == ["insthub", "mcp"]:
+        parent = _parent(pid)
+        return f"{AGENT} ({agent_name(_cmdline(parent) if parent else [])})"
+    return name
+
+
+def agent_name(argv: list[str]) -> str:
+    """What to call the program that started an `insthub mcp`, from its command line."""
+    if not argv:
+        return "unknown"
+    return {"claude": "Claude Code", "claude-desktop": "Claude Desktop"}.get(os.path.basename(argv[0]),
+                                                                            command_name(argv))
+
+
+def _cmdline(pid: int) -> list[str]:
     try:
-        argv = [a.decode(errors="replace") for a in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if a]
+        return [a.decode(errors="replace") for a in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if a]
     except OSError:
-        argv = []
-    return command_name(argv) if argv else f"pid {pid}"
+        return []
+
+
+def _parent(pid: int) -> int | None:
+    try:  # "pid (name) state ppid ...": the name may contain anything, so split after its last ")"
+        return int(Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[1]) or None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def mcp_command() -> list[str]:
+    """How an agent starts this installation's `insthub mcp`: by full path, as docs/agents.md advises."""
+    script = Path(sys.executable).with_name("insthub.exe" if os.name == "nt" else "insthub")
+    return [str(script), "mcp"] if script.is_file() else [sys.executable, "-m", "insthub", "mcp"]
 
 
 def command_name(argv: list[str]) -> str:
@@ -785,6 +823,116 @@ class _AddServiceDialog(QtWidgets.QDialog):
         return self.target.text().strip(), self.name.text().strip(), self.python.text().strip() or sys.executable
 
 
+def _claude(*args: str) -> subprocess.CompletedProcess:
+    """Run Claude Code's command line (`claude mcp ...`)."""
+    return subprocess.run(["claude", *args], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+
+
+class _AgentsDialog(QtWidgets.QDialog):
+    """AI agents on the bus: giving one access through `insthub mcp`, and which are connected now."""
+
+    def __init__(self, window: Manager):
+        super().__init__(window)
+        self.window = window
+        self._asking = False
+        self.setWindowTitle("AI agents")
+        command = mcp_command()
+        self.add = ["mcp", "add", "--scope", "user", "insthub", "--", *command]
+        intro = QtWidgets.QLabel(
+            "An AI agent such as Claude Code can use the instruments through <code>insthub mcp</code>: list them, "
+            "read their documentation, call commands, set properties and take live traces. While it does, it is "
+            "listed among the programs connected to a server, and the tray says when one starts. "
+            "docs/agents.md explains the rest.")
+        intro.setWordWrap(True)
+        self.status = QtWidgets.QLabel()
+        self.status.setWordWrap(True)
+        self.setup = QtWidgets.QPushButton("Set up")
+        self.setup.setToolTip("Runs: " + shlex.join(["claude", *self.add]))
+        self.setup.clicked.connect(lambda: self._run("Setting up insthub for Claude Code", self.add))
+        self.remove = QtWidgets.QPushButton("Remove")
+        self.remove.setToolTip("Runs: claude mcp remove --scope user insthub")
+        self.remove.clicked.connect(lambda: self._run("Removing insthub from Claude Code",
+                                                      ["mcp", "remove", "--scope", "user", "insthub"]))
+        claude = QtWidgets.QHBoxLayout()
+        claude.addWidget(self.status, 1)
+        claude.addWidget(self.setup)
+        claude.addWidget(self.remove)
+        self.connected = QtWidgets.QLabel()
+        self.connected.setWordWrap(True)
+        form = QtWidgets.QFormLayout()
+        form.addRow("Claude Code", claude)
+        form.addRow("Its command", self._copyable(shlex.join(["claude", *self.add])))
+        form.addRow("Other agents", self._copyable(json.dumps(
+            {"mcpServers": {"insthub": {"command": command[0], "args": command[1:]}}})))
+        form.addRow("Connected now", self.connected)
+        close = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.hide)
+        box = QtWidgets.QVBoxLayout(self)
+        box.addWidget(intro)
+        box.addSpacing(8)
+        box.addLayout(form)
+        box.addWidget(close)
+        self.resize(780, 0)
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._show_connected)
+        self._timer.start(1000)
+
+    def _copyable(self, text: str) -> QtWidgets.QWidget:
+        line = QtWidgets.QLineEdit(text)
+        line.setReadOnly(True)
+        line.setCursorPosition(0)
+        copy = QtWidgets.QPushButton("Copy")
+        copy.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText(text),
+                                      self.window.statusBar().showMessage("Copied", 3000)))
+        row = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(line, 1)
+        layout.addWidget(copy)
+        return row
+
+    def check(self) -> None:
+        """Ask Claude Code whether it has insthub (in a worker: it starts `insthub mcp` to check it)."""
+        self._show_connected()
+        if shutil.which("claude") is None:
+            self.status.setText("not installed here (there is no <code>claude</code> command); other agents take "
+                                "the settings below")
+            self.setup.hide()
+            self.remove.hide()
+            return
+        if self._asking:
+            return
+        self._asking = True
+        self.status.setText("asking...")
+        self.window.submit(self.window.actions, lambda: _claude("mcp", "get", "insthub").returncode == 0,
+                           self._answered, self._failed)
+
+    def _answered(self, registered: bool) -> None:
+        self._asking = False
+        self.status.setText(_badge(_GOOD, "set up, for all your projects") if registered else "not set up yet")
+        self.setup.setVisible(not registered)
+        self.remove.setVisible(registered)
+
+    def _failed(self, exc) -> None:
+        self._asking = False
+        self.status.setText(f"cannot ask it: {_esc(exc)}")
+
+    def _run(self, doing: str, args: list[str]) -> None:
+        def run():
+            result = _claude(*args)
+            if result.returncode != 0:
+                raise BusError((result.stderr or result.stdout).strip() or f"exit status {result.returncode}")
+
+        self.window.act(doing, run, f"{doing}: done", after=self.check)
+
+    def _show_connected(self) -> None:
+        if not self.isVisible():
+            return
+        agents = self.window.agents()
+        self.connected.setText("<br>".join(f"{_esc(name)} (pid {pid}), using {', '.join(map(_esc, servers))}"
+                                           for pid, (name, servers) in agents.items()) or "none right now")
+
+
 # ---------------------------------------------------------------- the window
 class Manager(QtWidgets.QMainWindow):
     """The window.  With `tray=True` it also has a tray icon, and closing the
@@ -796,6 +944,8 @@ class Manager(QtWidgets.QMainWindow):
         self._refresh_ms = refresh_ms
         self._quitting = False
         self._health: dict[tuple, str] = {}  # what was fine and what was broken at the last look
+        self._agents_told: set[int] = set()  # agents (by pid) the tray has announced
+        self._agents_dialog: _AgentsDialog | None = None
         self.probes = ThreadPoolExecutor(8, thread_name_prefix="insthub-gui-probe")
         self.actions = ThreadPoolExecutor(4, thread_name_prefix="insthub-gui-action")
         self.servers: dict[str, _Server] = {}
@@ -814,6 +964,8 @@ class Manager(QtWidgets.QMainWindow):
         bar.setMovable(False)
         self.add_service = self._action(bar, "Add service...", self.add_service_dialog,
                                         "Keep a server running in the background (systemd user service)")
+        self._action(bar, "AI agents...", self.agents_dialog,
+                     "Let AI agents such as Claude Code use the instruments (insthub mcp)")
         self._action(bar, "Refresh", self.refresh, "Look again now (F5)", QtGui.QKeySequence.StandardKey.Refresh)
         spacer = QtWidgets.QWidget()
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
@@ -888,18 +1040,23 @@ class Manager(QtWidgets.QMainWindow):
     def _report(self, exc) -> None:
         self.statusBar().showMessage(f"{type(exc).__name__}: {exc}", 8000)
 
-    def act(self, doing: str, fn, done: str) -> None:
-        """A user's action: say what is happening, then what came of it."""
+    def act(self, doing: str, fn, done, after=None) -> None:
+        """A user's action: say what is happening, then what came of it.  `done` is the
+        message (or makes it from the result); `after()` runs once it is over, either way."""
         self.statusBar().showMessage(f"{doing}...")
 
         def ok(result):
             self.statusBar().showMessage(done if not callable(done) else done(result), 6000)
             self.refresh()
+            if after is not None:
+                after()
 
         def failed(exc):
             self.statusBar().clearMessage()
             QtWidgets.QMessageBox.warning(self, "insthub", f"{doing} failed.\n\n{exc}")
             self.refresh()
+            if after is not None:
+                after()
 
         self.submit(self.actions, fn, ok, failed)
 
@@ -978,6 +1135,13 @@ class Manager(QtWidgets.QMainWindow):
             s.probing = False
             if self.servers.get(s.key) is not s:
                 return
+            if s.probe is not None and self.tray is not None:  # an agent that arrived since the last look
+                before = {c["pid"] for c in s.probe["clients"] or () if c["agent"]}
+                for c in result["clients"] or ():
+                    if c["agent"] and c["pid"] not in before and c["pid"] not in self._agents_told:
+                        self._agents_told.add(c["pid"])
+                        self.tray.alert("An AI agent is using the instruments",
+                                        f"{c['program']} connected to {s.name}.", ("server", s.key))
             now = time.monotonic()
             if s.probe and now > s.probed_at:
                 for dev, d in result["devices"].items():
@@ -1079,13 +1243,32 @@ class Manager(QtWidgets.QMainWindow):
         down = sum(1 for d in devices if not d["status"]["connected"] and d["status"]["error"] not in (None, "released"))
         running = sum(1 for s in self.servers.values() if s.origin != "service")
         text = f"{running} server{'s' * (running != 1)} · {len(devices)} device{'s' * (len(devices) != 1)}"
+        agents = len(self.agents())
+        if agents:
+            text += f" · {agents} AI agent{'s' * (agents != 1)} connected"
         if down:
             text += f" · <span style='color:{_BAD}'>{down} not connected</span>"
         self.summary.setText(text)
         self.add_service.setEnabled(self._systemd)
         self.where.setText(self._remote_error or f"runtime folder: {registry.runtime_dir()}")
 
+    def agents(self) -> dict[int, tuple[str, list[str]]]:
+        """The AI agents connected right now: pid -> (name, the servers it uses)."""
+        found: dict[int, tuple[str, list[str]]] = {}
+        for s in self.servers.values():
+            for c in (s.probe["clients"] if s.probe else None) or ():
+                if c["agent"]:
+                    found.setdefault(c["pid"], (c["program"], []))[1].append(s.name)
+        return found
+
     # -- managing ------------------------------------------------------------
+    def agents_dialog(self) -> None:
+        if self._agents_dialog is None:
+            self._agents_dialog = _AgentsDialog(self)
+        self._agents_dialog.show()
+        self._agents_dialog.raise_()
+        self._agents_dialog.check()
+
     def device_action(self, s: _Server, device: str, method: str) -> None:
         address = s.address
         doing = {"$open": f"Connecting {device}", "$release": f"Releasing {device}"}[method]
@@ -1203,8 +1386,9 @@ class Manager(QtWidgets.QMainWindow):
                 if color == _BAD and self._health.get(key) in (_GOOD, _BUSY):  # it worked until just now
                     self.tray.alert(headline, sentence, select)
             problems = [headline for color, headline, _, _ in now.values() if color == _BAD]
+            agents = [f"{name} on {', '.join(servers)}" for name, servers in self.agents().values()]
             self.tray.refresh(sorted(self.servers.values(), key=lambda s: (_ORIGIN_ORDER[s.origin], s.name.lower())),
-                              problems)
+                              problems, agents)
         self._health = {key: value[0] for key, value in now.items()}
 
     def showEvent(self, event) -> None:
@@ -1249,17 +1433,43 @@ class Manager(QtWidgets.QMainWindow):
 
 
 # ---------------------------------------------------------------- the tray icon
-def _tray_icon(alert: bool) -> QtGui.QIcon:
-    """The insthub icon, with a red dot when something is broken."""
-    pix = QtGui.QIcon(str(launcher.ICON)).pixmap(64, 64)
-    if alert:
+_LIGHTS = {"good": "#33d17a", "bad": "#ed333b"}  # the desktop's own green and red
+_NODES = ((3.2, 3.2), (12.8, 3.2), (3.2, 12.8), (12.8, 12.8))
+
+
+def _tray_icon(status: str | None) -> QtGui.QIcon:
+    """A symbolic hub, white line art like the other icons of the top bar.  The
+    lower-right node doubles as a status light: green while all is well, red
+    while something is broken, absent while no server runs."""
+    icon = QtGui.QIcon()
+    ink = QtGui.QColor("#f2f2f2")
+    for size in (16, 22, 24, 32, 48, 64):  # drawn at each size, so that it stays crisp
+        pix = QtGui.QPixmap(size, size)
+        pix.fill(QtGui.QColor(0, 0, 0, 0))
         p = QtGui.QPainter(pix)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        p.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 4))
-        p.setBrush(QtGui.QColor(_BAD))
-        p.drawEllipse(QtCore.QRectF(36, 2, 26, 26))
+        p.scale(size / 16, size / 16)  # designed on a 16 x 16 grid
+        pen = QtGui.QPen(ink)
+        pen.setWidthF(1.5)
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        for x, y in _NODES:
+            p.drawLine(QtCore.QPointF(8, 8), QtCore.QPointF(x, y))
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(ink)
+        p.drawEllipse(QtCore.QPointF(8, 8), 2.7, 2.7)
+        for x, y in _NODES:
+            p.drawEllipse(QtCore.QPointF(x, y), 1.9, 1.9)
+        if status in _LIGHTS:
+            light = QtCore.QPointF(12.4, 12.4)
+            p.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_Clear)  # a gap around the light
+            p.drawEllipse(light, 4.4, 4.4)
+            p.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_SourceOver)
+            p.setBrush(QtGui.QColor(_LIGHTS[status]))
+            p.drawEllipse(light, 3.2, 3.2)
         p.end()
-    return QtGui.QIcon(pix)
+        icon.addPixmap(pix)
+    return icon
 
 
 class _Tray(QtWidgets.QSystemTrayIcon):
@@ -1270,16 +1480,18 @@ class _Tray(QtWidgets.QSystemTrayIcon):
         super().__init__(window)
         self.window = window
         self.settings = QtCore.QSettings("insthub", "gui")
-        self._icons = {alert: _tray_icon(alert) for alert in (False, True)}
+        self._icons = {status: _tray_icon(status) for status in (None, "good", "bad")}
+        self._logo = QtGui.QIcon(str(launcher.ICON))  # for notifications, which show it large
+        self.status: str | None = None
         self._rows: tuple | None = None
         self._clicked: tuple | None = None  # what the last notification was about
         self.menu = QtWidgets.QMenu()
         self.setContextMenu(self.menu)
-        self.setIcon(self._icons[False])
+        self.setIcon(self._icons[None])
         self.setToolTip("insthub")
         self.activated.connect(self._activated)
         self.messageClicked.connect(lambda: window.bring_up(self._clicked))
-        self.refresh([], [])
+        self.refresh([], [], [])
         self.show()
 
     def _activated(self, reason) -> None:
@@ -1293,19 +1505,22 @@ class _Tray(QtWidgets.QSystemTrayIcon):
     def notify(self) -> bool:
         return self.settings.value("notify", True, type=bool)
 
-    def refresh(self, servers: list[_Server], problems: list[str]) -> None:
-        self.setIcon(self._icons[bool(problems)])
+    def refresh(self, servers: list[_Server], problems: list[str], agents: list[str]) -> None:
         running = sum(1 for s in servers if s.origin != "service")
+        status = "bad" if problems else ("good" if running else None)
+        if status != self.status:
+            self.status = status
+            self.setIcon(self._icons[status])
         devices = sum(len(s.probe["devices"]) for s in servers if s.probe)
         tip = f"insthub: {running} server{'s' * (running != 1)}, {devices} device{'s' * (devices != 1)}"
-        self.setToolTip(tip + "".join(f"\n{p}" for p in problems[:6]))
+        self.setToolTip(tip + "".join(f"\n{line}" for line in (*problems[:6], *agents)))
         rows = tuple((s.key, s.name, *_server_state(s)[:2], len(s.probe["devices"]) if s.probe else None)
                      for s in servers)
-        if rows != self._rows:  # rebuild only on a change: the menu may be open
-            self._rows = rows
-            self._build(rows)
+        if (rows, agents) != self._rows:  # rebuild only on a change: the menu may be open
+            self._rows = rows, agents
+            self._build(rows, agents)
 
-    def _build(self, rows: tuple) -> None:
+    def _build(self, rows: tuple, agents: list[str]) -> None:
         menu = self.menu
         menu.clear()
         menu.addAction("Show insthub").triggered.connect(lambda: self.window.bring_up())
@@ -1316,6 +1531,8 @@ class _Tray(QtWidgets.QSystemTrayIcon):
             action.triggered.connect(lambda _=False, key=key: self.window.bring_up(("server", key)))
         if not rows:
             menu.addAction("No server is running").setEnabled(False)
+        for agent in agents:
+            menu.addAction(agent).triggered.connect(lambda: self.window.agents_dialog())
         menu.addSeparator()
         notify = menu.addAction("Notify me when something breaks")
         notify.setCheckable(True)
@@ -1332,7 +1549,7 @@ class _Tray(QtWidgets.QSystemTrayIcon):
     def alert(self, headline: str, sentence: str, select: tuple | None) -> None:
         if self.notify:
             self._clicked = select
-            self.showMessage(headline, sentence, self._icons[True], 10000)
+            self.showMessage(headline, sentence, self._logo, 10000)
 
     def hint_once(self) -> None:
         """The first time the window is closed, say where it went."""
@@ -1340,7 +1557,7 @@ class _Tray(QtWidgets.QSystemTrayIcon):
             self.settings.setValue("told-about-tray", True)
             self.showMessage("insthub is still here", "It keeps watching from the tray icon. Your servers run "
                              "on regardless; Quit in the tray menu closes the window for good.",
-                             self._icons[False], 8000)
+                             self._logo, 8000)
 
 
 # ---------------------------------------------------------------- starting

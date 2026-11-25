@@ -70,8 +70,9 @@ claude mcp add --scope user insthub -- "$(which insthub)" mcp
 
 Claude Code (or any agent that speaks MCP) can then list the instruments,
 read their documentation from your docstrings, call commands, set properties
-and take live traces, with large arrays handed over as files. See
-[using insthub from AI agents](docs/agents.md).
+and take live traces, with large arrays handed over as files. **AI agents...**
+in `insthub gui` does the setup with a click and shows which agents are
+connected. See [using insthub from AI agents](docs/agents.md).
 
 ## The smallest example
 
@@ -120,7 +121,7 @@ for frame in thermo.subscribe("temperature"):
 
 ## Status
 
-- 200 tests cover calls, streams, device lifecycle, finding servers,
+- 203 tests cover calls, streams, device lifecycle, finding servers,
   reconnecting, the command line, services, the GUIs and the agent interface.
   Run them with `python -m pytest tests` (about 17 s).
 - Developed and tested on Linux with Python 3.11, 3.12 and 3.14. Written to
