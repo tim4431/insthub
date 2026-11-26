@@ -149,6 +149,24 @@ def test_install_refuses_the_user_wide_command(tmp_path, monkeypatch):
         service.install(cfg, python=str(tmp_path / "nope"))
 
 
+def test_install_runs_the_python_the_file_needs(tmp_path, monkeypatch):
+    """By default, the one `insthub check --import` checks in (extensions.python_for): here, the
+    virtualenv next to the file, not the Python that runs `insthub service install`."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(service, "_systemctl", lambda *a, check=True: subprocess.CompletedProcess(a, 0, "", ""))
+    checked = []
+    monkeypatch.setattr(service, "check_python", lambda target, python: checked.append(python) or [])
+    (tmp_path / "rig" / ".venv" / "bin").mkdir(parents=True)
+    python = tmp_path / "rig" / ".venv" / "bin" / "python"
+    python.write_text("")
+    cfg = tmp_path / "rig" / "lab.toml"
+    cfg.write_text("[server]\n")
+    unit = service.install(cfg, start=False)
+    assert checked == [str(python)] and f'ExecStart="{python}" "-m" "insthub" "serve"' in unit.read_text()
+    service.install(cfg, start=False, python=sys.executable)              # --python: that one
+    assert checked[-1] == sys.executable
+
+
 def test_check_python_imports_the_drivers(tmp_path):
     (tmp_path / "gooddrv.py").write_text("class Box:\n    pass\n")
     good = tmp_path / "good.toml"

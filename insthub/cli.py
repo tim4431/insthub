@@ -176,9 +176,8 @@ def _cmd_list(args) -> int:
             continue
         where = " on another computer" if info.get("remote") else ""
         print(f"{info['server']}  (pid {info['pid']}{where})  {'  '.join(info['addresses'])}")
-        try:
-            address = next((a for a in info["addresses"] if not a.startswith("inproc")), info["addresses"][0])
-            described = insthub.connect(args.address or address).describe()
+        try:  # (with -a, info() has no "address": it is the one given)
+            described = insthub.connect(args.address or info["address"]).describe()
         except insthub.BusError as e:
             print(f"    unreachable: {e}")
             continue
@@ -675,7 +674,7 @@ def _cmd_check(args) -> int:
 
     problems = extensions.check(args.path, import_=args.import_)
     print("\n".join(problems) or f"{args.path}: no problems found" +
-          ("" if args.import_ else " (--import also imports the drivers)"))
+          ("" if args.import_ else " (--import also imports the drivers and the UIs)"))
     return 1 if problems else 0
 
 
@@ -780,8 +779,8 @@ def main(argv=None) -> int:
     s = sub.add_parser("check", help="what is wrong with an extension, or with the extensions of a server file")
     s.add_argument("path", help="an extension's folder, its insthub-extension.toml, or a server's .toml")
     s.add_argument("--import", dest="import_", action="store_true",
-                   help="also import the drivers, in the extension's Python (for a server file: the checks of "
-                        "`insthub service install`)")
+                   help="also import the drivers and the UIs' modules, in the extension's Python (for a "
+                        "server file: the checks of `insthub service install`, in the Python that serves it)")
     s.set_defaults(fn=_cmd_check)
     s = sub.add_parser("service", help="keep servers running in the background (systemd user services)")
     s.set_defaults(fn=_cmd_service)
@@ -794,8 +793,9 @@ def main(argv=None) -> int:
     a.add_argument("--no-login", action="store_true", help="start it now, but not at every login "
                                                            "(later: insthub service start NAME)")
     a.add_argument("--python", metavar="PATH",
-                   help="the Python the service runs (default: the one running this command); "
-                        "it needs insthub and the drivers' packages")
+                   help="the Python the service runs (default: that of the devices' extensions, else a "
+                        "virtualenv next to the file or its drivers, else the one running this command); it "
+                        "needs insthub and the drivers' packages")
     actions.add_parser("list", help="installed services and their state")
     for action, text in (("start", "start a service"),
                          ("stop", ("stop a service (until `start`, or the next start of your services if it "

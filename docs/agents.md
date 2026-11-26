@@ -113,7 +113,10 @@ There are two steps, and you only set up the first.
    servers running on this computer, plus the devices and servers on other
    computers that `devices.toml` names (see [running servers](running-servers.md#reaching-a-server-from-another-computer)).
    `list_devices` notes a server there that does not answer, and a
-   `devices.toml` that cannot be read.
+   `devices.toml` that cannot be read. It lists each device where the other
+   tools find it (as `insthub.locate` does: this computer first, then
+   `devices.toml`'s `[devices]`); a name that two servers have, so that the
+   tools refuse it as ambiguous, is left out with a note that says so.
    A server you start later is visible at the agent's next call.
 
 The agent's knowledge of each instrument is whatever `describe` returns: the

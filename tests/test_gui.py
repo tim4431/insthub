@@ -5,7 +5,6 @@ import time
 import numpy as np
 import pytest
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("pyqtgraph")
 
 import insthub  # noqa: E402
@@ -59,6 +58,31 @@ def test_nothing_is_delivered_for_a_widget_that_is_gone():
     future.set_result("late")                                       # ... before the answer comes
     spin(app, 0.2)
     assert got == []
+
+
+def test_a_coalesced_or_followed_answer_reaches_no_widget_that_is_gone():
+    import gc
+    from concurrent.futures import Future
+
+    app = qt.application()
+    for make in (lambda call, done, error, owner: qt.coalesce(call, done, error, owner=owner),
+                 lambda call, done, error, owner: qt.follow(call, done, error=error, owner=owner)):
+        started, got = [], []
+
+        def call(started=started, **values):
+            started.append(Future())
+            return started[-1]
+
+        window = qt.QtWidgets.QWidget()
+        label = qt.QtWidgets.QLabel(window)
+        send = make(call, got.append, got.append, label)
+        send(level=1)
+        assert spin(app, 3, lambda started=started: started)            # (started off the GUI thread)
+        del window, label
+        gc.collect()                                                    # the panel is closed ...
+        started[0].set_result("late")                                   # ... before the instrument answers
+        spin(app, 0.2)
+        assert got == []
 
 
 class Connection:

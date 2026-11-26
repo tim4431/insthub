@@ -409,7 +409,7 @@ over.
 ## GUIs
 
 A GUI must not freeze while an instrument works, and may only touch its
-widgets from the GUI thread. Four helpers in `insthub.qt` take care of both:
+widgets from the GUI thread. Five helpers in `insthub.qt` take care of both:
 
 ```python
 from insthub import qt
@@ -443,45 +443,38 @@ slider.valueChanged.connect(lambda us: timebase(seconds_per_div=us * 1e-6))
   that fails, and `merge(waiting, new)` for names that go together (a new
   center makes a waiting start and stop wrong). `timebase.busy` says whether a
   call is on its way.
+- `qt.follow` is `qt.coalesce` for a control that also shows the device's own
+  value, such as the timebase the scope reports in its state.
 
-A control that shows the device's own value (the timebase the scope reports
-in its state) leaves the control alone while a call is on its way, because
-until the instrument has taken the new value it may still report the old one.
-But it does not drop what the device reports meanwhile: it keeps it and shows
-it when the last call ends, in `done` or `error` (where `busy` is false unless
-values that waited went out). Otherwise, an instrument that rounds what it is
-sent (to 1-2-5 steps, say) or refuses it would be shown with the value that was
-typed, not the one it has:
+A control that shows the device's own value must not show the old value over
+a new one on its way: until the instrument has taken it, it may still report
+the old one. Nor may it show the value that was typed: an instrument that
+rounds what it is sent (to 1-2-5 steps, say) or refuses it has another.
+`qt.follow` takes care of that. Give it the call and the function that shows a
+value, and feed it what the device reports:
 
 ```python
-reported = {}                             # the scope's state, as it said last
+def show(seconds):
+    box.blockSignals(True)                # (showing a value is not sending it)
+    box.setValue(seconds)
+    box.blockSignals(False)
 
-def on_state(frame):                      # qt.watch(scope.subscribe("state"), on_state)
-    reported.update(frame.data)
-    show()
-
-def show():
-    if not timebase.busy and "timebase" in reported:
-        box.blockSignals(True)            # (showing a value is not sending it)
-        box.setValue(reported["timebase"])
-        box.blockSignals(False)
-
-def taken(seconds):                       # set_timebase returns the value it took
-    reported["timebase"] = seconds
-    show()
-
-timebase = qt.coalesce(scope.set_timebase.future, done=taken, error=lambda exc: show())
+timebase = qt.follow(scope.set_timebase.future, show, error=lambda exc: label.setText(f"failed: {exc}"))
+box.valueChanged.connect(lambda seconds: timebase(seconds_per_div=seconds))
+watcher = qt.watch(scope.subscribe("state"), lambda frame: timebase.report(frame.data["timebase"]))
 ```
 
-`insthub/sim_ui.py` does this for its timebase.
-
-A value that the device only reads now and then (with `poll`) needs one more
-step. The device may read it just before it takes the new value, and that old
-report then reaches the window with the answer, to be shown a moment after it.
-So keep the subscription (`reports = laser.subscribe("power")`, watched with
-`qt.watch(reports, on_power)`), and in `done` call `reports.poll()` first: it
-drops a report that has come in and is not shown yet. The demo laser's panel,
-`examples/extension/demolaser_insthub/ui/panel.py`, does this.
+It shows what the device reports while no call is on its way, and keeps what
+it reports meanwhile. When the last call ends, it shows what the device took
+(the call's result, if it returns one, as `set_timebase` does; else what it
+reported last), or, if the call failed, what it reported last. A value that
+the device only reads now and then (with `poll`) may be read just before it
+takes the new value, and that old report then comes in with the answer. Pass
+the subscription as `reports=`, and that report is dropped instead of being
+shown a moment after the answer. `insthub/sim_ui.py` follows its timebase this
+way, and the demo laser's panel,
+`examples/extension/demolaser_insthub/ui/panel.py`, its power, with
+`reports=`.
 
 A GUI can live in the server's program or in a separate one; the code is the
 same. In the server's program, use `server.device("scope")` and frames arrive
@@ -505,11 +498,11 @@ def make(device, parent=None) -> QWidget:
 |---|---|
 | gets its device | as `device`, an ordinary proxy: the same thing `insthub.device("scope")` returns |
 | never freezes the window | streams through `qt.watch`, calls started with `qt.start(device.command.future, ...)`, results through `qt.deliver(..., owner=the panel)`, so a panel closed inside a larger app gets no late answers |
-| sends a setting as fast as the instrument takes it | `qt.coalesce` for a slider, a spin box's arrows or a wheel: one call at a time, with the newest values |
+| sends a setting as fast as the instrument takes it | `qt.coalesce` for a slider, a spin box's arrows or a wheel: one call at a time, with the newest values; `qt.follow` when the control also shows the device's value |
 | shows the rest without code of its own | `controls.Controls(device, exclude=[...])` (see below) |
 | reaches the instrument only through the bus | commands, properties and streams, so a script or an agent can do all it does |
 | stops what it watches when it closes | in its widget's `closeEvent`: `watcher.stop()` for each watcher |
-| never disagrees with the device | it shows what the device reports, also after a call it rounded or refused (see `busy` above); the limits of a command's parameters (`min`, `max`, `unit`) come from `device.bus.describe(refresh=False)`, which the proxy already has, so reading them makes no call |
+| never disagrees with the device | it shows what the device reports, also after a call it rounded or refused (`qt.follow`, above); the limits of a command's parameters (`min`, `max`, `unit`) come from `device.bus.describe(refresh=False)`, which the proxy already has, so reading them makes no call |
 
 A panel often shows a few things in a way of its own (a trace with markers,
 an image) and needs plain controls for the rest. `insthub.controls` has them,
@@ -540,7 +533,7 @@ value is set.
 
 `insthub/sim_ui.py` is a complete example: insthub's own panel for its
 simulated scope (two traces, the timebase from 1 ns to 10 s per division as
-the device takes it, sent through `qt.coalesce` and shown as the scope took
+the device takes it, sent through `qt.follow` and shown as the scope took
 it, live on or off, a measurement, and the scope's other commands as
 `Controls`). The reference extension's panel,
 `examples/extension/demolaser_insthub/ui/panel.py`, is a smaller one: a
@@ -623,9 +616,10 @@ other software (**Release**), or open its live plots (**Live view**).
 program's commands fail with `DevicePaused`) until **Resume**; the page says
 who paused it and since when. **⋯ → Edit in lab.toml...** (named after the
 server's config file) changes its driver, arguments or **Open at start** there.
-A device whose [extension](#extensions) has a UI for it gets a button for each,
-such as **Open Scope panel** for the scope of `insthub sim`; a right-click on
-its tile offers them too. Each opens in a program of its own, run with the
+A device whose [extension](#extensions) has a UI for it gets a button to open
+it, such as **Open Scope panel** for the scope of `insthub sim`, or one
+**Open** button with a menu of them when it has several; a right-click on its
+tile offers them too. Each opens in a program of its own, run with the
 extension's Python. If the extension is not on this computer, its page says so:
 "extension hp8562a is not installed on this computer: `insthub ext add
 FOLDER`". The live view and these windows write their output to a log file; if
@@ -727,8 +721,8 @@ computer. Of two extensions with one `id` the first that can be used wins,
 and `insthub ext list` says which one it hides. One that cannot be used (its
 manifest is not valid TOML, its `api` is too new, it has no Python) is listed
 with the reason, and hides nothing. To try an extension without adding it,
-`INSTHUB_EXTENSIONS=~/Code/hp8562a insthub gui` looks only there (folders
-separated by `:`, or `;` on Windows).
+`INSTHUB_EXTENSIONS=~/Code/hp8562a insthub gui` looks only there, besides
+insthub's own extension (folders separated by `:`, or `;` on Windows).
 
 A manifest:
 
@@ -771,7 +765,7 @@ type (as `insthub info` shows it: the class name) is listed. For a device on
 this computer, the extension is found from the device's own folder, so
 **Open** starts the copy of the extension that its server runs; for one on
 another computer, from your extensions. insthub runs nothing of an
-extension whose manifest or folder another user may change (see
+extension whose manifest, folder or Python another user may change (see
 [the design](design.md#the-manifest)). Its output goes to
 `ui/DEVICE/NAME.log` in insthub's runtime folder. `insthub open` waits 3
 seconds and, if it ended with an error by then, prints the log's last lines.
@@ -802,7 +796,7 @@ insthub serve CONFIG.toml                      host the devices of a config file
 insthub ext list [--json]                      the extensions this computer knows of, and what is wrong with them
 insthub ext add PATH | ext remove PATH         add an extension's folder to your list, or take it off
 insthub check PATH [--import]                  what is wrong with an extension, or with a server file's extensions;
-                                               --import also imports the drivers, in the extension's Python
+                                               --import also imports the drivers and the UIs, in its Python
 insthub service install | list | start | stop | restart | enable | disable | remove | logs
                                                keep servers running in the background
 insthub sim [--gui]                            simulated instruments to try things on

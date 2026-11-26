@@ -41,6 +41,9 @@ panel = "hpdrv_ui:make"
 """
 
 
+HP_UI = "def make(device, parent=None):\n    raise RuntimeError('never made')\n"  #: hpdrv_ui.py: what HP's UIs load
+
+
 def extension(folder, manifest=HP, python=True, **files):
     """An extension's folder: its manifest, a virtualenv's python (a stand-in) and other files."""
     folder.mkdir(parents=True, exist_ok=True)
@@ -53,10 +56,28 @@ def extension(folder, manifest=HP, python=True, **files):
     return folder
 
 
+def own_python(folder) -> Path:
+    """A virtualenv's python for an extension (FOLDER/.venv/bin/python) that is not the Python running
+    the tests, as a real one is not: a stand-in that runs this Python with a library of its own,
+    vendorlib (in FOLDER/vendor), which only it can import."""
+    if os.name == "nt":
+        pytest.skip("the stand-in python is a shell script")
+    vendor = folder / "vendor"
+    vendor.mkdir(parents=True, exist_ok=True)
+    (vendor / "vendorlib.py").write_text("WHERE = 'the extension s own Python'\n")
+    python = folder / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text(f"#!/bin/sh\nPYTHONPATH=${{PYTHONPATH:+$PYTHONPATH:}}{shlex.quote(str(vendor))} "
+                      f'exec {shlex.quote(sys.executable)} "$@"\n')  # (last: what insthub puts first stays so)
+    python.chmod(0o755)
+    return python
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """A home of its own (your list of extensions), and the places discover() looks in, all empty."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # (else your list would be there)
     monkeypatch.delenv(extensions.ENV)
     monkeypatch.setattr(service, "units", list)
     return tmp_path / "home"
@@ -331,7 +352,7 @@ def test_check_an_extension_and_import_its_drivers(tmp_path):
                        class Analyzer(insthub.Device):
                            extension = "hp8562a"
                            extension_version = "0.2"
-                       """)
+                       """, hpdrv_ui=HP_UI)
     with pytest.warns(ConfigWarning, match=r"says extension_version = \"0.2\", but the manifest's version is "
                                            r"\"0.3\""):
         assert extensions.check(folder, import_=True) == []
@@ -358,8 +379,8 @@ def test_check_import_loads_what_link_errors_names(tmp_path):
                            pass
 
                        class Analyzer:
-                           pass
-                       """)
+                           extension = ".csv"  # a plain class's own: insthub reads it only from a Device
+                       """, hpdrv_ui=HP_UI)
     assert extensions.check(folder) == []  # what they name is known only once imported
     where = f"{folder / extensions.MANIFEST}: [devices.analyzer] link_errors:"
     assert extensions.check(folder, import_=True) == [
@@ -390,7 +411,7 @@ def test_check_a_server_file(tmp_path, capsys):
     assert cli.main(["check", str(lab), "--import"]) == 1
     assert "pda: not a parameter" in capsys.readouterr().out
     assert cli.main(["check", str(folder)]) == 0
-    assert f"{folder}: no problems found (--import also imports the drivers)" in capsys.readouterr().out
+    assert f"{folder}: no problems found (--import also imports the drivers and the UIs)" in capsys.readouterr().out
 
 
 def test_check_a_server_file_next_to_its_drivers(tmp_path):
@@ -457,21 +478,25 @@ sys.exit(int(os.environ.get("APP_EXIT", "0")))
 
 def test_launch_starts_an_app_or_a_panel_with_the_extension_s_python(tmp_path, monkeypatch):
     run = '["app.py", "--address", "{address}", "--name", "{device}", "{other}", "{\\"a\\": 1}"]'
-    folder = extension(tmp_path / "hp", HP.replace("api = 1", f'api = 1\npython = "{sys.executable}"').replace(
-        'run = ["-m", "hpdrv_ui", "--address", "{address}", "--name", "{device}"]', f"run = {run}"), app=APP)
+    folder = extension(tmp_path / "hp", HP.replace(
+        'run = ["-m", "hpdrv_ui", "--address", "{address}", "--name", "{device}"]', f"run = {run}"), python=False,
+        app="import vendorlib\nprint('vendorlib', vendorlib.WHERE)\n" + APP)  # (only its own Python has vendorlib)
+    python = own_python(folder)
     ext = extensions.load(folder / extensions.MANIFEST)
+    assert ext.python == str(python)
     app = extensions.launch(ext, "analyzer", "sa", "tcp://labpc:8700")
     assert app.failure(wait=20) is None and not app.running and app.title == "Spectrum analyzer for sa"
     started, *said = app.log.read_text().splitlines()
     assert app.log == insthub.registry.runtime_dir() / "ui" / "sa" / "analyzer.log"
     assert started.startswith("--- ") and started.endswith(f": {shlex.join(app.process.args)}")  # when, and what ran
-    assert said == ["args ['--address', 'tcp://labpc:8700', '--name', 'sa', '{other}', '{\"a\": 1}']",
+    assert said == ["vendorlib the extension s own Python",  # run by its Python, which has its libraries
+                    "args ['--address', 'tcp://labpc:8700', '--name', 'sa', '{other}', '{\"a\": 1}']",
                     f"cwd {folder}", f"path {folder}"]  # in its folder, which is first on its PYTHONPATH
     monkeypatch.setenv("APP_EXIT", "3")
     assert extensions.launch(ext, "analyzer", "sa", "tcp://labpc:8700").failure(wait=20).endswith(f"path {folder}")
 
     panel = extensions.launch(ext, "quick", "sa", "tcp://127.0.0.1:9")  # nothing listens there
-    assert panel.process.args == [sys.executable, "-m", "insthub", "-a", "tcp://127.0.0.1:9", "panel", "sa",
+    assert panel.process.args == [str(python), "-m", "insthub", "-a", "tcp://127.0.0.1:9", "panel", "sa",
                                   "hpdrv_ui:make", "--title=quick"]
     assert "error: cannot load the panel 'hpdrv_ui:make': No module named 'hpdrv_ui'" in panel.failure(wait=30)
     for device, address in (("../sa", "tcp://labpc:8700"), ("sa --x", "tcp://labpc:8700"), ("sa", "labpc:8700"),
@@ -500,7 +525,13 @@ def test_a_program_started_in_the_background_says_why_it_failed(tmp_path):
     assert slow.failure(wait=0.2) is None and slow.running               # it runs
     slow.process.kill()
     slow.process.wait(10)
-    assert slow.failure() is None and not slow.running                   # ended by a signal: by whoever sent it
+    assert slow.failure() is None and not slow.running                   # killed: by whoever sent it, on purpose
+    stopped = started("import os, signal; os.kill(os.getpid(), signal.SIGTERM)", "terminated")
+    assert stopped.failure(wait=20) is None                              # asked to stop (Stop): no news either
+    crashed = started("import os, sys; print('qt.qpa.plugin: Could not load the Qt platform plugin', flush=True); "
+                      "os.abort()", "crashed")                           # as Qt does when it cannot show a window
+    assert crashed.failure(wait=20) == "qt.qpa.plugin: Could not load the Qt platform plugin"
+    assert started("import os; os.abort()", "aborted").failure(wait=20) == "ended by SIGABRT"  # it said nothing
 
 
 def test_what_a_program_said_is_its_own_not_an_earlier_run_s():
@@ -597,3 +628,177 @@ def test_insthub_open_opens_the_ui_of_a_device(home, tmp_path, monkeypatch, caps
         assert cli.main(["-a", address, "open", "loopback"]) == 1
         assert "error: loopback: its extension, Simulated instruments, has no UI for it (insthub view loopback" in \
             capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- which Python runs what
+def test_what_runs_in_the_extension_s_python_is_run_there(tmp_path):
+    """Its driver is imported, and a server file of its devices checked, in the extension's own Python,
+    which has its libraries (vendorlib), not in the one that runs insthub."""
+    folder = extension(tmp_path / "hp", python=False, hpdrv="import vendorlib\n\nclass Analyzer:\n    pass\n",
+                       hpdrv_ui=HP_UI)
+    python = own_python(folder)
+    assert extensions.check(folder, import_=True) == []
+    lab = tmp_path / "servers" / "lab.toml"  # (no virtualenv next to it: its devices' extension says)
+    lab.parent.mkdir()
+    lab.write_text(f'[devices.a]\ndriver = "hpdrv:Analyzer"\npath = "{folder}"\n')
+    assert extensions.python_for(lab) == str(python)
+    assert extensions.check(lab, import_=True) == []  # as `insthub service install` checks it, in that Python
+    report = service.check_report(lab, sys.executable)  # (in this one, it would not load)
+    assert "No module named 'vendorlib'" in report["problem"]
+
+
+def test_the_python_a_server_file_is_served_with(tmp_path):
+    rig = tmp_path / "rig"
+    (rig / "servers").mkdir(parents=True)
+    lab = rig / "servers" / "lab.toml"
+    lab.write_text('[devices.echo]\ndriver = "insthub.sim:Loopback"\n')
+    assert extensions.python_for(lab) == sys.executable                  # nothing says: this one
+    (rig / ".venv" / "bin").mkdir(parents=True)
+    venv = rig / ".venv" / "bin" / "python"
+    venv.write_text("")
+    assert extensions.python_for(lab) == str(venv)                       # a virtualenv in its folder or the one above
+    assert extensions.python_for(rig / "srv.py") == str(venv)            # (a .py server's too)
+    drv = tmp_path / "drv"
+    (drv / ".venv" / "bin").mkdir(parents=True)
+    (drv / ".venv" / "bin" / "python").write_text("")
+    elsewhere = tmp_path / "elsewhere" / "lab.toml"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text(f'[devices.box]\ndriver = "box:Box"\npath = "{drv}"\n')
+    assert extensions.python_for(elsewhere) == str(drv / ".venv" / "bin" / "python")  # next to a device's code
+    assert extensions.device_python({"driver": "box:Box", "path": str(drv)}, None) == str(drv / ".venv" / "bin" /
+                                                                                          "python")
+    hp = extension(tmp_path / "hp")
+    lab.write_text(f'[devices.a]\ndriver = "hpdrv:Analyzer"\npath = "{hp}"\n'
+                   '[devices.s]\ndriver = "insthub.sim:SimScope"\n')         # (insthub's own has no say)
+    assert extensions.python_for(lab) == str(hp / ".venv" / "bin" / "python")  # its extension's, not the one by it
+    assert extensions.device_python({"driver": "hpdrv:Analyzer", "path": "hp"}, tmp_path) == \
+        str(hp / ".venv" / "bin" / "python")
+    assert extensions.device_python({"driver": "insthub.sim:SimScope"}, tmp_path) is None  # installed: no folder
+    assert extensions.device_python({"driver": "insthub.sim:SimScope", "path": str(extensions.OWN.parent)},
+                                    None) is None                        # insthub's own: any Python with insthub
+    other = extension(tmp_path / "other", HP.replace("hp8562a", "other"))
+    lab.write_text(f'[devices.a]\ndriver = "hpdrv:Analyzer"\npath = "{hp}"\n'
+                   f'[devices.b]\ndriver = "hpdrv:Analyzer"\npath = "{other}"\n')
+    assert extensions.python_for(lab) == str(venv)                       # they disagree: the one next to it
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="Unix permissions")
+def test_a_python_that_other_users_may_change_is_not_run(tmp_path, monkeypatch):
+    """The folder above an extension may be anyone's (/tmp): a virtualenv another user put there is not
+    run, nor one that another user may change, as for its manifest."""
+    shared = tmp_path / "shared"
+    folder = extension(shared / "mine", python=False)
+    folder.chmod(0o755)
+    (folder / extensions.MANIFEST).chmod(0o644)
+    planted = shared / ".venv" / "bin" / "python"
+    planted.parent.mkdir(parents=True)
+    planted.write_text("#!/bin/sh\n")
+    for path, mode in ((shared / ".venv", 0o755), (planted.parent, 0o755), (planted, 0o755), (shared, 0o1777)):
+        path.chmod(mode)
+    manifest = folder / extensions.MANIFEST
+    try:
+        ext = extensions.load(manifest)
+        assert ext.python is None and (f"its Python, {planted}: every user may change {shared} (chmod o-w {shared}); "
+                                       "insthub runs no Python that another user may change") in ext.error
+        with pytest.raises(ValueError, match="cannot be used"):
+            extensions.launch(ext, "analyzer", "sa", "tcp://labpc:8700")
+        assert any("every user may change" in p for p in extensions.check(folder, import_=True))  # nor imports
+        assert extensions.venv_python(folder) is None                    # nor serves a server file with it
+        assert extensions.python_for(folder / "lab.toml") == sys.executable
+        shared.chmod(0o755)                                              # the folder above is yours alone: it is
+        assert extensions.load(manifest).python == str(planted)
+        planted.parent.chmod(0o777)                                      # but not if anyone may change it inside
+        assert f"every user may change {planted.parent}" in extensions.load(manifest).error
+        planted.parent.chmod(0o755)
+        planted.chmod(0o775)
+        with monkeypatch.context() as m:
+            m.setattr(extensions, "_shared_group", lambda gid: "lab")    # a group with others in it
+            assert f"the users of group lab may change {planted} (chmod g-w {planted})" in \
+                extensions.load(manifest).error
+        planted.unlink()
+        planted.symlink_to(sys.executable)                               # a link, as in a virtualenv: only its owner
+        assert extensions.load(manifest).usable                          # may change it, whatever its mode says
+        declared = extension(tmp_path / "declared", HP.replace("api = 1", f'api = 1\npython = "{planted}"'),
+                             python=False)                               # named in a manifest: the same holds
+        assert extensions.load(declared / extensions.MANIFEST).python == str(planted)
+        shared.chmod(0o1777)
+        assert f"every user may change {shared}" in extensions.load(declared / extensions.MANIFEST).error
+        uid = os.getuid()
+        if uid != 0:
+            shared.chmod(0o755)
+            with monkeypatch.context() as m:
+                real = os.lstat
+
+                def lstat(path, *a, **k):  # as if another user had made the link
+                    st = real(path, *a, **k)
+                    return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, uid + 1, *st[5:])) \
+                        if Path(path) == planted else st
+
+                m.setattr(extensions.os, "lstat", lstat)
+                assert f"{planted} belongs to another user" in extensions.load(manifest).error
+    finally:
+        shared.chmod(0o755)
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid") or os.getuid() == 0, reason="Unix permissions (root writes anything)")
+def test_a_list_of_extensions_that_cannot_be_changed_says_so(home, tmp_path, capsys):
+    hp = extension(tmp_path / "hp")
+    extensions.add_folder(hp)
+    listed = extensions.user_file()
+    listed.chmod(0o444)
+    other = extension(tmp_path / "other", HP.replace("hp8562a", "other"))
+    try:
+        with pytest.raises(ValueError, match=f"^{listed}: "):           # what add_folder promises, not an OSError
+            extensions.add_folder(other)
+        with pytest.raises(ValueError, match=f"^{listed}: "):
+            extensions.remove_folder(hp)
+        assert cli.main(["ext", "add", str(other)]) == 1                 # said, without a traceback
+        assert capsys.readouterr().err.startswith(f"error: {listed}: ")
+        assert extensions.listed_folders() == [str(hp)]
+    finally:
+        listed.chmod(0o644)
+
+
+def test_check_import_loads_what_the_uis_name_and_what_the_classes_say(tmp_path):
+    text = HP.replace("api = 1", f'api = 1\npython = "{sys.executable}"')
+    folder = extension(tmp_path / "ui", text + textwrap.dedent(
+        """
+        [ui.broken]
+        panel = "hpdrv_ui:nope"
+
+        [ui.gone]
+        run = ["-m", "no_such_module_here", "--name", "{device}"]
+
+        [ui.script]
+        run = ["app.py"]
+        """), hpdrv="""\
+        import insthub
+
+        EXTENSION, VERSION = "hp8562b", "0.2"  # names, not literals: only importing tells what they are
+
+        class Analyzer(insthub.Device):
+            extension = EXTENSION
+            extension_version = VERSION
+        """, hpdrv_ui=HP_UI)
+    manifest = folder / extensions.MANIFEST
+    assert extensions.check(folder) == []                                # without importing, nothing runs
+    with pytest.warns(ConfigWarning, match=r"hpdrv:Analyzer says extension_version = \"0.2\", but the manifest's "
+                                           r"version is \"0.3\""):
+        problems = extensions.check(folder, import_=True)
+    said = ("hpdrv:Analyzer says extension = \"hp8562b\", but the manifest's id is \"hp8562a\": its devices would "
+            "announce an extension that has no UI here")
+    assert problems == [
+        f"{manifest}: [devices.analyzer] {said}", f"{manifest}: [devices.analyzer-sim] {said}",
+        (f"{manifest}: [ui.broken] cannot load the panel hpdrv_ui:nope with {sys.executable}: AttributeError: "
+         "module 'hpdrv_ui' has no attribute 'nope'"),
+        (f"{manifest}: [ui.gone] cannot find the module no_such_module_here with {sys.executable}: "
+         "ModuleNotFoundError: No module named 'no_such_module_here'")]  # (the panel and -m hpdrv_ui load: fine)
+    registered("here", {"sa": [str(folder)]})                            # a device of it: why it has no UI
+    ext, uis, why = extensions.device_uis({"name": "sa", "type": "Analyzer", "extension": "hp8562b"},
+                                          "ipc:///nowhere.sock")
+    assert (ext, uis) == (None, []) and why == (
+        f"it announces extension hp8562b, but the manifest of its folder, {manifest}, has id hp8562a: is the "
+        "`extension` of its class out of date? (insthub check FOLDER --import)")  # not "insthub ext add"
+    assert extensions.named({"extension": "hp8562b"}) == "hp8562b"
+    assert extensions.named({"extension": ""}) is extensions.named({"extension": ["x"]}) is extensions.named({}) \
+        is None

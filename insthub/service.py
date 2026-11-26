@@ -11,10 +11,11 @@ Nothing here needs root.
 There is one convention for every server, whatever instrument it drives:
 
     unit        ~/.config/systemd/user/insthub-NAME.service
-    command     the Python interpreter that ran `insthub service install` (or
-                --python), so the server runs in that environment (the
-                virtualenv with the driver's dependencies), on a .toml config
-                or a .py script
+    command     a Python interpreter on a .toml config or a .py script: the one
+                the server file needs (extensions.python_for: its devices'
+                extensions', else a virtualenv next to it or its drivers, else
+                the one that ran `insthub service install`), or --python, so
+                the server runs in the environment with the drivers' packages
 
 Before writing the unit, `install` makes sure that Python can import insthub
 and, for a config, every driver it names, and that each device's keys fit its
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -67,6 +69,40 @@ def command_for(target: str | Path, python: str | None = None) -> list[str]:
     if target.suffix == ".py":
         return [python, str(target)]
     raise BusError(f"{target.name}: expected a .toml config (for `insthub serve`) or a .py server script")
+
+
+def served(argv: list[str]) -> str | None:
+    """What a server's command line runs (command_for's `target`, read back): the config after
+    `insthub serve` (or `python -m insthub serve`), else the script a Python runs ("python
+    my_server.py settings.toml": the .py)."""
+    args = argv[1:]
+    if "serve" in args:
+        before = [os.path.basename(a) for a in [argv[0], *args[:args.index("serve")]]]
+        if "insthub" in before or "insthub.exe" in before:  # the command, `python -m insthub` or its script
+            return next((a for a in args[args.index("serve") + 1:] if a.endswith(".toml")), None)
+    if argv and os.path.basename(argv[0]).startswith("python"):
+        while args and args[0].startswith("-") and args[0] not in ("-m", "-c"):
+            args = args[2:] if args[0] in ("-X", "-W", "--check-hash-based-pycs") else args[1:]  # its options
+        if args and args[0].endswith(".py"):
+            return args[0]
+    return None
+
+
+def command_of(unit: dict) -> list[str]:
+    """The command line of an installed service (units()' "command": its ExecStart=, as command_for
+    made it); [] if it cannot be read."""
+    try:
+        return shlex.split(unit.get("command") or "")
+    except ValueError:
+        return []
+
+
+def target(unit: dict) -> Path | None:
+    """The .toml config or .py script that an installed service serves (units()' entry), if it is
+    there."""
+    arg = served(command_of(unit))
+    path = Path(arg) if arg else None
+    return path if path is not None and path.is_file() else None
 
 
 def tool_environment(prefix: str | None = None) -> str | None:
@@ -210,12 +246,16 @@ def install(target: str | Path, name: str | None = None, start: bool = True, pyt
             login: bool | None = None, wait: float | None = None) -> Path:
     """Register the server of `target` as the service insthub-NAME and start it (and wait for
     it, as start() does).  Installing again under the same name replaces the old definition.
-    `python`: the interpreter the service runs (default: this one).
+    `python`: the interpreter the service runs (default: the one the file needs, as `insthub
+    check --import` checks it: extensions.python_for, which is this one unless the file's
+    devices' extensions or a virtualenv next to it or its drivers say another).
     `login`: start it at every login (default: as `start`); False: only when started by hand."""
+    from .extensions import python_for  # (here: the extensions are only looked for when installing)
+
     target = Path(target).expanduser().resolve()
     name = name or target.stem
     if python is None:
-        python = sys.executable
+        python = python_for(target)
     else:
         found = shutil.which(python)
         if found is None:

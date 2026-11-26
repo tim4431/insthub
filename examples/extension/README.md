@@ -16,9 +16,9 @@ says how to use one.
 | `insthub-extension.toml` | the *manifest*: what the folder adds to insthub, as data | the extension's `id`, the device the window's **New server** dialog offers, the two UIs |
 | `demolaser.py` | the driver: plain Python, with no insthub and no Qt | a module name of its own (`demolaser`), so it may stay at the top of the folder |
 | `demolaser_insthub/device.py` | `Laser`, the driver wrapped for the bus | which extension it belongs to (`extension`, the manifest's `id`) and its version; that it is simulated; units and limits (`set_meta`), and choices from the driver's `Literal` annotation; `get_X`/`set_X` pairs as settings (`accessors`); values read every second (`poll`); what is dangerous; the raw protocol kept off the bus (`exclude`) |
-| `demolaser_insthub/ui/panel.py` | the panel: `make(device, parent=None)` returns its widget, and insthub puts it in a window | a slider sent through `qt.coalesce`, live values through `qt.watch`, the rest as insthub's ready-made `Controls` |
+| `demolaser_insthub/ui/panel.py` | the panel: `make(device, parent=None)` returns its widget, and insthub puts it in a window | a slider sent and shown through `qt.follow`, live values through `qt.watch`, the rest as insthub's ready-made `Controls` |
 | `demolaser_insthub/ui/__main__.py` | the app: a whole program, `python -m demolaser_insthub.ui --address ADDRESS --name NAME` | given an address, it only attaches; without one, it hosts a laser itself when none runs |
-| `laser.toml` | a server for the laser, as **New server** writes one | `path`, the folder the device's modules are in, and its constructor's arguments |
+| `laser.toml` | a server for the laser, as **New server** writes one | `path`, the folder the device's modules are in; `extension`, the manifest's `id`; and its constructor's arguments |
 
 The modules with generic names (`device`, `ui`) are inside a package named
 after the extension, `demolaser_insthub`: Python keeps one module of a name
@@ -47,8 +47,9 @@ insthub open laser panel                     # the panel, in a window of its own
 insthub open laser app                       # the app
 ```
 
-In the window (`insthub gui`), the laser's tile is marked SIM, its page has
-**Open Laser panel** and **Open Laser app**, and **Add → New server...** offers
+In the window (`insthub gui`), the laser's tile is marked SIM, its page's
+**Open** button offers **Laser panel** and **Laser app** (so does a right-click
+on its tile), and **Add → New server...** offers
 "Demo laser: a simulated diode laser, no hardware needed". `insthub ext remove .`
 takes the extension off your list again.
 
@@ -60,8 +61,10 @@ counts from there), so the server runs from any folder, as a service does.
 1. Choose an `id` for your extension, and give your modules names of their
    own: rename `demolaser.py` and `demolaser_insthub/`, and update the names
    in the manifest, in `laser.toml` and in the imports. Put the `id` in the
-   manifest and in `EXTENSION` in `demolaser_insthub/__init__.py`: the device
-   announces it, and the app attaches only to a device that does.
+   manifest, in `laser.toml` and in `EXTENSION` in
+   `demolaser_insthub/__init__.py`: the device announces it, and the app
+   attaches only to a device that does. `insthub check . --import` says when
+   the class and the manifest disagree.
 2. Put your driver in place of `demolaser.py`. Keep insthub and Qt out of
    it, and import its vendor library in its constructor (or guard the import),
    so that it imports cleanly where that library is missing.
@@ -71,7 +74,9 @@ counts from there), so the server runs from any folder, as a service does.
 4. Keep the panel, the app, both or neither, and remove the `[ui.*]` table of
    what you drop. A device without a UI of its own still gets the window's
    device page, which is made from what it says about itself.
-5. Run `insthub check . --import` again.
+5. Run `insthub check . --import` again. It imports the driver and the
+   UIs' modules in the extension's Python, so it also finds a name in the
+   manifest that a rename left behind.
 
 A packaged extension keeps its UI's libraries in an extra, so that a server's
 environment installs only the server half: `dependencies = ["insthub @

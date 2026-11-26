@@ -10,6 +10,10 @@ import pytest
 import insthub
 from insthub import registry, sim
 
+# Before any test module imports Qt (this file is read first): no window on a real screen, and none needed
+# (a test module run alone, without a display, would abort the run).
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 
 @pytest.fixture(autouse=True)
 def _isolated_bus(tmp_path_factory, monkeypatch):

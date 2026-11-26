@@ -13,6 +13,7 @@ by reference), on this machine (Unix socket) or on another one (TCP).
 from __future__ import annotations
 
 import collections
+import functools
 import logging
 import os
 import sys
@@ -916,27 +917,40 @@ def locate(name: str) -> str:
     """Address of the server hosting the device `name`: this process first, then
     the servers running on this machine, then the static table (registry.py), then
     the servers on other computers that the static table names (asked which devices
-    they have: see discover)."""
-    for srv in _server.local_servers():
-        if name in srv._devices:
-            return f"inproc://{srv.name}"
-    entries = registry.find(name)
-    if len(entries) > 1:
+    they have: see discover), as _place() says."""
+    return _place(name, discover(), registry.static_devices,
+                  lambda: [e for e in _remote_servers(fresh=_REMOTE_FRESH) if not e.get("error")])
+
+
+def _place(name: str, here: list[dict], static, remote) -> str:
+    """Where the device `name` is, by the one rule that locate(), states() and the agents'
+    list_devices follow: in this process (the first server there that has it); else on this
+    computer (`here`: discover()'s entries without `remote`), if one server has it; else where
+    the static table says (`static()`: devices.toml's [devices]); else on another computer
+    (`remote()`: discover(remote=True)'s entries of the servers elsewhere that answered), if one
+    server has it.  `static` and `remote` are called only if the device is not here.  Raises
+    DeviceNotFound if two servers here, or two elsewhere, have one (ambiguous), or none does, and
+    BusError if devices.toml cannot be read."""
+    hosts = [e for e in here if name in e.get("devices", ())]
+    inproc = next((e["address"] for e in hosts if e["address"].startswith("inproc://")), None)
+    if inproc is not None:
+        return inproc
+    if len(hosts) > 1:
         raise DeviceNotFound(f"device name {name!r} is ambiguous: servers "
-                             f"{[e['server'] for e in entries]} all have one; pass address=")
-    if entries:
-        return _nearest(entries[0]["addresses"])
-    static = registry.static_devices()
-    if name in static:
-        return static[name]
-    remote = [e for e in _remote_servers(fresh=_REMOTE_FRESH) if not e.get("error")]
-    hosts = [e for e in remote if name in e.get("devices", ())]
+                             f"{[e['server'] for e in hosts]} all have one; pass address=")
+    if hosts:
+        return hosts[0]["address"]
+    table = static()
+    if name in table:
+        return table[name]
+    elsewhere = remote()
+    hosts = [e for e in elsewhere if name in e.get("devices", ())]
     if len(hosts) > 1:
         raise DeviceNotFound(f"device name {name!r} is ambiguous: servers on other computers "
                              f"{[e['address'] for e in hosts]} all have one; pass address=")
     if hosts:
         return hosts[0]["address"]
-    known = sorted({d for s in [*registry.servers(), *remote] for d in s.get("devices", ())} | set(static))
+    known = sorted({d for s in [*here, *elsewhere] for d in s.get("devices", ())} | set(table))
     raise DeviceNotFound(f"no device {name!r} on the bus (known devices: {', '.join(known) or 'none'}; "
                          "is its server running?)")
 
@@ -1038,11 +1052,11 @@ def states(names=None, timeout: float = 2.0, address: str | None = None) -> dict
     """What each device on the bus is like now, for saving next to a data file: {device: {"server",
     "type", "extension", "connected", "state": its state dict, "time": when it was read}}, from
     every server discover(remote=True) finds, all asked at once.  `names`: only these devices.
-    Each is read where locate() finds it, so it is the device that device(name) gives; a name that
-    locate() cannot place (two servers have it, it is nowhere, or devices.toml cannot be read)
-    gets {"error"}.  A device whose server does not answer within `timeout` seconds gets
-    {"server", "error"} instead.  With `address`: the devices of the server there only (BusError
-    if it does not answer)."""
+    Each is read where locate() finds it (_place, from what that discover() found), so it is the
+    device that device(name) gives; a name that cannot be placed (two servers have it, it is
+    nowhere, or devices.toml cannot be read) gets {"error"}.  A device whose server does not
+    answer within `timeout` seconds gets {"server", "error"} instead.  With `address`: the
+    devices of the server there only (BusError if it does not answer)."""
     end = time.monotonic() + timeout
     wanted = [names] if isinstance(names, str) else None if names is None else list(names)
     found, where, unanswered = {}, {}, {}
@@ -1054,9 +1068,12 @@ def states(names=None, timeout: float = 2.0, address: str | None = None) -> dict
     else:
         entries = discover(remote=True)
         unanswered = {e["address"]: e["error"] for e in entries if e.get("error") and e["address"]}
+        here = [e for e in entries if not e.get("remote")]
+        elsewhere = [e for e in entries if e.get("remote") and not e.get("error")]
+        static = functools.cache(registry.static_devices)  # (read once, and only for a device not here)
         for name in sorted({n for e in entries for n in e.get("devices", ())}) if wanted is None else wanted:
             try:
-                where.setdefault(locate(name), []).append(name)
+                where.setdefault(_place(name, here, static, lambda: elsewhere), []).append(name)
             except BusError as e:
                 found[name] = {"error": str(e)}
     asked = []
