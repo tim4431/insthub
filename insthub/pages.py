@@ -41,6 +41,7 @@ from .inventory import (
     BUSY,
     GOOD,
     PAUSED,
+    STALE,
     Server,
     ago,
     clock,
@@ -58,7 +59,6 @@ if TYPE_CHECKING:
     from .manager import Manager
 
 Qt = QtCore.Qt
-STALE = 10.0  #: seconds without a new frame after which a preview is drawn faded
 PAUSE_TIP = ("Close the instrument session and refuse every command, property and periodic task until Resume, "
              "e.g. while you use the instrument by hand or with the vendor's software")
 RESUME_TIP = "End the pause: its commands run again, and it reconnects if it was connected before"
@@ -836,8 +836,8 @@ class DevicePage(_Page):
                 "The next command or periodic task opens it again; stop the periodic tasks to keep it closed.",
             slot=lambda: window.device_action(self.server, self.name, "$release"))
         self.pause = ui.button("Pause", "pause", slot=self._pause_or_resume)
-        self.live = ui.button("Live view", "live", kind="primary", tip="Live plots of its streams, in a window of "
-                              "their own", slot=lambda: window.live_view(self.server, self.name))
+        self.live = ui.button("Live view", "live", tip="Live plots of its streams, in a window of their own",
+                              slot=lambda: window.live_view(self.server, self.name))
         self.more = ui.button("", "more", kind="ghost", tip="More")
         self.more.setFixedWidth(38)
         menu = QtWidgets.QMenu(self.more)
@@ -866,6 +866,10 @@ class DevicePage(_Page):
         self.watchers = self.facts.row("Watched by")
         self.preview_box, inside = ui.card(margins=(12, 12, 12, 10), spacing=6)
         self.preview = ui.PreviewView()
+        self.preview.setToolTip("Right-click to choose the stream it shows")
+        self.preview_box.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.preview_box.customContextMenuRequested.connect(
+            lambda pos: window.preview_menu(self.server, self.name, self.preview_box.mapToGlobal(pos)))
         self.preview_caption = ui.label("", "small")
         inside.addWidget(self.preview, 1)
         inside.addWidget(self.preview_caption)
@@ -1003,13 +1007,11 @@ class DevicePage(_Page):
         live_ok, why = self.window.can_view(s, d)
         self.live.setEnabled(reachable and live_ok)
         self.live.setToolTip("Live plots of its streams, in a window of their own" if live_ok else why)
-        for button, primary, icon in ((self.pause, paused, "start" if paused else "pause"),
-                                      (self.live, not paused, "live")):  # what to do now stands out
-            if button.property("kind") != ("primary" if primary else None):
-                button.setProperty("kind", "primary" if primary else None)
-                button.style().unpolish(button)
-                button.style().polish(button)
-            button.setIcon(ui.icon(icon, "on_accent" if primary else None))
+        if self.pause.property("kind") != ("primary" if paused else None):  # a paused device stands out: Resume
+            self.pause.setProperty("kind", "primary" if paused else None)
+            self.pause.style().unpolish(self.pause)
+            self.pause.style().polish(self.pause)
+        self.pause.setIcon(ui.icon("start" if paused else "pause", "on_accent" if paused else None))
         self.edit_file.setVisible(editable)
         if editable:
             self.edit_file.setText(f"Edit in {config.name}...")

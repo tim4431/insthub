@@ -359,7 +359,24 @@ def test_previews_show_the_last_frame_without_subscribing(window, monkeypatch):
         window.open_device("local:t", "scope")
         assert spin(3, lambda: not window.device_page.preview_box.isHidden())
         assert "float32[1000]" in window.device_page.preview_caption.text()
+        s, page = window.servers["local:t"], window.device_page
+        ch2 = server.device("scope").subscribe("ch2")
+        assert spin(5, lambda: s.device("scope")["streams"]["ch2"]["time"] is not None)
+        menu = qt.QtWidgets.QMenu()
+        window.add_preview_choices(menu, s, "scope")                        # what a right-click on it offers
+        choices = {a.text().partition("\t")[0]: a for a in menu.actions() if a.text()}
+        assert list(choices) == ["Automatic", "ch1", "ch2"] and choices["Automatic"].isChecked()
+        choices["ch2"].trigger()
+        assert spin(3, lambda: page.preview_caption.text().startswith("ch2"))
+        assert window.preview_choice("scope") == "ch2"                      # remembered, for its tile too
         window.show_page("devices")
+        assert spin(3, lambda: tile("scope").view.preview.stream == "ch2")
+        window.choose_preview(s, "scope", None)                             # automatic: both are live, so
+        spin(0.5)
+        assert tile("scope").view.preview.stream == "ch2"                   # it keeps the one it shows ...
+        monkeypatch.setattr(inventory, "STALE", 0.5)
+        ch2.close()
+        assert spin(3, lambda: tile("scope").view.preview.stream == "ch1")  # ... until it is not live
         monkeypatch.setattr(pages, "STALE", 0.3)
         scope.close()
         assert spin(5, lambda: tile("scope").view.stale)        # no new frames: drawn faded
@@ -367,6 +384,20 @@ def test_previews_show_the_last_frame_without_subscribing(window, monkeypatch):
         window.settings.setValue("previews", False)
         assert spin(3, lambda: kind("scope") is None and tile("scope").view.figures)
         camera.close()
+
+
+def test_preview_stream_prefers_the_chosen_one_then_a_live_one():
+    d = {"streams": {"state": {"time": 99}, "a": {"time": 1}, "b": {"time": None}, "c": {"time": 98},
+                     "d": {"time": 97}}}
+    pick = lambda chosen=None, current=None: inventory.preview_stream(d, chosen, current, now=100.0)
+    assert pick() == "c"                                            # a is not live, c and d are: the first
+    assert pick(current="d") == "d" and pick(current="a") == "c"    # the one shown is kept while it is live
+    assert pick("a") == "a"                                         # chosen: even when it is not live
+    assert pick("b") == "c" and pick("gone") == "c" and pick("state") == "c"  # nothing yet, none, not one
+    stale = {"streams": {n: dict(st, time=st["time"] and 1) for n, st in d["streams"].items()}}
+    assert inventory.preview_stream(stale, now=100.0) == "a"        # none live: the first that published
+    assert inventory.preview_stream(stale, current="d", now=100.0) == "d"
+    assert inventory.preview_stream({"streams": {"b": {"time": None}}}) is None
 
 
 def test_shrink_makes_frames_small():

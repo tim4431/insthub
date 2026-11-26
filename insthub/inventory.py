@@ -42,6 +42,7 @@ ACTION_TIMEOUT = 120.0
 PREVIEW_POINTS = 160  #: a trace preview keeps the lowest and highest value of this many slices
 PREVIEW_PIXELS = 160  #: the long side of an image preview
 PREVIEW_LIMIT = 4_000_000  #: elements; a larger frame gets no preview (over TCP: an eighth of it)
+STALE = 10.0  #: seconds without a new frame after which a stream is not live (its preview drawn faded)
 GOOD, BUSY, BAD, IDLE, PAUSED = "good", "busy", "bad", "idle", "paused"  #: statuses (widgets.STATUS: colours)
 
 
@@ -431,9 +432,23 @@ def elements(kind: str | None) -> int:
         return 0
 
 
-def preview_stream(d: dict) -> str | None:
-    """The stream a tile shows: the first one (but "state") that has published something."""
-    return next((n for n, st in d["streams"].items() if n != "state" and st["time"] is not None), None)
+def preview_stream(d: dict, chosen: str | None = None, current: str | None = None,
+                   now: float | None = None) -> str | None:
+    """The stream a tile shows: `chosen` (picked with a right-click on a preview) once it has published
+    something; else one (but "state") that is live: `current` (the one shown) while it is, so that two
+    live streams do not take turns, else the first; else, when none is, `current` or the first that has
+    published something."""
+    now = time.time() if now is None else now
+    published = [n for n, st in d["streams"].items() if n != "state" and st["time"] is not None]
+    if chosen in published:
+        return chosen
+    live = [n for n in published if now - d["streams"][n]["time"] <= STALE]
+    for streams in (live, published):
+        if current in streams:
+            return current
+        if streams:
+            return streams[0]
+    return None
 
 
 # ---------------------------------------------------------------- the model
