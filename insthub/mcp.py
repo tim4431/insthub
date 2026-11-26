@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import functools
 import io
 import json
 import logging
@@ -41,9 +42,9 @@ from pathlib import Path
 
 import numpy as np
 
-from . import __version__, client
-from .device import busy_with
-from .errors import DevicePaused, RemoteError
+from . import __version__, client, registry
+from .device import ABOUT, busy_with
+from .errors import BusError, DevicePaused, RemoteError
 from .render import Renderer
 
 _log = logging.getLogger("insthub.mcp")
@@ -252,19 +253,30 @@ class Tools:
 
         with ThreadPoolExecutor(max(1, min(8, len(targets)))) as pool:
             results = list(pool.map(fetch, targets))
-        devices, owner = {}, {}
+        places: dict[str, list] = {}  # device name -> (server, address, its describe()) of each that has one
         for (server, address), described in zip(targets, results):
             if isinstance(described, Exception):
                 notes.append(f"{address}: unreachable ({_error_text(described)})")
                 continue
-            for name, d in sorted(described.items()):
-                if name in owner:
-                    if owner[name] != server:
-                        notes.append(f"device name {name!r} is on servers {owner[name]!r} and {server!r}; "
-                                     "only the first is listed")
-                    continue
-                owner[name] = server
-                devices[name] = _brief(server, d)
+            for name, d in described.items():
+                places.setdefault(name, []).append((server, address, d))
+        # Each is listed where the other tools find it (client._place, as locate does), or not at all
+        here = [s for s in servers if not s.get("remote")]
+        elsewhere = [s for s in servers if s.get("remote") and not s.get("error")]
+        static = functools.cache(registry.static_devices)
+        devices = {}
+        for name, found in sorted(places.items()):
+            try:
+                address = client._place(name, here, static, lambda: elsewhere)
+            except BusError as e:  # two servers have one: the tools refuse it as well
+                notes.append(_error_text(e))
+                continue
+            chosen = next((f for f in found if f[1] == address), None)
+            if chosen is None:
+                notes.append(f"device {name!r} is looked for at {address}, so the one on "
+                             f"{', '.join(repr(f[0]) for f in found)} is not listed")
+                continue
+            devices[name] = _brief(chosen[0], chosen[2])
         if not servers:
             notes.append("no insthub server is running on this computer, and none is listed in devices.toml")
         out = {"devices": devices}
@@ -384,7 +396,7 @@ def _danger(described: dict, command: str, args: list) -> str | None:
 def _about(d: dict) -> dict:
     """What a device says it is, for agents: its description and address (which of several of a
     kind it is), its extension, and whether it is a simulator."""
-    return {k: d[k] for k in ("description", "address", "extension", "extension_version", "simulated") if d.get(k)}
+    return {k: d[k] for k in (*ABOUT, "simulated") if d.get(k)}
 
 
 def _brief(server: str, d: dict) -> dict:

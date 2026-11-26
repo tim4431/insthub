@@ -8,7 +8,8 @@ scanning those files.  The directory is private to the user (mode 0700), which
 is also what protects the Unix sockets.
 
 Devices on other machines are listed by hand in a small TOML file
-(`$INSTHUB_DEVICES`, default `~/.config/insthub/devices.toml`), and so are
+(`$INSTHUB_DEVICES`, default `~/.config/insthub/devices.toml`, or in
+$XDG_CONFIG_HOME if set: see config_dir), and so are
 servers there whose devices are found by asking them:
 
     [devices]
@@ -163,10 +164,16 @@ def find(device: str) -> list[dict]:
     return [s for s in servers() if device in s.get("devices", ())]
 
 
+def config_dir() -> Path:
+    """insthub's folder of your settings: insthub in XDG_CONFIG_HOME, which is ~/.config unless set
+    (devices.toml, extensions.toml, the configs of the servers the window makes)."""
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "insthub"
+
+
 def devices_file() -> Path:
     """The hand-written table of devices on other machines."""
     path = os.environ.get("INSTHUB_DEVICES")
-    return Path(path) if path else Path.home() / ".config" / "insthub" / "devices.toml"
+    return Path(path) if path else config_dir() / "devices.toml"
 
 
 def _devices_table(name: str) -> dict[str, str]:

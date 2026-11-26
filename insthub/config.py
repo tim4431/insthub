@@ -553,14 +553,24 @@ def _checked(path: str | Path, advise: bool = False) -> tuple[dict, list[tuple[s
     return server, _tables(_counted_from(config.get("devices", {}), path.resolve().parent), advise, problems)
 
 
-def _counted_from(devices, folder: Path):
-    """The [devices] tables of a file in `folder`, with each relative `path` counted from there: a
+def device_folder(spec, base: str | Path | None) -> Path | None:
+    """The folder a [devices.NAME] table (`spec`) names as its `path`, the one rule for it: a
+    relative one counts from `base`, the folder of the server file (where the server runs), so a
     server file means the same wherever `insthub serve` runs, as it does to a service and to the
-    window (which run it in that folder) and to `insthub check` (extensions._device_folders)."""
+    window (which run it in that folder), to `insthub check` and to the New server dialog.  None
+    if it names none (no `path`, or not text, or empty)."""
+    path = spec.get("path") if isinstance(spec, dict) else None
+    if not isinstance(path, str) or not path.strip():
+        return None
+    return (Path(base or ".") / Path(path).expanduser()).resolve()
+
+
+def _counted_from(devices, folder: Path):
+    """The [devices] tables of a file in `folder`, with each relative `path` counted from there
+    (device_folder)."""
     if not isinstance(devices, dict):
         return devices
-    return {name: {**spec, "path": str((folder / Path(spec["path"]).expanduser()).resolve())}
-            if isinstance(spec, dict) and isinstance(spec.get("path"), str) and spec["path"].strip() else spec
+    return {name: {**spec, "path": str(found)} if (found := device_folder(spec, folder)) is not None else spec
             for name, spec in devices.items()}
 
 

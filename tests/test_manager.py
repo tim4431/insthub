@@ -8,11 +8,11 @@ import subprocess
 import sys
 import time
 import tomllib
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("insthub.qt", exc_type=ImportError)  # needs a Qt binding
 
 import insthub  # noqa: E402
@@ -832,6 +832,120 @@ def test_a_device_opens_the_uis_of_its_extension(window, monkeypatch):
     assert "insthub.sim_ui" not in sys.modules
 
 
+def test_a_device_with_several_uis_opens_them_from_one_button(window, monkeypatch, tmp_path):
+    """One Open button with a menu of them, kept at its full size: a button for each crowded the header."""
+    folder = tmp_path / "two"
+    folder.mkdir()
+    (folder / "insthub-extension.toml").write_text(
+        f'[extension]\nid = "two"\ntitle = "Two"\npython = "{sys.executable}"\n\n[ui.panel]\ntitle = "Laser panel"\n'
+        'panel = "twouis:make"\n\n[ui.app]\ntitle = "Laser app"\nrun = ["-c", "pass"]\n')
+    (folder / "twouis.py").write_text("import insthub\n\nclass Box(insthub.Device):\n    extension = 'two'\n")
+    box = config.load_object("twouis:Box", str(folder))
+    opened = []
+    monkeypatch.setattr(window, "open_ui", lambda s, name, ext, u: opened.append((name, u.name)))
+    window.show()
+    try:
+        with insthub.Server("t", [box("laser")]):
+            assert spin(5, lambda: "local:t" in window.servers and window.servers["local:t"].device("laser"))
+            window.open_device("local:t", "laser")
+            page = window.device_page
+            assert spin(5, lambda: page.ui_buttons.count() == 1)
+            button = page.ui_buttons.itemAt(0).widget()
+            assert button.text() == "Open" and [a.text() for a in button.menu().actions()] == ["Laser panel",
+                                                                                                "Laser app"]
+            assert "Laser panel, Laser app" in button.toolTip() and sys.executable in button.toolTip()
+            button.menu().actions()[1].trigger()
+            assert opened == [("laser", "app")]
+            assert menu_of(window, monkeypatch, "local:t", "laser")[2:4] == ["Open Laser panel", "Open Laser app"]
+            spin(0.3)                                                    # at the window's own size, all in full
+            shown = [page.connect_now, page.release, page.pause, page.live, button]
+            assert not page.header.actions_below and all(b.width() >= b.sizeHint().width() for b in shown)
+            window.resize(window.minimumWidth(), window.height())        # the narrowest: they go below the name
+            assert spin(3, lambda: page.header.actions_below) and spin(1, lambda: button.width() >=
+                                                                          button.sizeHint().width())
+    finally:
+        window.hide()
+
+
+def test_where_a_server_s_log_is_read(window, monkeypatch, tmp_path):
+    """Its service's journal, else the output of a server this window started, else what it keeps itself."""
+    monkeypatch.setattr(service, "units", lambda: [{"name": "lab", "state": "active", "sub": "running",
+                                                    "pid": os.getpid(), "enabled": True, "unit": "u",
+                                                    "command": "python -m insthub serve lab.toml"}])
+    monkeypatch.setattr(service, "journal", lambda name, lines=200: f"the journal of {name}")
+    with insthub.Server("t", [sim.Loopback()], tcp=0):                     # (it stands in for the service's)
+        assert spin(5, lambda: "local:t" in window.servers and window.servers["local:t"].service)
+        s = window.servers["local:t"]
+        assert inventory.server_python(s) == Path(sys.executable)          # as its registry file says
+        window.show_logs(s)
+        dialog = window._logs["lab"]
+        assert dialog.windowTitle() == "insthub-lab: log"
+        assert spin(5, lambda: dialog.text.toPlainText() == "the journal of lab")
+        dialog.hide()
+    monkeypatch.setattr(service, "units", list)
+    cfg = tmp_path / "outp.toml"
+    cfg.write_text('[devices.echo]\ndriver = "insthub.sim:Loopback"\n')
+    window.start_server([sys.executable, "-m", "insthub", "serve", str(cfg)], "outp", cwd=tmp_path)
+    try:
+        assert spin(15, lambda: "local:outp" in window.servers and word(window, "server", "local:outp") == "running")
+        window.show_logs(window.servers["local:outp"])
+        dialog = window._logs[str(inventory.server_log("outp"))]
+        assert dialog.windowTitle() == "outp: output"
+        assert spin(5, lambda: f"serve {cfg}" in dialog.text.toPlainText())  # (the line that says what ran)
+        dialog.hide()
+    finally:
+        for proc in window._spawned:
+            proc.process.terminate()
+            proc.process.wait(10)
+
+
+def test_what_a_device_says_of_its_extension_is_shown_as_text(window):
+    class Odd(insthub.Device):
+        extension = "<b>x</b>"                                          # (it came over the network)
+        extension_version = "<i>1</i>"
+
+    with insthub.Server("t", [Odd("odd")]):
+        assert spin(5, lambda: "local:t" in window.servers and window.servers["local:t"].device("odd"))
+        window.open_device("local:t", "odd")
+        page = window.device_page
+        assert spin(5, lambda: "not installed" in page.extension.text())
+        version, hint = page.extension.text().split("<br>")
+        assert version == "&lt;b&gt;x&lt;/b&gt; &lt;i&gt;1&lt;/i&gt;"
+        assert "extension &lt;b&gt;x&lt;/b&gt; is not installed" in hint and "<b>x" not in hint
+
+
+def test_a_program_that_ends_between_two_looks_is_still_reported(window, monkeypatch, tmp_path):
+    said = []
+    monkeypatch.setattr(window, "say", lambda text, ms=5000: said.append(text))
+    monkeypatch.setattr(qt.QtWidgets.QMessageBox, "show", lambda self: None)
+
+    class Process:  # it ends right after the window's first look at it
+        pid = 4242
+        looks = iter([None])
+
+        def poll(self):
+            return next(self.looks, 1)
+
+    log = tmp_path / "x.log"
+    log.write_text("Traceback (most recent call last):\nValueError: no such port\n")
+    window._spawned = [inventory.Launched(Process(), log, "x")]
+    window.refresh()
+    window.refresh()
+    assert any(t.startswith("x ended with an error: ValueError: no such port") for t in said) and not window._spawned
+
+
+def test_keep_a_server_running_picks_the_python_it_needs(window, tmp_path):
+    (tmp_path / "rig" / ".venv" / "bin").mkdir(parents=True)
+    python = tmp_path / "rig" / ".venv" / "bin" / "python"
+    python.write_text("")
+    lab = tmp_path / "rig" / "lab.toml"
+    lab.write_text('[devices.echo]\ndriver = "insthub.sim:Loopback"\n')
+    dialog = forms.ServiceDialog(window)
+    dialog.target.setText(str(lab))
+    assert dialog.python.text() == str(python) == extensions.python_for(lab)  # as `insthub check --import` uses
+    assert dialog.name.text() == "lab"
+
+
 def test_a_window_opened_for_a_device_says_why_it_failed(window, monkeypatch, tmp_path):
     said = []
     monkeypatch.setattr(window, "say", lambda text, ms=5000: said.append(text))
@@ -1382,9 +1496,10 @@ def test_saving_when_the_file_vanished_or_changed(window, tmp_path, monkeypatch)
 
 
 def test_only_insthub_configs_are_edited(window, tmp_path):
-    assert inventory.served(["python3", "srv.py", "settings.toml"]) == "srv.py"     # its own settings: not ours
-    assert inventory.served(["/v/bin/python", "-m", "insthub", "serve", "lab.toml"]) == "lab.toml"
-    assert inventory.served(["python3", "-X", "dev", "-W", "ignore", "-u", "srv.py"]) == "srv.py"
+    assert service.served(["python3", "srv.py", "settings.toml"]) == "srv.py"       # its own settings: not ours
+    assert service.served(["/v/bin/python", "-m", "insthub", "serve", "lab.toml"]) == "lab.toml"
+    assert service.served(["python3", "-X", "dev", "-W", "ignore", "-u", "srv.py"]) == "srv.py"
+    assert service.served([]) is None
     other = tmp_path / "devices.toml"
     other.write_text('[devices]\nscope = "tcp://h:1"\n')
     with pytest.raises(ValueError, match="not an insthub server"):
@@ -1584,15 +1699,6 @@ def test_command_names():
     assert name(["python3", "-m", "insthub", "-a", "ipc:///run/x.sock", "view", "scope"]) == "insthub view scope"
     assert name(["python", "-m", "ipykernel_launcher", "-f", "kernel.json"]) == "Jupyter kernel"
     assert name(["/opt/vendor/bin/scopeapp"]) == "scopeapp"
-
-
-def test_find_python(tmp_path):
-    (tmp_path / "rig" / ".venv" / "bin").mkdir(parents=True)
-    python = tmp_path / "rig" / ".venv" / "bin" / "python"
-    python.write_text("")
-    (tmp_path / "rig" / "servers").mkdir()
-    assert inventory.find_python(tmp_path / "rig" / "servers" / "lab.toml") == str(python)   # the folder above
-    assert inventory.find_python(tmp_path / "other.toml") == sys.executable
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux desktop launchers")

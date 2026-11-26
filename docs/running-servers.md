@@ -83,13 +83,17 @@ Nothing here needs administrator rights. Two details:
   the computer boots, with nobody logged in, turn on *lingering* once:
   `sudo loginctl enable-linger $USER`. `insthub service install` tells you if
   it is off.
-- **Which Python.** The service runs with the Python interpreter that ran
-  `insthub service install`, or the one named with `--python`. If a server
-  needs the packages of a particular virtualenv, install it with that
-  virtualenv's `insthub`:
+- **Which Python.** The service runs with the Python that the server file
+  needs, by the rule that `insthub check --import` and the window follow
+  too: that of its devices' [extensions](guide.md#extensions) when they
+  agree on one, else a virtualenv's (`.venv`, `venv` or `env`) next to the
+  file or next to a device's code, else the Python interpreter that ran
+  `insthub service install`. `--python` names another. If a server needs
+  the packages of a virtualenv that is not next to its files, install it
+  with that virtualenv's `insthub` (or pass `--python`):
 
   ```bash
-  ~/Code/mydriver/.venv/bin/insthub service install ~/Code/mydriver/server.toml
+  ~/Code/mydriver/.venv/bin/insthub service install ~/lab/server.toml
   ```
 
   Before it writes anything, `install` checks that this Python can import
@@ -105,9 +109,8 @@ Nothing here needs administrator rights. Two details:
   which has insthub but none of your drivers.
 
   `insthub check server.toml --import` makes the same check without
-  installing anything, in the Python of the devices'
-  [extensions](guide.md#extensions) (else the `.venv` next to the file), and
-  also checks each device's `extension` against the manifest of its folder.
+  installing anything, in the same Python, and also checks each device's
+  `extension` against the manifest of its folder.
 
 This needs Linux with systemd. On other systems, start servers with the
 system's own autostart mechanism.
@@ -204,8 +207,10 @@ dangerous or simulated, until it restarts. To remove it:
 
 Servers do not use it. A server needs its driver's packages, and those are
 in its project's environment, not in this one. That is why
-`insthub service install` refuses this command's Python and asks you to run
-the project's `insthub` or to pass `--python` (see
+`insthub service install` takes the Python of the server's extensions, or of
+a virtualenv next to its file or its drivers, when there is one, and else
+refuses this command's Python and asks you to run the project's `insthub` or
+to pass `--python` (see
 [keeping a server running](#keeping-a-server-running)). Run `insthub serve`
 from the project's environment as well; from this command it stops at the
 first driver it cannot import.
@@ -346,10 +351,12 @@ key of a config file and what to do when something does not work.
 | Addresses of devices and servers on other computers | `~/.config/insthub/devices.toml`; override with `INSTHUB_DEVICES` |
 | A server's last 1000 log lines | in the server's memory; `insthub logs SERVER` reads them |
 | Your list of extension folders | `~/.config/insthub/extensions.toml`, written by `insthub ext add`; `INSTHUB_EXTENSIONS` (folders) looks only there instead |
+| The configs of the servers the window makes | `~/.config/insthub/servers/`, unless you choose another folder |
 | Output of what the window or `insthub open` started | in the runtime folder (the first row): `NAME.log` for a server, `ui/DEVICE/UI.log` for a UI of a device's extension, `ui/DEVICE/_view.log` for its live view. Each run adds to its log, after a line that says when it started and what ran |
 | Service definitions | `~/.config/systemd/user/insthub-NAME.service` |
 | The insthub command for yourself | `~/.local/bin/insthub`; its environment in `~/.local/share/uv/tools/insthub/` |
 | Results saved for AI agents by `insthub mcp` | `.insthub/` in the folder the agent was started in; override with `INSTHUB_DATA` or `--data` |
+| (`~/.config` in the rows above) | `$XDG_CONFIG_HOME`, if it is set |
 | The launcher of `insthub gui` | `~/.local/share/applications/insthub.desktop`, its icon under `~/.local/share/icons/`, a copy on the desktop, and `~/.config/autostart/insthub.desktop` with Start at login |
 
 A server and its clients must use the same first folder to find each other by

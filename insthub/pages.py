@@ -254,7 +254,9 @@ class _Facts(QtWidgets.QFrame):
 
 
 class _Header(QtWidgets.QWidget):
-    """The top of a page: the way back, its title and status, a line below, buttons on the right."""
+    """The top of a page: the way back, its title and status, a line below, buttons on the right:
+    beside the title, or in a row of their own below it when there is no room for both (a narrow
+    window, a long name), so that no button is squeezed until its text is cut off."""
 
     def __init__(self, title: str = "", back: str | None = None, on_back=None):
         super().__init__()
@@ -269,20 +271,39 @@ class _Header(QtWidgets.QWidget):
         self.subtitle.setTextFormat(Qt.TextFormat.RichText)
         self.actions = QtWidgets.QHBoxLayout()
         self.actions.setSpacing(8)
-        top = QtWidgets.QHBoxLayout()
+        self._top = top = QtWidgets.QHBoxLayout()
         top.setSpacing(12)
         top.addWidget(self.title)
         top.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignVCenter)
         top.addWidget(self.pill, 0, Qt.AlignmentFlag.AlignVCenter)
         top.addStretch(1)
         top.addLayout(self.actions)
+        self._below = QtWidgets.QHBoxLayout()  # the row of the buttons when they do not fit beside the title
+        self._below.addStretch(1)
+        self.actions_below = False
         box = QtWidgets.QVBoxLayout(self)
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(4)
         if self.back is not None:
             box.addWidget(self.back, 0, Qt.AlignmentFlag.AlignLeft)
         box.addLayout(top)
+        box.addLayout(self._below)
         box.addWidget(self.subtitle)
+
+    def event(self, event) -> bool:
+        if event.type() in (QtCore.QEvent.Type.Resize, QtCore.QEvent.Type.LayoutRequest):  # (a button came or
+            self._fit_actions()                                                               # went, a new title)
+        return super().event(event)
+
+    def _fit_actions(self) -> None:
+        """The buttons beside the title if there is room for both at their full size, else below it."""
+        beside = [w for w in (self.title, self.badge, self.pill) if not w.isHidden()]
+        need = sum(w.sizeHint().width() + self._top.spacing() for w in beside) + self.actions.sizeHint().width()
+        below = need > self.width()
+        if below != self.actions_below:
+            self.actions_below = below
+            (self._top if below else self._below).removeItem(self.actions)
+            (self._below if below else self._top).addLayout(self.actions)
 
 
 class _Page(QtWidgets.QWidget):
@@ -764,7 +785,7 @@ class DevicePage(_Page):
         self.edit_file.triggered.connect(lambda *_: window.edit_config(self.server.key, self.name))
         menu.addAction(ui.icon("copy"), "Copy its name").triggered.connect(lambda *_: window.copy(self.name))
         self.more.setMenu(menu)
-        self.ui_buttons = QtWidgets.QHBoxLayout()  # Open <title>: one per UI of its extension (see _show_uis)
+        self.ui_buttons = QtWidgets.QHBoxLayout()  # Open <title>, or Open with a menu of its UIs (see _show_uis)
         self.ui_buttons.setSpacing(8)
         self._uis_shown: tuple | None = None
         for button in (self.connect_now, self.release, self.pause, self.live):
@@ -834,15 +855,28 @@ class DevicePage(_Page):
                 button = self.ui_buttons.takeAt(0).widget()
                 button.hide()  # (at once: deleteLater waits for the event loop)
                 button.deleteLater()
-            for u in uis:
-                self.ui_buttons.addWidget(ui.button(
-                    f"Open {u.title}", "window", slot=lambda u=u: self.window.open_ui(self.server, self.name, ext, u)))
+            if len(uis) == 1:
+                self.ui_buttons.addWidget(ui.button(f"Open {uis[0].title}", "window",
+                                                    slot=lambda: self.window.open_ui(self.server, self.name, ext,
+                                                                                     uis[0])))
+            elif uis:  # one button, its menu listing them: a button for each would crowd the header
+                button = ui.button("Open", "window")
+                menu = QtWidgets.QMenu(button)
+                menu.setToolTipsVisible(True)
+                for u in uis:
+                    action = menu.addAction(ui.icon("window"), u.title)
+                    action.setToolTip(f"Its {u.kind}, in a window of its own")
+                    action.triggered.connect(lambda *_, u=u: self.window.open_ui(self.server, self.name, ext, u))
+                button.setMenu(menu)
+                self.ui_buttons.addWidget(button)
         can, why_not = self.window.can_open(s)
         for i in range(self.ui_buttons.count()):
-            button, u = self.ui_buttons.itemAt(i).widget(), uis[i]
+            button = self.ui_buttons.itemAt(i).widget()
+            button.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)  # (never cut)
             button.setEnabled(can)
-            button.setToolTip(why_not or f"{ext.title}'s {u.kind} for it, in a window of its "
-                                         f"own (run with {ext.python})")
+            what = f"{uis[0].kind}" if len(uis) == 1 else "UIs (" + ", ".join(u.title for u in uis) + ")"
+            button.setToolTip(why_not or f"{ext.title}'s {what} for it, in a window of its own (run with "
+                                         f"{ext.python})")
         return why
 
     def show_device(self, s: Server, name: str) -> None:

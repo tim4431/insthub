@@ -59,6 +59,10 @@ _log = logging.getLogger("insthub")
 #: the step a spin box takes, and the values to choose from.  Advice for UIs and agents, never
 #: enforced: an instrument may accept "auto", and it clamps a value by itself.
 META_KEYS = ("unit", "min", "max", "step", "choices")
+#: What a device says it is, as text, in describe() (each when it says it): the extension it belongs
+#: to and the version of its code, what this one is, and which of several of a kind (its address).
+#: Besides these, describe() says "simulated" (True) for a simulator.
+ABOUT = ("extension", "extension_version", "description", "address")
 
 
 def _checked_meta(meta: dict, where: str) -> dict:
@@ -887,8 +891,7 @@ class _Runtime:
             last = st.last
             streams[name] = {"seq": st.seq, "time": last.time if last else None, "doc": self._stream_doc(st),
                              "kind": summarize(last.data) if last else None, "subscribers": len(st.sinks)}
-        about = {key: value for key in ("extension", "extension_version", "description", "address")
-                 if (value := _declared(dev, key, str))}
+        about = {key: value for key in ABOUT if (value := _declared(dev, key, str))}
         if _declared(dev, "simulated", bool):
             about["simulated"] = True
         return {

@@ -36,14 +36,22 @@ def demo(tmp_path, monkeypatch):
 @pytest.fixture
 def demo_venv(demo):
     """The copy with its own virtualenv's python, as after `uv venv` there: a stand-in that runs
-    this Python, for what insthub runs in the extension's Python."""
+    this Python, for what insthub runs in the extension's Python, and notes each time it runs (ran()),
+    so that a test tells it from the Python that runs the tests."""
     if os.name == "nt":
         pytest.skip("the stand-in python is a shell script")
     python = demo / ".venv" / "bin" / "python"
     python.parent.mkdir(parents=True)
-    python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+    python.write_text(f'#!/bin/sh\necho ran >> {shlex.quote(str(demo / ".venv" / "ran"))}\n'
+                      f'exec {shlex.quote(sys.executable)} "$@"\n')
     python.chmod(0o755)
     return demo
+
+
+def ran(demo) -> int:
+    """How often the extension's own Python (demo_venv's stand-in) ran."""
+    runs = demo / ".venv" / "ran"
+    return len(runs.read_text().splitlines()) if runs.exists() else 0
 
 
 def spin(seconds, until=lambda: False):
@@ -75,9 +83,11 @@ def test_insthub_finds_the_reference_extension_and_finds_nothing_wrong(demo, mon
     assert {name: ui.kind for name, ui in ext.ui.items()} == {"panel": "panel", "app": "app"}
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # not even a warning: its device's version is the manifest's, ...
-        assert extensions.check(demo) == []
-        assert extensions.check(demo, import_=True) == []  # its driver, imported in its own Python: no Qt
-        assert extensions.check(demo / "laser.toml", import_=True) == []  # as `insthub service install` does
+        assert extensions.check(demo) == [] and ran(demo) == 0
+        assert extensions.check(demo, import_=True) == []  # its driver (and UIs), imported in its own Python:
+        assert ran(demo) == 1                                # the driver brings in no Qt
+        assert extensions.check(demo / "laser.toml", import_=True) == []  # as `insthub service install` does,
+        assert ran(demo) == 2                                               # in the same Python
 
 
 def test_its_server_file_and_its_manifest_make_the_laser(demo, monkeypatch):
@@ -225,7 +235,7 @@ def test_its_app_only_attaches_given_an_address_and_else_hosts_one(demo, monkeyp
 @pytest.mark.usefixtures("demo_venv")  # (it runs the extension's Python)
 def test_insthub_opens_its_panel_and_its_app_in_programs_of_their_own(demo, monkeypatch):
     pytest.importorskip("insthub.qt", exc_type=ImportError)
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")  # (for the programs it starts too)
     with laser_server() as server, insthub.connect(server.addresses[0]) as client:
         address = server.addresses[0]
         ext, uis, why = extensions.device_uis(client.laser.bus.describe(), address)
@@ -237,6 +247,7 @@ def test_insthub_opens_its_panel_and_its_app_in_programs_of_their_own(demo, monk
 
         for ui in uis:
             launched = extensions.launch(ext, ui.name, "laser", address)
+            assert launched.process.args[0] == str(demo / ".venv" / "bin" / "python")  # the extension's Python
             try:
                 end = time.monotonic() + 30
                 while time.monotonic() < end and launched.running and not connected(launched):

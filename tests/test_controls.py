@@ -1,11 +1,9 @@
 """The controls of any device (insthub.controls), as a panel embeds them: on a proxy, run without a
 display.  The window's device page is made of the same ones (tests/test_manager.py)."""
-import os
 import time
 
 import pytest
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("insthub.qt", exc_type=ImportError)  # needs a Qt binding
 
 import insthub
@@ -158,6 +156,40 @@ def test_the_same_device_keeps_what_is_typed_and_the_result_on_its_way(rig):
     assert commands.current() == "fire" and commands.args.text() == "ms=7"
     assert spin(3, lambda: commands.result.toPlainText() == "7")            # its result is shown all the same
     assert commands.run_button.isEnabled()
+
+
+class Slow(insthub.Device):
+    """Answers, or fails, after a while."""
+
+    def open(self):
+        pass
+
+    @insthub.command
+    def wait(self, seconds: float) -> float:
+        time.sleep(seconds)
+        return seconds
+
+    @insthub.command
+    def give_up(self, seconds: float):
+        time.sleep(seconds)
+        raise RuntimeError("gave up")
+
+
+def test_a_result_for_another_device_than_the_one_shown_is_dropped():
+    """The host (the window's device page) shows another device before the answer comes: it is not
+    shown on that device's page, whether it is a result or an error."""
+    qt.application()
+    with insthub.Server("s", [Slow("a"), Slow("b")], tcp=0) as server, insthub.connect(server.addresses[-1]) as c:
+        for command in ("wait", "give_up"):
+            commands = controls.Commands(c.a)
+            commands.choose(command)
+            commands.args.setText("0.3")
+            commands.run()
+            commands.load(c.b.bus.describe(), where="b")                     # now it shows b
+            spin(1.0)
+            assert f"a.{command}" not in commands.took.text() and "gave up" not in commands.result.toPlainText()
+            assert "0.3" not in commands.result.toPlainText()
+            commands.load(c.a.bus.describe())                               # (the same device: see above)
 
 
 def test_load_shows_the_device_as_it_is_now(rig):

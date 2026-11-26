@@ -13,7 +13,7 @@ that may block) or with what they returned (everything else), and shows it.
                      'AI agent (Claude Code)')
     spawn(), Launched    starting a server or a window for a device in the background, its output
                          in a log file (server_log, ui_log); what it said if it failed
-    server_file(), find_python()    finding a server's files
+    server_file(), server_python()  the file a server runs, and the Python it runs in
 """
 from __future__ import annotations
 
@@ -36,7 +36,6 @@ from . import registry, service
 from .client import PROCESS_TOKEN, Client, connect, discover
 from .device import busy_with, summarize
 from .errors import BusError
-from .extensions import venv_python
 
 PROBE_TIMEOUT = 3.0  #: seconds a server may take to answer before it is shown as unreachable
 ACTION_TIMEOUT = 120.0
@@ -210,12 +209,6 @@ def terminate(pid: int) -> None:
     os.kill(pid, signal.SIGTERM)
 
 
-def find_python(target: str | Path) -> str:
-    """The interpreter a server file most likely needs: a virtualenv in its folder or the one above
-    (as for an extension: extensions.venv_python), else ours."""
-    return venv_python(Path(target).expanduser().resolve().parent) or sys.executable
-
-
 def server_log(name: str) -> Path:
     """Where the output of a server this window started goes (the runtime folder, so it is gone at logout)."""
     return registry.runtime_dir() / f"{name}.log"
@@ -258,21 +251,35 @@ class Launched:
         return self.process.poll() is None
 
     def failure(self, wait: float = 0.0) -> str | None:
-        """What it said last, if it ended with an error (an exit code above 0: an exception, or
-        `error: ...` from the insthub command), waiting up to `wait` seconds for it to end: the last
-        lines of its own output in the log, else its exit code.  None while it runs, once it ended
-        well, or when quiet."""
+        """What it said last, if it ended with an error, waiting up to `wait` seconds for it to end:
+        the last lines of its own output in the log, else its exit code or the signal that ended it.
+        An error is an exit code above 0 (an exception, or `error: ...` from the insthub command),
+        or a signal other than those that stop a program on purpose (STOPPED): Qt aborts when it
+        cannot show a window (no platform plugin) or a panel's slot raises, and a vendor library may
+        crash.  None while it runs, once it ended well or was stopped, or when quiet."""
         try:
             code = self.process.wait(wait) if wait else self.process.poll()
         except subprocess.TimeoutExpired:
             return None
-        if not code or code < 0 or self.quiet:  # (below 0: ended by a signal, as Stop and closing it do)
+        if not code or self.quiet or -code in STOPPED:
             return None
         try:
             lines = [line for line in tail(self.log, 40, self.offset).splitlines() if line.strip()]
         except BusError:  # the log is gone (the runtime folder was cleaned up)
             lines = []
-        return "\n".join(lines[-12:]) or f"exit code {code}"
+        return "\n".join(lines[-12:]) or (f"exit code {code}" if code > 0 else f"ended by {_signal_name(-code)}")
+
+
+#: The signals that stop a program on purpose (Stop, closing a session, kill): its end is no error.
+STOPPED = frozenset(getattr(signal, name) for name in ("SIGTERM", "SIGINT", "SIGKILL", "SIGHUP")
+                    if hasattr(signal, name))
+
+
+def _signal_name(number: int) -> str:
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return f"signal {number}"
 
 
 def spawn(command: list[str], log: Path, title: str, cwd: str | Path | None = None,
@@ -304,32 +311,28 @@ def tail(path: Path, lines: int = 500, start: int = 0) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
-def served(argv: list[str]) -> str | None:
-    """What a server's command line runs: the config after `insthub serve` (or `python -m insthub
-    serve`), else the script a Python runs ("python my_server.py settings.toml": the .py)."""
-    args = argv[1:]
-    if "serve" in args:
-        before = [os.path.basename(a) for a in [argv[0], *args[:args.index("serve")]]]
-        if "insthub" in before or "insthub.exe" in before:  # the command, `python -m insthub` or its script
-            return next((a for a in args[args.index("serve") + 1:] if a.endswith(".toml")), None)
-    if os.path.basename(argv[0]).startswith("python"):
-        while args and args[0].startswith("-") and args[0] not in ("-m", "-c"):
-            args = args[2:] if args[0] in ("-X", "-W", "--check-hash-based-pycs") else args[1:]  # its options
-        if args and args[0].endswith(".py"):
-            return args[0]
-    return None
+def _argv(s: Server) -> tuple[list[str], str | None]:
+    """(the command line of a server: that of its service, else that of its process on this
+    computer; the folder that process runs in, if known); ([], None) if neither is known."""
+    if s.service:
+        return service.command_of(s.service), None
+    if s.origin == "local" and s.pid and s.pid != os.getpid():
+        try:
+            cwd = os.readlink(f"/proc/{s.pid}/cwd")
+        except OSError:
+            cwd = None
+        return _cmdline(s.pid), cwd
+    return [], None
 
 
 def server_python(s: Server) -> Path | None:
-    """The Python a server runs in (from its service, else its command line), or None if unknown."""
-    argv: list[str] = []
-    if s.service:
-        try:
-            argv = shlex.split(s.service["command"])
-        except ValueError:
-            argv = []
-    elif s.origin == "local" and s.pid and s.pid != os.getpid():
-        argv = _cmdline(s.pid)
+    """The Python a server runs in: for one running here, what its registry file says; else (a
+    service that is not running, or a server of an older insthub) from its command line, the
+    Python it starts, or that of a virtualenv whose script it starts (.venv/bin/insthub); None
+    if unknown."""
+    if s.origin == "local" and s.python:
+        return Path(s.python)
+    argv, _ = _argv(s)
     if not argv:
         return None
     first = Path(argv[0])
@@ -341,19 +344,10 @@ def server_python(s: Server) -> Path | None:
 
 def server_file(s: Server) -> Path | None:
     """The .toml config or .py script a server runs: from its service, else from its command line."""
-    argv, cwd = [], None
     if s.service:
-        try:
-            argv = shlex.split(s.service["command"])
-        except ValueError:
-            argv = []
-    elif s.origin == "local" and s.pid and s.pid != os.getpid():
-        argv = _cmdline(s.pid)
-        try:
-            cwd = os.readlink(f"/proc/{s.pid}/cwd")
-        except OSError:
-            cwd = None
-    arg = served(argv) if argv else None
+        return service.target(s.service)
+    argv, cwd = _argv(s)
+    arg = service.served(argv)
     if arg is None:
         return None
     path = Path(arg) if os.path.isabs(arg) or cwd is None else Path(cwd) / arg
@@ -455,6 +449,7 @@ class Server:
     started: float | None = None
     declared: list = dataclasses.field(default_factory=list)  #: device names known before asking the server
     service: dict | None = None
+    python: str | None = None  #: the Python it runs in, as its registry file says (a server running here)
     probe: dict | None = None
     probed_at: float = 0.0
     error: str | None = None
@@ -467,7 +462,10 @@ class Server:
 
     @property
     def address(self) -> str | None:
-        """The address the window talks to: the Unix socket, else TCP, else in-process."""
+        """The address the window talks to: the Unix socket, else TCP, else in-process.  Not the order
+        of client._nearest, which prefers a server's address in this process: the window hands this
+        address to the programs it starts for a device (its live view, a UI), which only a socket
+        reaches."""
         for prefix in ("ipc://", "tcp://", "inproc://"):
             for address in self.addresses:
                 if address.startswith(prefix):

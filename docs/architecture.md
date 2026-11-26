@@ -444,10 +444,12 @@ sequenceDiagram
   extension's code; the server it starts does, in the extension's Python.
 - **Open** on a device's page starts a UI of the device's extension
   (`extensions.launch`) as a program of its own, with the extension's Python:
-  an app, or a panel that `insthub panel` puts in a window. Which UIs a device
-  has is found out on a worker thread (`extensions.device_uis`, from the
-  folders in its server's `.json` file when the server runs here) and looked
-  up again every 30 seconds and whenever the page opens.
+  an app, or a panel that `insthub panel` puts in a window (one button, or
+  one with a menu of them when there are several). Which UIs a server's
+  devices have is found out on a worker thread, for all of them at once
+  (`extensions.server_uis`, from the folders in its server's `.json` file
+  when the server runs here), after a probe or when the page opens, at most
+  every 30 seconds unless the devices or their extensions change.
 - **What the window starts** (servers, the live view, UIs) runs in a session
   of its own, so it outlives the window, and writes its output to a log file
   in the runtime folder (`inventory.spawn`). When one of them ends with an

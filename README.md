@@ -236,7 +236,7 @@ gui` does this setup with a click and shows which agents are connected. See
 
 ## Status
 
-- 471 tests cover calls, streams, device lifecycle, finding servers,
+- 488 tests cover calls, streams, device lifecycle, finding servers,
   reconnecting, mixed insthub versions, the command line, config files,
   services, extensions (the reference extension among them), the GUIs, the
   agent interface, and how little `import insthub` loads. Run them with

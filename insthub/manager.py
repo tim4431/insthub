@@ -8,7 +8,7 @@ how each one is reached, and the controls to look after them and set them up.
                  programs watch it; its properties to read and change, its streams, its
                  periodic tasks (a switch each), its state, and its commands to run.
                  Connect now / Release / Pause and Resume / Live view / Open <a UI of its
-                 extension> / Edit in its config.
+                 extension> (a menu of them, for several) / Edit in its config.
     Servers      a card per server: running here, installed as a service, or on another
                  computer (devices.toml)
     a server     its process, addresses, service, devices and the programs connected to it.
@@ -309,7 +309,9 @@ class Manager(QtWidgets.QMainWindow):
 
     # -- looking -------------------------------------------------------------
     def refresh(self) -> None:
-        for p in self._spawned:  # a server or a window this window started that failed (at start, often) says why
+        ended = [p for p in self._spawned if not p.running]  # (once: one that ends meanwhile is seen next time)
+        self._spawned = [p for p in self._spawned if p not in ended]
+        for p in ended:  # a server or a window this window started that failed (at start, often) says why
             failure = p.failure()
             if failure:
                 self.say(f"{p.title} ended with an error: {failure.splitlines()[-1]} (its log: {p.log})", 15000)
@@ -319,7 +321,6 @@ class Manager(QtWidgets.QMainWindow):
                 box.setInformativeText(f"{failure}\n\nIts log: {p.log}")
                 box.setModal(False)
                 box.show()
-        self._spawned = [p for p in self._spawned if p.running]  # and those that ended
         if not self._scanning:
             self._scanning = True
             self.submit(self.probes, self.backend.scan, self._on_scan, self._on_scan_failed)
@@ -343,6 +344,7 @@ class Manager(QtWidgets.QMainWindow):
                 s.forget_live_data()
             s.pid, s.started = info.get("pid"), info.get("started")
             s.addresses, s.declared = list(info.get("addresses", ())), list(info.get("devices", ()))
+            s.python = info["python"] if isinstance(info.get("python"), str) else None  # (another insthub's: none)
             s.service = by_pid.get(s.pid)
             if s.service:
                 taken.add(s.service["name"])
@@ -748,8 +750,8 @@ class Manager(QtWidgets.QMainWindow):
         """What a device can open here, as extensions.device_uis() says: (its extension, its UIs, why
         it has none); None until a worker has found out (see _look_up_uis)."""
         d = s.device(device)
-        wanted = d.get("extension") if d else None
-        if not isinstance(wanted, str) or not wanted or not s.address:  # (it came over the network)
+        wanted = extensions.named(d) if d else None
+        if wanted is None or not s.address:
             return None, [], None
         self._look_up_uis(s)
         _, extension_of, found = self._uis.get(s.address, (None, {}, {}))
@@ -759,7 +761,7 @@ class Manager(QtWidgets.QMainWindow):
     def _with_extensions(s: Server) -> dict[str, dict]:
         """The devices of a server that name an extension (name -> what it said about itself)."""
         devices = s.probe["devices"] if s.probe else {}
-        return {name: d for name, d in devices.items() if isinstance(d.get("extension"), str) and d["extension"]}
+        return {name: d for name, d in devices.items() if extensions.named(d)}
 
     def _look_up_uis(self, s: Server) -> None:
         """Find out on a worker what the devices of a server that name an extension can open here

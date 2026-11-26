@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 
 import pytest
@@ -230,6 +231,80 @@ def test_what_nothing_caught_goes_to_the_log(tmp_path):
         proc.terminate()
         _, err = proc.communicate(timeout=10)
     assert err.decode().count("ZeroDivisionError") == 1                    # in its output too, once
+
+
+def test_insthub_serve_keeps_the_whole_log(tmp_path):
+    """What every service runs: a driver's own logger, and an exception in a thread of its own, reach
+    `insthub logs` and the window's Logs, not only insthub's own records."""
+    (tmp_path / "chatdrv.py").write_text(textwrap.dedent("""\
+        import logging, threading
+        import insthub
+
+        class Chat(insthub.Device):
+            def open(self):
+                logging.getLogger("chatdrv").warning("driver says hi")         # its own logger, not insthub's
+                threading.Timer(0.2, lambda: 1 / 0).start()                    # nothing catches this one
+        """))
+    cfg = tmp_path / "chat.toml"
+    cfg.write_text('[devices.chat]\ndriver = "chatdrv:Chat"\n')
+    proc = subprocess.Popen([sys.executable, "-m", "insthub", "serve", str(cfg)], cwd=tmp_path, env=os.environ.copy(),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert wait_for(lambda: any(s["server"] == "chat" for s in registry.servers()))
+        with insthub.connect(insthub.locate("chat")) as c:
+            assert wait_for(lambda: len(c.logs(level="WARNING")) >= 2)
+            messages = [r["message"] for r in c.logs(level="WARNING")]
+        assert "driver says hi" in messages and any(m.startswith("uncaught exception in thread") for m in messages)
+    finally:
+        proc.terminate()
+        proc.wait(10)
+
+
+def test_insthub_sim_keeps_the_whole_log_too(monkeypatch):
+    kept = []
+    monkeypatch.setattr(server, "keep_logs", lambda everything=False: kept.append(everything))
+    monkeypatch.setattr(server.Server, "serve_forever", lambda self: None)  # (instead of serving until Ctrl-C)
+    assert cli.main(["sim", "--name", "keeps"]) == 0 and kept == [True]
+
+
+def later(value, seconds=3.0) -> client.CallFuture:
+    """A call's future that an instrument answers only after `seconds`: longer than a time limit."""
+    future = client.CallFuture()
+    timer = threading.Timer(seconds, lambda: future.set_result(value))
+    timer.daemon = True
+    timer.start()
+    return future
+
+
+def test_states_and_info_keep_to_their_time_limits(server, monkeypatch):
+    real = client._LocalTransport.request
+
+    def request(self, device, method, args, kwargs):  # a server that answers, then stalls
+        return later({"timebase": 1}) if method in ("$state", "info") else real(self, device, method, args, kwargs)
+
+    monkeypatch.setattr(client._LocalTransport, "request", request)
+    start = time.monotonic()
+    found = insthub.states(["scope", "synth"], timeout=0.3)
+    assert time.monotonic() - start < 1.5                                  # not 3 s
+    assert found["scope"]["server"] == "t" and "no reply within" in found["scope"]["error"]
+    assert found["synth"]["server"] == "t" and "error" in found["synth"]
+    with insthub.connect("inproc://t", timeout=0.3) as c:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            c.info()
+        assert time.monotonic() - start < 1.5
+
+
+def test_the_servers_elsewhere_are_asked_at_once(monkeypatch):
+    monkeypatch.setattr(client, "_REMOTE_TIMEOUT", 0.5)
+    with (socket.create_server(("127.0.0.1", 0)) as a, socket.create_server(("127.0.0.1", 0)) as b,
+          socket.create_server(("127.0.0.1", 0)) as c):                   # each accepts, and never says hello
+        registry.devices_file().write_text("[servers]\n" + "".join(
+            f'mute{i} = "tcp://127.0.0.1:{s.getsockname()[1]}"\n' for i, s in enumerate((a, b, c))))
+        start = time.monotonic()
+        found = insthub.discover(remote=True)
+        assert time.monotonic() - start < 1.2 and len(found) == 3          # about 0.5 s, not 1.5 s
+        assert all("handshake" in entry["error"] for entry in found)
 
 
 def test_the_state_of_every_device_at_once(server, monkeypatch, capsys):

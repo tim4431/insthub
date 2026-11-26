@@ -1,7 +1,7 @@
 """Qt glue (optional; needs PyQt6, PySide6 or PyQt5).
 
 A GUI must never block on an instrument and must only touch widgets from the
-GUI thread.  Four helpers cover that:
+GUI thread.  Five helpers cover that:
 
     watch(sub, slot)        every display tick, hand the newest frame of a
                             subscription to `slot(frame)` in the GUI thread
@@ -13,6 +13,9 @@ GUI thread.  Four helpers cover that:
     coalesce(call)          a sender for a setting that changes faster than the
                             instrument takes it (a slider): one call at a time,
                             with the newest values
+    follow(call, show)      the same, for a control that also shows the setting
+                            as the device reports it (and takes it): never an
+                            old report over a value on its way
 
     scope = insthub.device("scope")
     watch(scope.subscribe("ch1"), lambda frame: curve.setData(frame.data))
@@ -289,11 +292,68 @@ def coalesce(call, done=None, error=None, merge=None, *, owner=None) -> _Coalesc
     `done(result)` runs in the GUI thread with the result of a call that nothing waits behind,
     `error(exception)` with each call that fails (without it, a warning is logged), neither once
     `owner` is deleted, as for deliver().  `send.busy` says whether a call is on its way: it is
-    False in `done`, and in `error` unless values that waited went out.  A panel that shows the
-    device's own value shows it only when no call is on its way (while one is, the device may
-    still report the value before), and keeps what the device reports meanwhile to show it in
-    `done` or `error` (docs/guide.md#guis).  Use the sender from the GUI thread."""
+    False in `done`, and in `error` unless values that waited went out.  A control that also shows
+    the device's own value uses follow(), which builds on this.  Use the sender from the GUI
+    thread."""
     return _Coalesced(call, done, error, merge, owner)
+
+
+class _Followed:
+    """The sender made by follow()."""
+
+    def __init__(self, call, show, reports, error, merge, owner):
+        self._show, self._reports, self._error = show, reports, error or _warn
+        self._send = _Coalesced(call, self._taken, self._failed, merge, owner)
+        self.value = None  #: what the device reported last, or took (None: nothing yet)
+
+    @property
+    def busy(self) -> bool:
+        """Whether a call is on its way (as coalesce()'s `busy`)."""
+        return self._send.busy
+
+    def __call__(self, **values) -> None:
+        self._send(**values)
+
+    def report(self, value) -> None:
+        """What the device reports now (from a stream, or its state): kept, and shown unless a
+        call is on its way, which the device may not have taken yet."""
+        self.value = value
+        if not self.busy:
+            self._show(value)
+
+    def _taken(self, result) -> None:
+        if self._reports is not None:  # a report not shown yet may be older than the answer: dropped
+            self._reports.poll()
+        if result is not None:
+            self.value = result
+        if self.value is not None:
+            self._show(self.value)
+
+    def _failed(self, exc: Exception) -> None:
+        self._error(exc)
+        if not self.busy and self.value is not None:  # (unless newer values went out: they are shown then)
+            self._show(self.value)
+
+
+def follow(call, show, *, reports=None, error=None, merge=None, owner=None) -> _Followed:
+    """A sender for a setting, as coalesce() makes, for a control that also shows the setting as the
+    device has it: a slider that shows the power a laser reports, and sends the one it is moved to.
+    `send = follow(laser.set_power.future, show_power)`; `send(mw=v)` for each new value, and
+    `send.report(value)` with each value the device reports (from a stream or its state, through
+    watch()).
+
+    It never disagrees with the device for long, and never shows an old value over one on its way:
+    `show(value)` runs in the GUI thread with each value reported while no call is on its way (while
+    one is, the device may still report the value before, so it is kept, not shown), and once the
+    last call has ended with what the device took (the call's result, if it returns one, as a
+    setter that rounds does; else what it reported last) or, if it failed, with what it reported
+    last (it kept that), after `error(exception)` (without it, a warning is logged).  `reports`: the
+    subscription that report() is fed from, for a value the device reads on its own (polls): what
+    it read just before it took the new value may come in just before the answer, and is dropped
+    then, not shown over it.  `merge` and `owner` are coalesce()'s.  `send.busy` says whether a call
+    is on its way, `send.value` what the device reported last, or took.  Use it from the GUI thread
+    (docs/guide.md#guis)."""
+    return _Followed(call, show, reports, error, merge, owner)
 
 
 def application():

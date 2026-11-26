@@ -94,8 +94,10 @@ An extension mechanism must keep this true.
 
 ## Extensions
 
-*Status: implemented, except entry points. A device says which extension it
-belongs to and whether it is simulated (step 4). Manifests, finding
+*Status: implemented, except entry points and the window's "restart: newer
+code" notice (proposed, see [installing, updating and broken
+extensions](#installing-updating-and-broken-extensions)). A device says which
+extension it belongs to and whether it is simulated (step 4). Manifests, finding
 extensions, `insthub ext` and `insthub check`, the folders in the servers'
 `.json` files and the New server dialog's list are step 7
 (`insthub/extensions.py`). Starting an extension's UIs (`insthub open`,
@@ -249,11 +251,15 @@ folder.
 
 insthub runs nothing of an extension that another user may change: its
 manifest, which says what is run, and its folder, whose modules come first,
-must belong to you (or root) and be writable by no one else. A group of
-your own alone counts as you, since a umask of 002 makes files writable for
-it. This matters because a manifest is also looked for in the folders above
-a device's code, and one of them, such as `/tmp`, may be anyone's. An
-extension that fails this check says why in its error, and offers no UI.
+must belong to you (or root) and be writable by no one else. So must its
+Python: the folder that holds its virtualenv, the virtualenv, its `bin`
+folder and the `python` in it (a link: the link itself, which only its owner
+may change). A group of your own alone counts as you, since a umask of 002
+makes files writable for it. This matters because a manifest, and a
+virtualenv, are also looked for in the folders above, and one of them, such
+as `/tmp`, may be anyone's. An extension that fails this check says why in
+its error, and offers no UI; a server file's virtualenv that fails it is not
+used.
 
 A driver class wrapped from a manifest keeps its safety options in its
 table. For example, the Windfreak synthesizer's raw protocol methods must
@@ -302,8 +308,9 @@ class SpectrumAnalyzer(insthub.Wrapped):
 ```
 
 For a driver wrapped from a `.toml`, the keys `extension = "hp8562a"` (and
-`simulated = true`) go in its `[devices.x]` table; the New server dialog will
-write them. A driver class that has `simulated = True` makes its wrapped
+`simulated = true`) go in its `[devices.x]` table. The New server dialog
+writes `extension` for a device chosen from a manifest, and `simulated` when
+the manifest's table has it. A driver class that has `simulated = True` makes its wrapped
 device say so by itself. `describe()` then carries `extension`,
 `extension_version` and `simulated` (each only when set), so any client on
 any computer can match a device to its UI without importing anything. The
@@ -407,12 +414,18 @@ valid TOML, its `api` is too new, its `id` is not a valid name, its Python or
 its folder is missing) is listed with its error by `insthub ext list` and on
 the window's Settings page. It never hides the other extensions, and `insthub
 check FOLDER` says what to do about it. `insthub check FOLDER --import` also
-imports each of its drivers, and the exception classes their `link_errors`
-name, in the extension's Python, in a program of its own that needs nothing
-but the standard library there, and reports those that fail and those that
-load Qt. For a server file, `insthub check lab.toml
---import` makes the check `insthub service install` makes, in the Python of
-its devices' extensions.
+loads what its entries name, in the extension's Python, in a program of its
+own that needs nothing but the standard library there: each of its drivers,
+the exception classes their `link_errors` name, each panel's function and
+each app's `-m` module (looked for, not run). It reports those that fail,
+drivers that load Qt, and a device class whose `extension` is not the
+manifest's `id` (its devices would find no UI; the device page says so too).
+For a server file, `insthub check lab.toml --import` makes the check
+`insthub service install` makes, in the Python that serves the file: that of
+its devices' extensions when they agree on one, else a virtualenv next to the
+file or next to a device's code, else insthub's own (one rule,
+`extensions.python_for`, which the service and the window's Keep a server
+running dialog follow too).
 
 ### When code is loaded
 
@@ -430,7 +443,7 @@ means importing it in the program that needs it.
 ### Writing the UI half
 
 *Status: implemented: `qt.device_window`, `insthub panel`, `insthub open`
-(step 8), `qt.start`, `qt.coalesce` and the controls a panel can embed,
+(step 8), `qt.start`, `qt.coalesce`, `qt.follow` and the controls a panel can embed,
 `insthub.controls` (step 11). Examples to copy: insthub's own panel for its
 simulated scope, `insthub/sim_ui.py`, which uses them all, and the panel and
 the app of the reference extension, `examples/extension/demolaser_insthub/ui/`
@@ -452,7 +465,10 @@ faster than the instrument takes it (a slider, a spin box's arrows held down)
 goes out through `qt.coalesce`: one call on its way at a time, and the values
 sent meanwhile merged into the next one, the newest value of each key winning
 (or as a `merge` function says, for keys that go together, such as a center
-and a span), so the instrument never works through a backlog. What the panel does
+and a span), so the instrument never works through a backlog. A control that
+also shows the device's value goes through `qt.follow`, which builds on
+`qt.coalesce`: it shows what the device reports, but not an old report over a
+value on its way, and once a call has ended, what the device took. What the panel does
 not show in a way of its own, `controls.Controls(device, include, exclude)`
 shows: the settings and commands of any device, made from its `describe()`,
 the same widgets as the window's device page (see [a generic
@@ -486,9 +502,12 @@ moment could make it start a second server for the same instrument.
 The window writes the output of an app or a panel to a log file in insthub's
 runtime folder, as it does for the live view and the servers it starts. If
 one ends with an error, at once or later, the window shows the log's last
-lines, for example "cannot load the panel 'x:make': No module named 'PyQt6'
-(this is .../python; does it have the libraries of the extension's UI, such
-as its gui extra?)". `insthub open` waits three seconds and prints them if it
+lines, for example "cannot load the panel 'x:make': insthub.qt needs a Qt
+binding: pip install 'insthub[gui]' (pyqtgraph + PyQt6) (this is
+.../python; does it have the libraries of the extension's UI, such as its gui
+extra?)". A program that Qt or a vendor library ends by a signal (Qt aborts
+when it cannot load its platform plugin) has ended with an error too; one
+stopped on purpose (SIGTERM, SIGINT, SIGKILL, SIGHUP) has not. `insthub open` waits three seconds and prints them if it
 ended with an error by then.
 
 The launched program runs the extension's own insthub, which may be older
@@ -551,7 +570,7 @@ there is no version number to name.)
 | What | How |
 |---|---|
 | the manifest's format | `api = 1`. insthub refuses a manifest with a higher number and accepts lower ones until one is deliberately dropped. |
-| the extension's code | `version` in the manifest, `extension_version` on the device. When the device states one, the window can say "running 0.3, the folder has 0.4: restart", as LabRAD's node does. The New server dialog never writes `extension_version` into a `.toml`, because it would freeze there, and `insthub check` warns when a class's `extension_version` (read from its source, without running it) differs from its manifest's `version`. |
+| the extension's code | `version` in the manifest, `extension_version` on the device. When the device states one, the window could say "running 0.3, the folder has 0.4: restart", as LabRAD's node does (proposed, as at [installing, updating and broken extensions](#installing-updating-and-broken-extensions); today the device page shows the version the device states). The New server dialog never writes `extension_version` into a `.toml`, because it would freeze there, and `insthub check` warns when a class's `extension_version` (read from its source, without running it) differs from its manifest's `version` (with `--import`, read from the imported class, also when its source does not say it plainly). |
 | the bus between two programs | Every connection starts with the bytes `INSTHUB1`, so a program that speaks another protocol is refused. The server's first message about itself, the *hello*, carries `protocol`, insthub's `version` and a list of `features` (`server.FEATURES`, today `["dangerous", "logs", "meta", "pause"]`), so that a client can ask (`client.supports("pause")`) before it relies on something newer. Both sides skip kinds of message they do not know instead of closing the connection. Together these let a feature arrive without everyone upgrading at once. |
 | `describe()` | Keys are only ever added, and they are optional, so older programs ignore them. |
 
@@ -711,11 +730,11 @@ so they are built on guard rails.
 | 4 | **Done.** Devices say what they are: `extension`, `extension_version`, `simulated` (a SIM badge on the tile and the device page, in `insthub info`, and in `list_devices` for agents), as `Device` attributes, `wrap()` options and config keys | `device.py`, `config.py`, window, `mcp.py` | small |
 | 5 | **Done.** Metadata for properties and command parameters (`META_KEYS`, `set_meta`, choices from `Literal` and `Enum`), accessor pairs, polling from the config; the names that a wrapped driver's `meta`, `poll` and `dangerous` use are checked with the file (so by `insthub service install`); the device page's controls follow the metadata, and `insthub info` shows it | `device.py`, `config.py`, `pages.py`, `mcp.py` | small to medium |
 | 6 | **Done.** Dangerous commands: `@command(dangerous=True)`, also for a whole wrapped driver at once. The MCP tools refuse them, including through `$set`, and a seventh tool, `call_dangerous`, runs them, so an agent can be allowed everything else without asking. The window asks before running one. A config file can only add marks, and an accessor pair is marked as a whole. | `device.py`, `mcp.py`, `pages.py` | small |
-| 7 | **Done.** Extension manifests: `insthub/extensions.py` (no Qt, never imported by `import insthub`); `insthub ext list`, `add` and `remove`, and the same on the window's Settings page, with what is wrong with each; `insthub check PATH [--import]` (with `--import`, a manifest's drivers are imported in the extension's Python, and a server file gets the check of `insthub service install`); insthub's own manifest for its simulators; each device's folders and the server's Python in the server's `.json` file (not in the hello); the New server dialog offers the manifests' devices, fills in their keys and runs them with the extension's Python | new module, `cli.py`, `server.py`, `forms.py` | medium |
+| 7 | **Done.** Extension manifests: `insthub/extensions.py` (no Qt, never imported by `import insthub`); `insthub ext list`, `add` and `remove`, and the same on the window's Settings page, with what is wrong with each; `insthub check PATH [--import]` (with `--import`, what a manifest's entries name is loaded in the extension's Python: drivers, `link_errors`, panels and apps' modules, and a class whose `extension` is not the manifest's `id` is reported; a server file gets the check of `insthub service install`, in the Python that serves it, `extensions.python_for`, the one rule that the service and the window's dialogs follow too); an extension's Python, like its manifest, is run only if no other user may change it; insthub's own manifest for its simulators; each device's folders and the server's Python in the server's `.json` file (not in the hello); the New server dialog offers the manifests' devices, fills in their keys and runs them with the extension's Python | new module, `cli.py`, `server.py`, `forms.py` | medium |
 | 8 | **Done.** Starting UIs: `extensions.launch` (an app or a panel, in the extension's folder and Python) and `device_uis` (a device's UIs, from its own folders when its server runs here, or why there are none); `insthub open`, `insthub panel`, `qt.device_window`; the device page's **Open** buttons and its tile's menu, and the hint for an extension not installed here; `types` in a `[ui.NAME]` table; insthub's own scope panel (`sim_ui.py`); everything the window starts (servers, live views, UIs) writes a log file through one helper (`inventory.spawn`), and the window shows its last lines when one ends with an error; a stop asked before a Qt program's event loop runs is no longer lost | `extensions.py`, `cli.py`, `qt.py`, `manager.py`, `pages.py`, `inventory.py` | medium |
-| 9 | **Done** for insthub's part. The reference extension, `examples/extension/`: a simulated laser that runs without hardware, with a manifest; a driver with a module name of its own and no insthub in it; a `Wrapped` device that says its extension and version, that it is simulated, the units and limits of its settings, what it polls and what is dangerous, and keeps its raw protocol off the bus; a panel made of `qt.coalesce`, `qt.watch` and `Controls`; an app that only attaches when it is given an address, and else hosts a laser itself if none runs; a server file; and a README on trying it and making it your own. The tests run it from `insthub check --import` to `insthub open`. Converting `hp_8562a_gpib` belongs to that project, and its first step is done there (see [existing projects](#existing-projects-become-extensions)) | `examples/extension/` | medium |
-| 10 | **Done.** Operations: a server's process keeps its last 1000 log records (`server.keep_logs`; all of them, and exceptions nothing caught, for `insthub serve`, `insthub sim` and `serve()`; insthub's own for a program that hosts a server, from before its devices start, and still printed where they were: Python's last resort for a program that leaves logging alone), and the server call `logs` (the feature `"logs"`) gives them to `Client.logs()`, `insthub logs SERVER [-f]` and the window's **Logs** for a server with no journal or log file; an older server says it keeps none; `service install`, `start` and `restart` wait until the service's process has announced its server, and show the journal's last lines if it does not; a limit on restart loops (5 s apart, 5 starts in 5 minutes; `start` resets it), and the restart count in `insthub service list` and the window; `insthub.states()` and `insthub states` collect every device's state at once for saving next to a data file (each name read where `locate` finds it, so a name two servers have is an error, not a guess; `address=` / `-a` for one server; exit code 1 when what was asked for is missing); remote addresses in one place, `registry.remote_addresses()` (`devices.toml`'s `[devices]` and a new `[servers]` table), for `locate` (which asks those servers for their devices on a miss, cached for 5 s or until `devices.toml` changes), `discover(remote=True)`, `insthub list`, the window and MCP, each server once however many addresses reach it (`registry.identity`: name, pid and start time), and a `devices.toml` that cannot be read named instead of stopping them; looking at a server elsewhere keeps no connection open to it; every `discover()` entry has the `"address"` to use; `insthub logs NAME` looks at this computer first; `insthub.connect(address, connect_timeout=...)` | `server.py`, `service.py`, `client.py`, `registry.py` | small each |
-| 11 | **Done.** Qt helpers for panels: `qt.start` (a call started off the GUI thread, in order per connection, so a server that has gone away never freezes the window); `qt.coalesce` (one call on its way at a time, later values merged into the next one; `send.busy` says whether one is on its way); `qt.deliver(..., owner=widget)` hands nothing to a widget that was deleted; the device page's settings and commands as widgets of their own, `insthub.controls` (`Controls`, `Settings`, `Commands`, with `include` and `exclude`), which the window's device page is made of (it replaces how they reach the device, through its workers) and insthub's scope panel embeds | `qt.py`, `controls.py`, `pages.py`, `sim_ui.py` | medium |
+| 9 | **Done** for insthub's part. The reference extension, `examples/extension/`: a simulated laser that runs without hardware, with a manifest; a driver with a module name of its own and no insthub in it; a `Wrapped` device that says its extension and version, that it is simulated, the units and limits of its settings, what it polls and what is dangerous, and keeps its raw protocol off the bus; a panel made of `qt.follow`, `qt.watch` and `Controls`; an app that only attaches when it is given an address, and else hosts a laser itself if none runs; a server file; and a README on trying it and making it your own. The tests run it from `insthub check --import` to `insthub open`. Converting `hp_8562a_gpib` belongs to that project, and its first step is done there (see [existing projects](#existing-projects-become-extensions)) | `examples/extension/` | medium |
+| 10 | **Done.** Operations: a server's process keeps its last 1000 log records (`server.keep_logs`; all of them, and exceptions nothing caught, for `insthub serve`, `insthub sim` and `serve()`; insthub's own for a program that hosts a server, from before its devices start, and still printed where they were: Python's last resort for a program that leaves logging alone), and the server call `logs` (the feature `"logs"`) gives them to `Client.logs()`, `insthub logs SERVER [-f]` and the window's **Logs** for a server with no journal or log file; an older server says it keeps none; `service install`, `start` and `restart` wait until the service's process has announced its server, and show the journal's last lines if it does not; a limit on restart loops (5 s apart, 5 starts in 5 minutes; `start` resets it), and the restart count in `insthub service list` and the window; `insthub.states()` and `insthub states` collect every device's state at once for saving next to a data file (each name read where `locate` finds it, by one rule, `client._place`, which the agents' `list_devices` follows too, so a name two servers have is an error, not a guess; `address=` / `-a` for one server; exit code 1 when what was asked for is missing); remote addresses in one place, `registry.remote_addresses()` (`devices.toml`'s `[devices]` and a new `[servers]` table), for `locate` (which asks those servers for their devices on a miss, cached for 5 s or until `devices.toml` changes), `discover(remote=True)`, `insthub list`, the window and MCP, each server once however many addresses reach it (`registry.identity`: name, pid and start time), and a `devices.toml` that cannot be read named instead of stopping them; looking at a server elsewhere keeps no connection open to it; every `discover()` entry has the `"address"` to use; `insthub logs NAME` looks at this computer first; `insthub.connect(address, connect_timeout=...)` | `server.py`, `service.py`, `client.py`, `registry.py` | small each |
+| 11 | **Done.** Qt helpers for panels: `qt.start` (a call started off the GUI thread, in order per connection, so a server that has gone away never freezes the window); `qt.coalesce` (one call on its way at a time, later values merged into the next one; `send.busy` says whether one is on its way); `qt.follow` (the same for a control that also shows the device's value: never an old report over a value on its way, and what the device took once a call has ended); `qt.deliver(..., owner=widget)` hands nothing to a widget that was deleted; the device page's settings and commands as widgets of their own, `insthub.controls` (`Controls`, `Settings`, `Commands`, with `include` and `exclude`), which the window's device page is made of (it replaces how they reach the device, through its workers) and insthub's scope panel embeds | `qt.py`, `controls.py`, `pages.py`, `sim_ui.py` | medium |
 
 Only when a real need shows up:
 
