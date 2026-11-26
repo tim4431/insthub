@@ -5,12 +5,15 @@ a server: anything it asks for goes through the window's workers.
     Sidebar        the way to each page; how many servers and devices, what is broken
     DevicesPage    a tile per device, in a section per server, with a search
     DevicePage     a device: its connection, its properties (to read and change), streams,
-                   periodic tasks, state and commands (to run); Pause and Resume; an Open
-                   button for each UI of its extension.  Its Settings and Commands tabs are
-                   the controls a panel can embed too (controls.py)
+                   periodic tasks, state, commands (to run, or save as a recipe) and the
+                   recipes that use it; Pause and Resume; an Open button for each UI of
+                   its extension.  Its Settings and Commands tabs are the controls a panel
+                   can embed too (controls.py)
     ServersPage    a card per server; Update all, when a server can be updated
     ServerPage     a server: its process, addresses, service (and whether it starts at
                    login, and whether its unit is out of date), devices and clients
+    RecipesPage    every recipe, to read and run (each in a process of its own); your
+                   recipes folder
     AgentsPage     giving AI agents the instruments (insthub mcp); which are connected
     SettingsPage   how the window looks and behaves; the files insthub uses; whether the
                    window itself runs older code
@@ -31,8 +34,9 @@ import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import __version__, controls, extensions, launcher, registry, service, tomlfile
+from . import __version__, cli, controls, extensions, launcher, recipes, registry, service, tomlfile
 from . import widgets as ui
+from .client import meta_text
 from .device import busy_with
 from .errors import BusError
 from .inventory import (
@@ -820,7 +824,521 @@ class _Settings(_InWindow, controls.Settings):
 
 
 class _Commands(_InWindow, controls.Commands):
-    """The device page's Commands tab."""
+    """The device page's Commands tab, with Save as recipe (a panel's Commands has none)."""
+
+    def __init__(self, page: DevicePage):
+        super().__init__(page)
+        self.save_button = ui.button("Save as recipe...", "file", slot=self.save_recipe,
+                                     tip="Keep this command, with these arguments, as a recipe: a Python "
+                                         "function in your recipes folder, which runs with one click from the "
+                                         "Recipes tab, or with  insthub run NAME")
+        self.line.addWidget(self.save_button)
+        self._chosen()
+
+    def _chosen(self) -> None:
+        super()._chosen()
+        if (button := getattr(self, "save_button", None)) is not None:  # (not yet while controls.Commands is made)
+            name = self.current()
+            button.setEnabled(name is not None and not name.startswith("$"))
+
+    def save_recipe(self) -> None:
+        """Save the chosen command, with the arguments typed, as a recipe: a function in your recipes
+        folder's file for this device (recipes.save), replacing one of that name once you agree.  A
+        name that another of your files has for a recipe is asked about first: `insthub run NAME`
+        would then have to say which."""
+        name, device = self.current(), self.page.name
+        if name is None or device is None:
+            return
+        try:
+            positional, keyword = cli.parse_params(cli.split_arguments(self.args.text()))
+        except ValueError as e:
+            self.result.setPlainText(f"Cannot read the arguments: {e}")
+            return
+        window = self.page.window
+        path = recipes.save_path(device)
+        call = f"{device}.{name} {self.args.text().strip()}".rstrip()
+        recipe = name if name.isidentifier() and not name.startswith("_") else ""
+        while True:
+            recipe, ok = QtWidgets.QInputDialog.getText(
+                window, "Save as recipe", f"Save  {call}  as a recipe: a Python function in\n{path}\n\n"
+                "Run it later from the Recipes tab, or with  insthub run NAME.  Its name:", text=recipe)
+            recipe = recipe.strip()
+            if not ok or not recipe:
+                return
+            mine = recipes.read_file(path)[0] if path.is_file() else []
+            old = next((r for r in reversed(mine) if r.name == recipe), None)  # (the one save() replaces: the last)
+            others = [r for file in recipes.your_files() if file != path
+                      for r in recipes.read_file(file)[0] if r.name == recipe]
+            if old is not None or not others or window.confirm(  # (with `old`, there are two of that name already)
+                    f"Another recipe called {recipe}?",
+                    f"Another of your recipes is called {recipe} "
+                    f"({', '.join(f'{r.file.name}, line {r.line}' for r in others)}). With this one too, "
+                    f"insthub run {recipe} and agents must say which one, as {others[0].full_name} or "
+                    f"{path.stem}.{recipe}.\n\nSave it as {recipe} all the same? Cancel to choose another name.",
+                    f"Save as {recipe}"):
+                break
+        if old is not None and not window.confirm(
+                f"Replace {recipe}?", f"{path.name} has a recipe named {recipe} already (line {old.line}: "
+                f"{old.title}).\n\nReplace it with this one? The rest of the file stays as it is.", "Replace"):
+            return
+        try:
+            saved = recipes.save(recipe, device, name, positional, keyword)
+        except (ValueError, OSError) as e:
+            QtWidgets.QMessageBox.warning(window, "Save as recipe", f"Cannot save the recipe.\n\n{e}")
+            return
+        window.recipes_changed()
+        window.say(f"Saved the recipe {recipe} in {saved}", 6000)
+
+
+# ---------------------------------------------------------------- recipes
+CODE_LINES = 14  #: lines of a recipe's code shown at most, before it scrolls
+RESULT_SHOWN = 200_000  #: characters of what a recipe returned shown at most, as many as of what it printed
+
+
+def _result_text(result) -> str:
+    """What a recipe returned, as the output box shows it: "Result: 5", or "Result:" and its JSON
+    lines; the first RESULT_SHOWN characters of a long one, and how much is left out.  (It can take
+    a while: on a worker.)"""
+    if result is None:
+        return "(no result)"
+    shown = cli._show(result)
+    if len(shown) > RESULT_SHOWN:
+        cut = shown.rfind("\n", 0, RESULT_SHOWN) + 1 or RESULT_SHOWN  # (at the end of a line, if it has lines)
+        shown = f"{shown[:cut].rstrip()}\n... and {len(shown) - cut:,} more characters, not shown"
+    return f"Result:\n{shown}" if "\n" in shown else f"Result: {shown}"
+
+
+def _cut(old: str, new: str, tries: int = 64) -> int | None:
+    """How many characters to cut from the start of `old` for `new` to go on from what is left: 0
+    if `new` starts with `old`; None if it does not go on from it.  (A Run keeps only the last
+    characters a recipe printed, and drops whole lines from the start.)"""
+    if new.startswith(old):
+        return 0
+    end = new.find("\n") + 1
+    if not end:
+        return None
+    first = new[:end]  # its first line: a whole line of `old`
+    at = old.find(first, 1)
+    for _ in range(tries):  # (a line printed many times is found at many places)
+        if at < 0:
+            return None
+        if old[at - 1] == "\n" and new.startswith(old[at:]):
+            return at
+        at = old.find(first, at + 1)
+    return None
+
+
+def _units(text: str) -> int:
+    """The length of `text` as Qt counts it (UTF-16: a character beyond U+FFFF is two)."""
+    return len(text) if text.isascii() else len(text.encode("utf-16-le")) // 2
+
+
+def _uses(r: recipes.Recipe) -> str:
+    """What a recipe uses of each of its devices, briefly, as rich text:
+    "Uses <b>synth</b>: frequency = ..., rf() · <b>sa</b>: center"."""
+    parts = []
+    for device in r.devices:
+        used = dict.fromkeys(u.text()[len(device) + 1:] for u in r.uses if u.device == device)  # (sa.ch1: a dot)
+        parts.append(f"<b>{ui.esc(device)}</b>" + (f": {ui.esc(', '.join(used))}" if used else ""))
+    if r.named_later:
+        parts.append("a device named only when it runs, which is not checked first")
+    if not parts:
+        return 'Uses no device that insthub can see (it looks for <code>insthub.device("NAME")</code> in the code)'
+    return "Uses " + " · ".join(parts)
+
+
+def _code_box(placeholder: str = "", wrap: bool = False) -> QtWidgets.QPlainTextEdit:
+    """A read-only box of monospace text (code, or what a program printed)."""
+    box = QtWidgets.QPlainTextEdit()
+    box.setProperty("role", "code")
+    box.setReadOnly(True)
+    box.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont))
+    if not wrap:
+        box.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+    box.setCornerWidget(QtWidgets.QWidget())  # (where the two scroll bars meet: the box's own background)
+    box.setUndoRedoEnabled(False)  # (nothing to undo; and no copy kept of what is cut from it)
+    box.setPlaceholderText(placeholder)
+    box.setMinimumHeight(72)
+    return box
+
+
+def _lines_high(box: QtWidgets.QPlainTextEdit, lines: int) -> int:
+    """The height of a box that shows that many lines."""
+    return box.fontMetrics().lineSpacing() * lines + 22
+
+
+class _Recipes(QtWidgets.QWidget):
+    """Recipes to read and run (see recipes.py): a table of them; for the one chosen, what it is,
+    what it uses, its code and its parameters.  Run asks its devices first (recipes.check, on a
+    worker) and runs nothing if one is missing or lacks what it uses; it asks you before what is
+    marked dangerous.  The recipe then runs in a process of its own (recipes.start): the window
+    never runs its code.  What it prints comes into the output box while it runs, then what it
+    returned or why it failed; Stop ends it.  One runs at a time here.  The device page shows
+    the recipes that use its device; the Recipes page (`every`), all of them.  `empty` is what
+    is shown instead while there is none."""
+
+    def __init__(self, window: Manager, empty: QtWidgets.QWidget, every: bool = False):
+        super().__init__()
+        self.window, self.empty, self.every = window, empty, every
+        self._recipes: list = []
+        self._chosen_key: tuple | None = None  # (file, name) of the recipe chosen
+        self._code_for: tuple | None = None  # (recipe, its file's mtime) whose code is shown
+        self._run: recipes.Run | None = None  # under way (or ended, until what it returned is read)
+        self._checking = False  # asking its devices
+        self._stopping = False
+        self._notes = ""  # what the check said besides problems, for the status line
+        self._printed = ""  # what the output box holds
+        self.warning = ui.label("", wrap=True, select=True)  # the files that cannot be read
+        self.warning.setTextFormat(Qt.TextFormat.RichText)
+        self.warning.hide()
+        self.empty.hide()
+        headers = ["Recipe", "Parameters", "Devices", "From", "Description"]
+        self.table = ui.table(*(headers if every else [h for h in headers if h != "Devices"]))
+        self.table.itemSelectionChanged.connect(self._chosen)
+        self.table.itemDoubleClicked.connect(lambda *_: self.params.setFocus())
+        self._rows_shown = 8 if every else 3  # the table is as tall as this many rows at most, then scrolls
+        self.boxed = ui.boxed(self.table)
+
+        self.title = ui.label("", wrap=True, select=True)
+        self.title.setTextFormat(Qt.TextFormat.RichText)
+        self.about = ui.label("", "small", wrap=True, select=True)  # what it uses; its parameters
+        self.about.setTextFormat(Qt.TextFormat.RichText)
+        self.params = QtWidgets.QLineEdit()
+        self.params.returnPressed.connect(self.run)
+        self.run_button = ui.button("Run", "start", kind="primary", slot=self.run,
+                                    tip="Ask its devices whether they have what it uses, then run it in a process "
+                                        "of its own")
+        self.stop_button = ui.button("Stop", "stop", slot=self.stop,
+                                     tip="End it as Ctrl-C would (its finally blocks run); for good 3 s later")
+        self.open_button = ui.button("Open file", "file", slot=self._open_file, tip="Its file, in your text editor")
+        line = QtWidgets.QHBoxLayout()
+        line.setSpacing(8)
+        line.addWidget(self.params, 1)
+        for button in (self.run_button, self.stop_button, self.open_button):
+            line.addWidget(button)
+        self.code_caption = ui.label("Code", "small")
+        self.code = _code_box("The code of the recipe you choose appears here.")
+        self.output = _code_box("What it prints, then what it returns, appears here.", wrap=True)
+        for widget in (self.code, self.output):  # side by side, as tall as each other: as the room there is
+            widget.setMaximumHeight(_lines_high(widget, CODE_LINES))
+            widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Ignored)
+        self.status = ui.label("", "small", wrap=True, select=True)
+        output_caption = ui.label("Output", "small")
+        for caption in (self.code_caption, output_caption):  # (on top of its box, however tall the page)
+            caption.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed)
+        boxes = QtWidgets.QGridLayout()
+        boxes.setHorizontalSpacing(12)
+        boxes.setVerticalSpacing(4)
+        boxes.addWidget(self.code_caption, 0, 0)
+        boxes.addWidget(output_caption, 0, 1)
+        boxes.addWidget(self.code, 1, 0)
+        boxes.addWidget(self.output, 1, 1)
+        boxes.setColumnStretch(0, 1)
+        boxes.setColumnStretch(1, 1)
+        boxes.setRowStretch(1, 1)
+        self.detail = QtWidgets.QWidget()
+        inside = QtWidgets.QVBoxLayout(self.detail)
+        inside.setContentsMargins(0, 0, 0, 0)
+        inside.setSpacing(8)
+        inside.addWidget(self.title)
+        inside.addWidget(self.about)
+        inside.addLayout(line)
+        inside.addLayout(boxes, 1)
+        inside.addWidget(self.status)
+        inside.addStretch()  # (what is left once the boxes are as tall as they get)
+
+        area, content = ui.scroll_page(margins=(0, 0, 0, 0), spacing=8)  # (it scrolls in a window too small for it)
+        for widget in (self.warning, self.empty, self.boxed):
+            content.addWidget(widget)
+        content.addWidget(self.detail, 1)
+        content.addStretch()  # (below what says that there is none)
+        box = QtWidgets.QVBoxLayout(self)
+        box.setContentsMargins(0, 0 if every else 12, 0, 0)
+        box.addWidget(area)
+        self.table.horizontalScrollBar().rangeChanged.connect(lambda *_: self._fit_table())
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(150)
+        self._timer.timeout.connect(self._tick)
+        self._show_list()
+        self._chosen()
+
+    @staticmethod
+    def _key(r) -> tuple | None:
+        return (str(r.file), r.name) if r is not None else None
+
+    def busy(self) -> bool:
+        """Whether a recipe is being checked or runs."""
+        return self._checking or self._run is not None
+
+    def load(self, found: tuple | None, fresh: bool = False) -> int:
+        """Show (recipes, the files that cannot be read) as recipes.available() or for_device() found
+        them (None: not known yet).  `fresh`: for another device than before, so the choice and what
+        was typed go, and what was shown unless a recipe runs.  Returns how many recipes there are."""
+        listed, problems = found if found is not None else ([], [])
+        if fresh or listed != self._recipes:
+            keep = None if fresh else self._key(self.current())
+            self._recipes = list(listed)
+            self._show_list()
+            keys = [self._key(r) for r in self._recipes]
+            blocked = self.table.blockSignals(True)
+            self.table.clearSelection()
+            if keep in keys:
+                self.table.selectRow(keys.index(keep))
+            self.table.blockSignals(blocked)
+            if fresh and not self.busy():
+                self._say("")
+                self.status.clear()
+            self._chosen()
+        else:
+            self._refresh_code()
+        self.warning.setText("<br>".join(_badge(BAD, p) for p in problems))
+        self.warning.setVisible(bool(problems))
+        empty = found is not None and not listed
+        self.empty.setVisible(empty)
+        self.boxed.setVisible(not empty)
+        self.detail.setVisible(not empty or self.busy() or bool(self._printed))  # (a run's end stays in sight)
+        return len(listed)
+
+    def _show_list(self) -> None:
+        rows = []
+        for r in self._recipes:
+            params = ", ".join(p.text() for p in r.params.values())
+            devices = ", ".join(r.devices) + (" (and one named when it runs)" if r.named_later else "")
+            row = [r.name, params, devices, r.file.name if r.file else "",
+                   f"Cannot be used: {r.error}" if r.error else r.title]
+            rows.append(row if self.every else [x for i, x in enumerate(row) if i != 2])
+        ui.fill(self.table, rows)
+        last = self.table.columnCount() - 1
+        for row, r in enumerate(self._recipes):
+            self.table.item(row, 0).setToolTip(r.full_name)
+            self.table.item(row, last - 1).setToolTip(f"{r.file}\n{r.where()}")
+            item = self.table.item(row, last)
+            item.setToolTip(r.error or r.doc or r.title)
+            item.setData(Qt.ItemDataRole.ForegroundRole, ui.color(ui.STATUS[BAD]) if r.error else None)
+        self._fit_table()
+
+    def _fit_table(self) -> None:
+        """Make the table as tall as its rows (as _rows_shown of them at most, then it scrolls), and its
+        scroll bar when it is too narrow for its columns."""
+        bar, rows = self.table.horizontalScrollBar(), min(max(len(self._recipes), 1), self._rows_shown)
+        height = (self.table.horizontalHeader().sizeHint().height() + 4
+                  + rows * self.table.verticalHeader().defaultSectionSize()
+                  + (bar.sizeHint().height() if bar.maximum() > 0 else 0))
+        if height != self.table.height():
+            self.table.setFixedHeight(height)
+
+    def current(self) -> recipes.Recipe | None:
+        rows = self.table.selectionModel().selectedRows()
+        return self._recipes[rows[0].row()] if rows and rows[0].row() < len(self._recipes) else None
+
+    def choose(self, name: str) -> None:
+        """Choose a recipe by its name (or full name), as a click on its row does."""
+        self.table.selectRow(next(i for i, r in enumerate(self._recipes) if name in (r.name, r.full_name)))
+
+    def _chosen(self) -> None:
+        r = self.current()
+        if self._key(r) != self._chosen_key:  # another recipe: what was typed was for the one before
+            self._chosen_key = self._key(r)
+            self.params.clear()
+        if r is None:
+            self.title.setText(ui.muted("Choose a recipe above, then Run.") if self._recipes else "")
+            self.about.hide()
+            self.params.setPlaceholderText("")
+            self.params.setEnabled(False)
+        else:
+            doc = r.doc.split("\n\n")[0].replace("\n", " ")
+            self.title.setText(f"<b>{ui.esc(r.title)}</b>" + (f" &nbsp;{ui.muted(ui.esc(doc))}" if doc else ""))
+            hints = [f"{ui.esc(p.name)}: {ui.esc(' · '.join(x for x in (p.doc, meta_text(p.meta)) if x))}"
+                     for p in r.params.values() if p.doc or p.meta]
+            if r.takes_more:
+                hints.append("it also takes other values by name")
+            self.about.setText(_uses(r) + (f"<br>{' · '.join(hints)}" if hints else "")
+                               + (f"<br><span style='color:{ui.STATUS[BAD]}'>Cannot be used: {ui.esc(r.error)}</span>"
+                                  if r.error else ""))
+            self.about.show()
+            typed = " ".join([f"{p.name}=..." for p in r.params.values() if p.required]
+                             + [f"{p.name}={p.default_text}" for p in r.params.values() if not p.required])
+            self.params.setPlaceholderText(f"{typed}   (NAME=VALUE; the others keep their defaults)" if typed else
+                                           "NAME=VALUE: it takes values by name" if r.takes_more else
+                                           "it has no parameters")
+            self.params.setEnabled((bool(r.params) or r.takes_more) and r.error is None)
+        self._refresh_code(force=True)
+        self._buttons()
+
+    def _refresh_code(self, force: bool = False) -> None:
+        """Show the chosen recipe's code as its file is now (read again when the file changes)."""
+        r = self.current()
+        try:
+            mtime = r.file.stat().st_mtime_ns if r is not None else None
+        except OSError:
+            mtime = None
+        if not force and self._code_for == (self._key(r), mtime):
+            return
+        self._code_for = self._key(r), mtime
+        text = r.source() if r is not None else ""
+        if text != self.code.toPlainText():
+            self.code.setPlainText(text)
+        self.code_caption.setText(f"Code · {r.file.name}, line {r.line} · {r.where()}" if r is not None else "Code")
+        self.code_caption.setToolTip(str(r.file) if r is not None else "")
+
+    def _buttons(self) -> None:
+        r = self.current()
+        can_run = r is not None and r.error is None and not self.busy()
+        if can_run != self.run_button.isEnabled():
+            self.run_button.setEnabled(can_run)  # (the icon in the ink of the text: white only on blue)
+            self.run_button.setIcon(ui.icon("start", ui.current().on_accent if can_run else None))
+        run = self._run
+        self.stop_button.setEnabled(run is not None and not run.done() and not run.stopping)  # (see stop)
+        self.open_button.setEnabled(r is not None and r.file is not None)
+
+    def _open_file(self) -> None:
+        r = self.current()
+        if r is not None and not open_path(r.file):
+            self.window.say(f"Cannot open {r.file}")
+
+    def _say(self, text: str) -> None:
+        """Show `text` in the output box.  If it goes on from what is there (a Run keeps only the last
+        characters a recipe printed, so lines may have gone from the start: see _cut), only what
+        changed is changed, so the line you read stays in its place and what you selected stays
+        selected.  The box follows the end if it was at the end."""
+        old, box = self._printed, self.output
+        if text == old:
+            return
+        bar = box.verticalScrollBar()
+        value, follow = bar.value(), bar.value() >= bar.maximum() - 4
+        cut = _cut(old, text) if old else None
+        if cut is None:
+            box.setPlainText(text)
+            if not follow:
+                bar.setValue(min(value, bar.maximum()))
+        else:
+            top = box.cursorForPosition(QtCore.QPoint(0, 0)).block()  # the first line in sight
+            top_at, down = top.position(), value - top.firstLineNumber()  # (and how far into it, if it wraps)
+            cursor = QtGui.QTextCursor(box.document())
+            if cut:
+                gone = _units(old[:cut])
+                cursor.setPosition(gone, QtGui.QTextCursor.MoveMode.KeepAnchor)
+                cursor.removeSelectedText()
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            cursor.insertText(text[len(old) - cut:])
+            if cut and not follow:
+                top = box.document().findBlock(top_at - gone) if top_at >= gone else None
+                bar.setValue(top.firstLineNumber() + down if top is not None else 0)
+        self._printed = text
+        if follow:
+            bar.setValue(bar.maximum())
+
+    def _status(self, text: str, error: bool = False) -> None:
+        self.status.setText(ui.esc(text) + (f" · {ui.esc(self._notes)}" if self._notes and not error else ""))
+        self.status.setProperty("role", "error" if error else "small")
+        self.status.style().unpolish(self.status)
+        self.status.style().polish(self.status)
+
+    # -- running ---------------------------------------------------------------
+    def run(self) -> None:
+        """Check the chosen recipe with the values typed, then run it (see the class docstring)."""
+        r = self.current()
+        if r is None or r.error or self.busy():
+            return
+        try:
+            positional, values = cli.parse_params(cli.split_arguments(self.params.text()))
+            if positional:
+                raise ValueError(f"give each as NAME=VALUE: {cli._show(positional[0])} has no name")
+            recipes.check_values(r, values)
+        except (ValueError, recipes.RecipeError) as e:
+            self._notes = ""
+            self._say(f"Nothing ran: {e}" if isinstance(e, recipes.RecipeError) else
+                      f"Cannot read the parameters: {e}")
+            self._status(f"{r.name}: not run", error=True)
+            return
+        self._checking, self._notes = True, ""
+        self._say("")
+        self._status(f"{r.name}: asking {', '.join(r.devices)} first..." if r.devices else f"{r.name}: checking...")
+        self._buttons()
+
+        def check():  # the recipe as its file is now: it may have changed since it was listed
+            found, problems = recipes.read_file(r.file, r.origin, r.python)
+            fresh = next((x for x in found if x.name == r.name), None)
+            if fresh is None:
+                raise recipes.RecipeError(problems[0] if problems else f"{r.file} has no recipe {r.name} any more")
+            return fresh, recipes.check(fresh)
+
+        def refused(exc):
+            self._checking = False
+            self._say(f"Nothing ran: {exc if isinstance(exc, recipes.RecipeError) else ui.error_text(exc)}")
+            self._status(f"{r.name}: not run", error=True)
+            self._buttons()
+
+        self.window.submit(self.window.actions, check, lambda found: self._checked(*found, values), refused)
+
+    def _checked(self, r: recipes.Recipe, found: recipes.Checked, values: dict) -> None:
+        self._checking = False
+        self._notes = " · ".join([*(["simulated: " + ", ".join(found.simulated)] if found.simulated else []),
+                                  *found.notes])
+        if found.problems:
+            self._say("Nothing ran. insthub asked its devices first:\n"
+                      + "\n".join(f"  {p}" for p in found.problems))
+            self._status(f"{r.name}: not run", error=True)
+            self._buttons()
+            return
+        if found.dangers and not self.window.confirm(
+                f"Run {r.name}?", f"{r.full_name} uses what is marked dangerous: it can harm the instrument, the "
+                "sample or a person.\n\n" + "\n".join(f"• {d}" for d in found.dangers) + "\n\nRun it?", "Run"):
+            self._say("Not run.")
+            self._status(f"{r.name}: not run")
+            self._buttons()
+            return
+        try:
+            self._run = self.window.start_recipe(r, values)
+        except (recipes.RecipeError, OSError) as e:
+            self._say(f"Nothing ran: {e}")
+            self._status(f"{r.name}: not run", error=True)
+            self._buttons()
+            return
+        self._stopping = False
+        self._timer.start()
+        self._tick()
+
+    def _tick(self) -> None:
+        run = self._run
+        if run is None:
+            self._timer.stop()
+            return
+        self._say(run.output())
+        if not run.done():
+            self._status(f"{run.recipe.name}: {'stopping' if self._stopping else 'running'} · {run.elapsed:.1f} s")
+            self._buttons()
+            return
+        self._timer.stop()
+        self._buttons()
+        self.window.submit(self.window.actions, lambda: _result_text(run.wait(0)),  # (read from a file, written out)
+                           lambda said: self._ended(run, said), lambda exc: self._ended(run, "", exc))
+
+    def _ended(self, run: recipes.Run, said: str, exc: BaseException | None = None) -> None:
+        """`run` has ended: `said` is what it returned (_result_text), or `exc` why it failed."""
+        if run is not self._run:
+            return
+        self._run = None
+        name, took = run.recipe.name, f"{run.elapsed:.2f} s"
+        printed = (getattr(exc, "output", "") or run.output()).rstrip("\n")
+        if exc is not None:
+            said = str(exc) if isinstance(exc, recipes.RecipeError) else ui.error_text(exc)
+            self._status(f"{name} was stopped after {took}" if self._stopping else f"{name} failed after {took}",
+                         error=not self._stopping)
+        else:
+            self._status(f"{name}: done in {took}")
+        self._say(f"{printed}\n\n{said}" if printed else said)
+        self._buttons()
+
+    def stop(self) -> None:
+        """End the recipe that runs (see recipes.Run.stop); returns at once.  Once: Stop is not offered
+        again while it stops, since a second interrupt would cut its finally blocks short (it is ended
+        for good 3 s later all the same)."""
+        run = self._run
+        if run is not None and not run.done() and not run.stopping:
+            self._stopping = True
+            run.stop()
+            self._tick()
 
 
 class DevicePage(_Page):
@@ -887,10 +1405,13 @@ class DevicePage(_Page):
         self.tasks = ui.table("Periodic task", "Every", "Running", "Runs", "Errors", "Last error")
         self.state = ui.table("Key", "Value")
         self.commands = _Commands(self)
+        self.no_recipes = ui.label("", "muted", wrap=True, select=True)  # (see show_device)
+        self.no_recipes.setTextFormat(Qt.TextFormat.RichText)
+        self.recipes = _Recipes(window, self.no_recipes)
         self._switches: dict[str, ui.Switch] = {}
         for widget, title in ((self.props, "Settings"), (self._pad(self.streams), "Streams"),
                               (self._pad(self.tasks), "Periodic tasks"), (self._pad(self.state), "State"),
-                              (self.commands, "Commands")):
+                              (self.commands, "Commands"), (self.recipes, "Recipes")):
             self.tabs.addTab(widget, title)
         self.body.addWidget(self.tabs, 1)
 
@@ -1057,12 +1578,99 @@ class DevicePage(_Page):
         ui.fill(self.state, [[k, ui.short(v)] for k, v in state.items()])
         self.props.load(d, (s.key, name))  # (the same device also when a probe failed: d is None)
         self.commands.load(d, (s.key, name))
-        counts = (len(d["properties"]) if d else 0, len(streams), len(tasks), len(state), len(d["commands"]) if d else 0)
-        for i, (title, count) in enumerate(zip(("Settings", "Streams", "Periodic tasks", "State", "Commands"), counts,
-                                               strict=True)):
+        if changed:
+            self.no_recipes.setText(
+                f"No recipe uses {ui.esc(name)} yet. A recipe is a Python function you keep in a .py file in "
+                f"<code>{ui.esc(recipes.folder())}</code>, to run by name; it is listed here when its code calls "
+                f"<code>insthub.device(\"{ui.esc(name)}\")</code>. Or run a command in the Commands tab, then "
+                "<b>Save as recipe...</b>")
+        used_by = self.recipes.load(self.window.device_recipes(name), fresh=changed)
+        counts = (len(d["properties"]) if d else 0, len(streams), len(tasks), len(state), len(d["commands"]) if d else 0,
+                  used_by)
+        for i, (title, count) in enumerate(zip(("Settings", "Streams", "Periodic tasks", "State", "Commands", "Recipes"),
+                                               counts, strict=True)):
             self.tabs.setTabText(i, f"{title} ({count})" if count else title)
         if changed and d:  # open on the tab that has something to show
             self.tabs.setCurrentIndex(next((i for i, n in enumerate(counts) if n), 0))
+
+
+# ---------------------------------------------------------------- Recipes
+_EXAMPLE = '''\
+# redpitaya.py, in your recipes folder
+import insthub
+
+
+def square(freq: float = 1e3, volt: float = 0.5):
+    """Square wave out of OUT1."""
+    rp = insthub.device("redpitaya")
+    rp.sour_set(1, func="SQUARE", volt=volt, freq=freq)
+    rp.tx_txt("OUTPUT1:STATE ON")
+'''
+
+
+class _NoRecipes(QtWidgets.QFrame):
+    """The Recipes page while there is no recipe: what one is, and where to write one."""
+
+    def __init__(self, page: RecipesPage):
+        super().__init__()
+        self.setProperty("card", True)
+        box = QtWidgets.QVBoxLayout(self)
+        box.setContentsMargins(28, 26, 28, 26)
+        box.setSpacing(10)
+        box.addWidget(ui.label("No recipes yet", "h2"))
+        text = ui.label(
+            "A recipe is a Python function that you keep in a file, to run it by name: from here, from the page "
+            "of each device it uses, with <code>insthub run NAME</code>, or from a script. Each public function "
+            f"of a .py file in your recipes folder, <code>{ui.esc(recipes.folder())}</code>, is one. Or run a "
+            "command on a device's page, then <b>Save as recipe...</b>", "muted", wrap=True, select=True)
+        text.setTextFormat(Qt.TextFormat.RichText)
+        box.addWidget(text)
+        example = _code_box()
+        example.setPlainText(_EXAMPLE.rstrip("\n"))
+        example.setFixedHeight(_lines_high(example, len(_EXAMPLE.splitlines())))
+        box.addWidget(example)
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addWidget(ui.button("Open the recipes folder", "folder", kind="primary", slot=page.open_folder,
+                                    tip="Write a .py file in it with your text editor (it is made if missing)"))
+        buttons.addStretch(1)
+        box.addSpacing(4)
+        box.addLayout(buttons)
+        box.addStretch(1)  # (any height to spare goes below, not between the lines)
+
+
+class RecipesPage(_Page):
+    """Every recipe this computer knows of (recipes.available()), to read and run; your recipes folder."""
+
+    def __init__(self, window: Manager):
+        super().__init__("Recipes", scroll=False)
+        self.window = window
+        self.folder_button = ui.button("Open folder", "folder", slot=self.open_folder,
+                                       tip=f"Your recipes folder, {recipes.folder()}: each .py file in it holds "
+                                           "recipes")
+        self.header.actions.addWidget(self.folder_button)
+        self.view = _Recipes(window, _NoRecipes(self), every=True)
+        self.body.addWidget(self.view, 1)
+
+    def sync(self, found: tuple | None) -> None:
+        """Show every recipe, as recipes.available() found them (None: not known yet)."""
+        count = self.view.load(found)
+        files = len({r.file for r in found[0]}) if found else 0
+        self.header.subtitle.setText(
+            "Reading the recipes..." if found is None else
+            "Snippets you keep as Python functions, to run by name" if not count else
+            f"{_count(count, 'recipe')} in {_count(files, 'file')} · each runs in a process of its own · yours are "
+            f"the .py files in <code>{ui.esc(recipes.folder())}</code>")
+
+    def open_folder(self) -> None:
+        """Open your recipes folder (made first, if it is missing)."""
+        folder = recipes.folder()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.window.say(f"Cannot make {folder}: {e}", 8000)
+            return
+        if not open_path(folder):
+            self.window.say(f"Cannot open {folder}")
 
 
 # ---------------------------------------------------------------- AI agents and Settings
@@ -1400,8 +2008,8 @@ class Sidebar(QtWidgets.QWidget):
         brand.addWidget(ui.label("insthub", "brand"))
         brand.addStretch(1)
         self.nav = {name: ui.NavButton(text, icon) for name, text, icon in (
-            ("devices", "Devices", "devices"), ("servers", "Servers", "servers"), ("agents", "AI agents", "agents"),
-            ("settings", "Settings", "settings"))}
+            ("devices", "Devices", "devices"), ("servers", "Servers", "servers"), ("recipes", "Recipes", "logs"),
+            ("agents", "AI agents", "agents"), ("settings", "Settings", "settings"))}
         group = QtWidgets.QButtonGroup(self)
         group.setExclusive(True)
         for name, button in self.nav.items():
@@ -1416,7 +2024,7 @@ class Sidebar(QtWidgets.QWidget):
         box.setSpacing(2)
         box.addLayout(brand)
         box.addSpacing(18)
-        for name in ("devices", "servers", "agents"):
+        for name in ("devices", "servers", "recipes", "agents"):
             box.addWidget(self.nav[name])
         box.addStretch(1)
         box.addWidget(self.summary)

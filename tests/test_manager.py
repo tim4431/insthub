@@ -28,6 +28,7 @@ from insthub import (  # noqa: E402
     manager,
     pages,
     qt,
+    recipes,
     registry,
     service,
     sim,
@@ -333,6 +334,355 @@ def test_commands_are_run_from_their_tab(window):
         page.show_device(s, "loopback")
         assert commands.current() == "sleep" and commands.args.text() == "0.3"  # ... it is the same device
         assert spin(3, lambda: commands.took.text().startswith("loopback.sleep:"))  # and its result is shown
+
+
+LAB_RECIPES = '''\
+"""The recipes of the window's tests."""
+import time
+
+import insthub
+
+
+def tune(mhz: float = 1000, dbm: float = 0):
+    """Tune the synth.
+
+    It says where it is."""
+    synth = insthub.device("synth")
+    synth.frequency = mhz
+    synth.power = dbm
+    print(f"tuned to {mhz} MHz", flush=True)
+    return {"mhz": synth.frequency, "dbm": synth.power}
+
+
+def broken(message="no lock"):
+    """Fails, as a recipe can."""
+    insthub.device("synth").rf(False)
+    raise RuntimeError(message)
+
+
+def typo():
+    """A misspelled property."""
+    insthub.device("synth").frequncy = 5
+
+
+def nap(seconds: float = 60):
+    """Sleeps until it is stopped."""
+    loopback = insthub.device("loopback")
+    print("napping", flush=True)
+    try:
+        time.sleep(seconds)
+    finally:  # a cleanup that takes a while, as ramping an output down does
+        print("waking", flush=True)
+        time.sleep(0.5)
+        print("woken", flush=True)
+    return loopback.echo("awake")
+'''
+
+
+def write_recipes(name: str, text: str):
+    path = recipes.folder() / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def test_the_recipes_that_use_a_device_are_checked_then_run_in_a_process_of_their_own(window):
+    write_recipes("lab.py", LAB_RECIPES)
+    write_recipes("camera.py", 'import insthub\n\n\ndef snap():\n    return insthub.device("camera").grab()\n')
+    with insthub.Server("t", [sim.SimSynth(), sim.Loopback()]) as server:
+        assert spin(5, lambda: word(window, "device", "local:t", "synth") == "connected")
+        window.open_device("local:t", "synth")
+        page, tab = window.device_page, window.device_page.recipes
+        assert spin(5, lambda: [r.name for r in tab._recipes] == ["tune", "broken", "typo"])  # not nap, not snap
+        assert page.tabs.tabText(5) == "Recipes (3)" and not tab.run_button.isEnabled()
+        row = [tab.table.item(0, c).text() for c in range(4)]
+        assert row == ["tune", "mhz=1000, dbm=0", "lab.py", "Tune the synth."]
+        assert tab.table.item(0, 0).toolTip() == "lab.tune" and "your recipes" in tab.table.item(0, 2).toolTip()
+        tab.choose("tune")
+        assert tab.run_button.isEnabled() and not tab.stop_button.isEnabled() and tab.open_button.isEnabled()
+        assert "Tune the synth." in tab.title.text() and "It says where it is." in tab.title.text()
+        assert "<b>synth</b>: frequency = ..., power = ..." in tab.about.text()
+        assert tab.code.toPlainText().startswith("def tune(mhz: float = 1000")
+        assert "lab.py, line 7" in tab.code_caption.text()
+        assert tab.params.placeholderText().startswith("mhz=1000 dbm=0")
+        tab.params.setText("mhz=2500")
+        tab.run()
+        assert spin(20, lambda: "done in" in tab.status.text()), tab.output.toPlainText()
+        printed, _, result = tab.output.toPlainText().partition("\n\nResult:")
+        assert printed == "tuned to 2500 MHz" and json.loads(result) == {"mhz": 2500.0, "dbm": 0.0}
+        assert server.devices["synth"]._freq == 2500.0 and "simulated: synth" in tab.status.text()
+
+        tab.choose("broken")                                                 # it fails: why, and where
+        tab.run()
+        assert spin(20, lambda: "failed after" in tab.status.text()), tab.output.toPlainText()
+        said = tab.output.toPlainText()
+        assert 'lab.py", line 21, in broken' in said
+        assert said.endswith("\n\nrecipe broken failed: RuntimeError: no lock")
+        assert tab.status.property("role") == "error" and tab.run_button.isEnabled()
+
+        ran = len(window._runs)
+        tab.choose("typo")                                                   # its devices are asked first
+        tab.run()
+        assert spin(5, lambda: "not run" in tab.status.text())
+        assert tab.output.toPlainText() == (
+            "Nothing ran. insthub asked its devices first:\n"
+            "  line 26: synth has no property 'frequncy'; did you mean 'frequency'?")
+        tab.choose("tune")
+        for typed, said in (("mhzz=3", "Nothing ran: recipe tune has no parameter 'mhzz'; did you mean 'mhz'?"),
+                            ("3000", "Cannot read the parameters: give each as NAME=VALUE: 3000 has no name"),
+                            ("mhz='open", "Cannot read the parameters: a ' is not closed")):
+            tab.params.setText(typed)
+            tab.params.returnPressed.emit()
+            assert tab.output.toPlainText() == said
+        spin(0.2)
+        assert len(window._runs) == ran and server.devices["synth"]._freq == 2500.0  # none of them ran
+
+
+def test_stop_ends_a_recipe_and_quitting_stops_those_that_run(window):
+    write_recipes("lab.py", LAB_RECIPES)
+    with insthub.Server("t", [sim.SimSynth(), sim.Loopback()]):
+        assert spin(5, lambda: word(window, "device", "local:t", "loopback") == "connected")
+        window.open_device("local:t", "loopback")
+        tab = window.device_page.recipes
+        assert spin(5, lambda: [r.name for r in tab._recipes] == ["nap"])
+        tab.choose("nap")
+        tab.run()
+        assert spin(20, lambda: "napping" in tab.output.toPlainText()), tab.output.toPlainText()
+        assert tab.stop_button.isEnabled() and not tab.run_button.isEnabled()
+        assert "nap: running" in tab.status.text()
+        tab.stop_button.click()
+        assert spin(10, lambda: "waking" in tab.output.toPlainText())
+        assert not tab.stop_button.isEnabled() and "nap: stopping" in tab.status.text()  # Stop is not offered twice
+        tab.stop()                                                           # (nor does it stop twice)
+        assert spin(10, lambda: "was stopped after" in tab.status.text()), tab.output.toPlainText()
+        assert tab.output.toPlainText() == "napping\nwaking\nwoken\n\nrecipe nap was stopped"  # its finally ran
+        assert tab.run_button.isEnabled() and not tab.stop_button.isEnabled()
+
+        tab.run()
+        assert spin(20, lambda: "napping" in tab.output.toPlainText())
+        job = tab._run
+        window.open_device("local:t", "synth")                               # another page: it goes on running
+        assert tab._run is job and "nap: running" in tab.status.text() and not job.done()
+        window.close()                                                       # (no tray: the window quits)
+        assert spin(10, job.done) and job.output().endswith("waking\nwoken\n")
+
+
+def test_a_recipe_stopped_as_the_window_quits_finishes_its_cleanup(window):
+    write_recipes("lab.py", LAB_RECIPES)
+    with insthub.Server("t", [sim.Loopback()]):
+        assert spin(5, lambda: word(window, "device", "local:t", "loopback") == "connected")
+        window.open_device("local:t", "loopback")
+        tab = window.device_page.recipes
+        assert spin(5, lambda: [r.name for r in tab._recipes] == ["nap"])
+        tab.choose("nap")
+        tab.run()
+        assert spin(20, lambda: "napping" in tab.output.toPlainText()), tab.output.toPlainText()
+        job = tab._run
+        tab.stop()
+        assert spin(10, lambda: "waking" in job.output())
+        window.close()                                                       # while it cleans up: left to finish
+        assert spin(10, job.done) and job.output() == "napping\nwaking\nwoken\n"
+
+
+def test_recipes_started_here_are_stopped_when_the_program_ends_from_the_tray(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    write_recipes("lab.py", LAB_RECIPES)
+    app = qt.application()
+    guard = qt.QtCore.QTimer()                                               # (were the quit refused: never hang)
+    guard.setSingleShot(True)
+    guard.timeout.connect(lambda: app.exit(1))
+    with insthub.Server("t", [sim.Loopback()]):
+        window = manager.Manager(refresh_ms=150, tray=True)
+        monkeypatch.setattr(window.tray, "showMessage", lambda *a: None)
+        try:
+            window.show()
+            assert spin(5, lambda: word(window, "device", "local:t", "loopback") == "connected")
+            nap = next(r for r in recipes.read_file(recipes.folder() / "lab.py")[0] if r.name == "nap")
+            job = window.start_recipe(nap, {})
+            assert spin(20, lambda: "napping" in job.output())
+            window.close()                                                   # to the tray: it goes on running
+            assert not window._closed and not job.done()
+            qt.QtCore.QTimer.singleShot(0, app.quit)                         # as Ctrl-C or SIGTERM do (qt.application)
+            guard.start(5000)
+            assert app.exec() == 0                                           # the event loop ends: so does the run
+            assert window._closed and spin(10, job.done) and job.output() == "napping\nwaking\nwoken\n"
+        finally:
+            guard.stop()
+            window._shutdown()
+            spin(0.1)
+
+
+def test_a_recipe_that_uses_what_is_dangerous_asks_first(window, monkeypatch):
+    write_recipes("rig.py", 'import insthub\n\n\ndef blast(ms: int = 5):\n    """Fire."""\n'
+                            '    return insthub.device("rig").fire(ms)\n')
+    with insthub.Server("t", [Rig("rig")]) as server:
+        assert spin(5, lambda: word(window, "device", "local:t", "rig") == "connected")
+        window.open_device("local:t", "rig")
+        tab = window.device_page.recipes
+        assert spin(5, lambda: [r.name for r in tab._recipes] == ["blast"])
+        tab.choose("blast")
+        asked = []
+        monkeypatch.setattr(window, "confirm", lambda *a: asked.append(a) and False)
+        tab.run()
+        assert spin(5, lambda: tab.output.toPlainText() == "Not run.")
+        assert asked[0][0] == "Run blast?" and "• rig: its command 'fire'" in asked[0][1]
+        assert server.devices["rig"].fired == 0
+        monkeypatch.setattr(window, "confirm", lambda *a: True)
+        tab.run()
+        assert spin(20, lambda: tab.output.toPlainText() == "Result: 5"), tab.output.toPlainText()
+        assert server.devices["rig"].fired == 1
+
+
+def test_a_command_is_saved_as_a_recipe_and_then_listed(window, monkeypatch):
+    with insthub.Server("t", [sim.Loopback()]):
+        assert spin(5, lambda: word(window, "device", "local:t", "loopback") == "connected")
+        window.open_device("local:t", "loopback")
+        page, tab = window.device_page, window.device_page.recipes
+        assert spin(5, lambda: not tab.empty.isHidden())                    # none yet: how to make one
+        assert "No recipe uses loopback yet" in tab.empty.text() and tab.boxed.isHidden() and tab.detail.isHidden()
+        commands = page.commands
+        commands.choose("echo")
+        commands.args.setText("hello")
+        asked = []
+        monkeypatch.setattr(qt.QtWidgets.QInputDialog, "getText",
+                            lambda *a, **k: asked.append((a, k)) or ("greet", True))
+        commands.save_button.click()
+        path = recipes.folder() / "loopback.py"
+        assert asked[0][1]["text"] == "echo" and str(path) in asked[0][0][2]  # its name, by default; and where
+        assert "def greet():\n" in path.read_text()
+        assert "    return insthub.device('loopback').echo('hello')\n" in path.read_text()
+        assert window.toast.text() == f"Saved the recipe greet in {path}"
+        assert spin(5, lambda: [r.name for r in tab._recipes] == ["greet"])
+        assert page.tabs.tabText(5) == "Recipes (1)"
+        tab.choose("greet")
+        assert not tab.params.isEnabled() and tab.params.placeholderText() == "it has no parameters"
+        tab.run()
+        assert spin(20, lambda: tab.output.toPlainText() == "Result: hello"), tab.output.toPlainText()
+
+        commands.args.setText("again")                                       # the same name: asked first
+        replies = []
+        monkeypatch.setattr(window, "confirm", lambda *a: replies.append(a[0]) and False)
+        commands.save_button.click()
+        assert replies == ["Replace greet?"] and "again" not in path.read_text()
+        monkeypatch.setattr(window, "confirm", lambda *a: True)
+        commands.save_button.click()
+        assert "echo('again')" in path.read_text() and path.read_text().count("def greet") == 1
+        monkeypatch.setattr(qt.QtWidgets.QInputDialog, "getText", lambda *a, **k: ("two words", True))
+        warned = []
+        monkeypatch.setattr(qt.QtWidgets.QMessageBox, "warning", lambda *a: warned.append(a[2]))
+        commands.save_button.click()
+        assert "'two words' cannot be a recipe's name" in warned[0]
+
+
+def test_saving_a_recipe_under_a_name_another_file_has_asks_first(window, monkeypatch):
+    write_recipes("lab.py", LAB_RECIPES)
+    path = recipes.folder() / "loopback.py"
+    with insthub.Server("t", [sim.Loopback()]):
+        assert spin(5, lambda: word(window, "device", "local:t", "loopback") == "connected")
+        window.open_device("local:t", "loopback")
+        commands = window.device_page.commands
+        commands.choose("echo")
+        commands.args.setText("hello")
+        names, offered, asked = iter(["nap", "greet"]), [], []
+        monkeypatch.setattr(qt.QtWidgets.QInputDialog, "getText",
+                            lambda *a, **k: offered.append(k["text"]) or (next(names), True))
+        monkeypatch.setattr(window, "confirm", lambda *a: asked.append(a) and False)
+        commands.save_button.click()                                         # Cancel: another name, then
+        assert asked[0][0] == "Another recipe called nap?" and asked[0][2] == "Save as nap"
+        assert "(lab.py, line 29)" in asked[0][1] and "as lab.nap or loopback.nap" in asked[0][1]
+        assert offered == ["echo", "nap"] and len(asked) == 1                # (greet: no other has it)
+        assert "def greet():" in path.read_text() and "def nap" not in path.read_text()
+        assert recipes.find("greet").full_name == "loopback.greet"
+
+        names = iter(["nap"])
+        monkeypatch.setattr(window, "confirm", lambda *a: asked.append(a) or True)
+        commands.save_button.click()                                         # saved all the same, if you say so
+        assert len(asked) == 2 and "def nap():" in path.read_text()
+        with pytest.raises(recipes.RecipeError, match="several recipes are called 'nap'"):
+            recipes.find("nap")
+        names = iter(["nap"])
+        commands.save_button.click()                                         # (in its own file: Replace? only)
+        assert [a[0] for a in asked[2:]] == ["Replace nap?"]
+
+
+def test_long_output_keeps_the_line_you_read_and_what_you_selected(window):
+    write_recipes("lab.py", LAB_RECIPES)
+    window.resize(1200, 900)
+    window.show()
+    window.show_page("recipes")
+    view = window.recipes_page.view
+    assert spin(5, lambda: len(view._recipes) == 4)
+    box, bar = view.output, view.output.verticalScrollBar()
+
+    def top():
+        return box.cursorForPosition(qt.QtCore.QPoint(0, 0)).block()
+
+    lines = [f"line {i:06d} " + "x" * 60 + "\n" for i in range(5000)]
+    view._say("".join(lines[:3000]))
+    spin(0.1)
+    bar.setValue(bar.maximum() // 2)                                         # you scroll up to read, and select
+    cursor = qt.QtGui.QTextCursor(top().next())
+    cursor.movePosition(qt.QtGui.QTextCursor.MoveOperation.EndOfBlock, qt.QtGui.QTextCursor.MoveMode.KeepAnchor)
+    box.setTextCursor(cursor)
+    reading, selected = top().text(), cursor.selectedText()
+    assert reading.startswith("line 00") and selected.startswith("line 00") and reading != selected
+    for start in (300, 600, 900):                                            # a Run keeps the last lines printed:
+        view._say("".join(lines[start:start + 3000]))                        # some go from the start as more come
+        spin(0.05)
+        assert box.toPlainText() == "".join(lines[start:start + 3000])
+        assert top().text() == reading and box.textCursor().selectedText() == selected
+    bar.setValue(bar.maximum())                                              # at the end, it follows the end
+    view._say("".join(lines[1500:4500]))
+    spin(0.05)
+    assert bar.value() == bar.maximum() and box.toPlainText().endswith(lines[4499])
+    bar.setValue(bar.maximum() // 3)                                         # not what it had: written anew, the
+    where = bar.value()                                                      # scroll bar where it was
+    view._say("something else\n" * 3000)
+    spin(0.05)
+    assert bar.value() == where and box.toPlainText() == "something else\n" * 3000
+
+
+def test_what_a_recipe_returned_and_uses_as_the_window_writes_them():
+    assert pages._result_text(None) == "(no result)" and pages._result_text(5) == "Result: 5"
+    assert pages._result_text({"a": 1}) == 'Result:\n{\n  "a": 1\n}'
+    long = pages._result_text(list(range(200_000)))                          # (as JSON: a line each)
+    assert long.startswith("Result:\n[\n  0,\n  1,\n") and len(long) < pages.RESULT_SHOWN + 100
+    assert long.endswith(",\n... and 1,688,896 more characters, not shown")  # (at the end of a line)
+    assert pages._result_text("x" * 300_000) == f"Result:\n{'x' * 200_000}\n... and 100,000 more characters, not shown"
+    uses = (recipes.Use("sa.ch1", "center", "set", 3), recipes.Use("sa.ch1", "sweep", "call", 4),
+            recipes.Use("sa", "center", "get", 5))
+    r = recipes.Recipe("look", devices=("sa.ch1", "sa"), uses=uses)
+    assert pages._uses(r) == "Uses <b>sa.ch1</b>: center = ..., sweep() · <b>sa</b>: center"
+    assert pages._cut("a\nb\nc\n", "a\nb\nc\nd\n") == 0 and pages._cut("a\nb\nc\n", "b\nc\nd\n") == 2
+    assert pages._cut("a\nb\n", "x\ny\n") is None and pages._cut("ab\nb\n", "b\nc\n") == 3  # (whole lines only)
+    assert pages._units("a\U0001f600b") == 4
+
+
+def test_the_recipes_page_lists_every_recipe_and_opens_nothing_by_itself(window, monkeypatch):
+    opened = []
+    monkeypatch.setattr(pages, "open_path", lambda path: opened.append(path) or True)
+    window.show_page("recipes")
+    page = window.recipes_page
+    assert window.pages.currentWidget() is page and window.sidebar.nav["recipes"].isChecked()
+    assert spin(5, lambda: not page.view.empty.isHidden())                  # none yet: what one is, where it goes
+    assert page.view.boxed.isHidden() and page.view.empty.findChild(qt.QtWidgets.QLabel).text() == "No recipes yet"
+    assert not recipes.folder().exists()                                     # (made only when you open it)
+
+    write_recipes("lab.py", LAB_RECIPES)
+    write_recipes("bad.py", "def oops(:\n    pass\n")
+    window.show_page("recipes")                                              # (read again when it opens)
+    assert spin(5, lambda: [r.full_name for r in page.view._recipes] == ["lab.tune", "lab.broken", "lab.typo",
+                                                                          "lab.nap"])
+    assert page.header.subtitle.text().startswith("4 recipes in 1 file")
+    assert not page.view.warning.isHidden() and "bad.py:1" in page.view.warning.text()  # it cannot be read
+    assert [page.view.table.item(3, c).text() for c in range(3)] == ["nap", "seconds=60", "loopback"]
+    page.view.choose("nap")
+    assert page.view.code.toPlainText().startswith("def nap(") and page.view.run_button.isEnabled()
+    spin(0.3)
+    assert opened == [] and window._runs == []                               # nothing opened or run by itself
+    page.view.open_button.click()
+    page.folder_button.click()
+    assert opened == [recipes.folder() / "lab.py", recipes.folder()]
 
 
 def test_previews_show_the_last_frame_without_subscribing(window, monkeypatch):
@@ -1722,8 +2072,8 @@ def test_every_page_paints_in_both_themes(window, tmp_path):
             window.apply_theme()
             for show in (lambda: window.show_page("devices"), lambda: window.open_device("local:t", "sa"),
                          lambda: window.open_device("local:t", "lamp"), lambda: window.show_page("servers"),
-                         lambda: window.open_server("local:t"), lambda: window.show_page("agents"),
-                         lambda: window.show_page("settings")):
+                         lambda: window.open_server("local:t"), lambda: window.show_page("recipes"),
+                         lambda: window.show_page("agents"), lambda: window.show_page("settings")):
                 show()
                 spin(0.2)
                 assert not window.grab().isNull()

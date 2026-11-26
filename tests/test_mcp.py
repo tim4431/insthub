@@ -323,7 +323,7 @@ def test_stdio_protocol(spawned, tmp_path):
         agent.send(method="notifications/initialized")
         agent.send(id=2, method="tools/list")
         names = [t["name"] for t in agent.receive()["result"]["tools"]]
-        assert names == ["list_devices", "describe", "get", "set", "call", "snapshot", "call_dangerous"]
+        assert names == ["list_devices", "describe", "get", "set", "call", "snapshot", "call_dangerous", "run_recipe"]
         agent.send(id=3, method="tools/call", params={"name": "call", "arguments": {
             "device": "loopback", "command": "sleep", "args": [0.5]}})
         agent.send(id=4, method="tools/call", params={"name": "get", "arguments": {
@@ -346,6 +346,55 @@ def test_stdio_protocol(spawned, tmp_path):
         assert "sim.py" in text
     finally:
         assert agent.close() == 0
+
+
+def test_a_recipe_stops_when_the_agent_cancels_it_or_closes_the_server(tmp_path):
+    from insthub import recipes
+
+    recipes.folder().mkdir(parents=True, exist_ok=True)
+    (recipes.folder() / "hold.py").write_text(
+        "import time\nfrom pathlib import Path\n\n\ndef hold(folder):\n    Path(folder, 'started').write_text('')\n"
+        "    try:\n        time.sleep(60)\n    finally:\n        Path(folder, 'stopped').write_text('')\n")
+
+    def wait_for(path):
+        deadline = time.monotonic() + 30
+        while not path.exists():
+            assert time.monotonic() < deadline, f"{path} did not appear"
+            time.sleep(0.02)
+
+    agent = Agent(tmp_path / "data")
+    try:
+        agent.send(id=1, method="initialize", params={"protocolVersion": "2025-06-18"})
+        agent.receive()
+        for request in (2, "two"):  # (an id is a number or a string)
+            folder = tmp_path / f"run{request}"
+            folder.mkdir()
+            agent.send(id=request, method="tools/call", params={"name": "run_recipe", "arguments": {
+                "name": "hold", "params": {"folder": str(folder)}, "timeout": 600}})
+            wait_for(folder / "started")
+            agent.send(method="notifications/cancelled", params={"requestId": request, "reason": "the user said stop"})
+            wait_for(folder / "stopped")  # (stopped as Ctrl-C would: its finally block ran)
+        time.sleep(0.5)
+        agent.send(id=3, method="ping")
+        assert agent.receive()["id"] == 3 and agent.lines.empty()  # no reply to a cancelled call
+        folder = tmp_path / "at_exit"
+        folder.mkdir()
+        agent.send(id=4, method="tools/call", params={"name": "run_recipe", "arguments": {
+            "name": "hold", "params": {"folder": str(folder)}, "timeout": 600}})
+        wait_for(folder / "started")
+    finally:
+        assert agent.close() == 0
+    wait_for(folder / "stopped")  # stopped when the server exited, not left running without a timeout
+    agent, folder = Agent(tmp_path / "data"), tmp_path / "at_sigterm"
+    folder.mkdir()
+    try:
+        agent.send(id=1, method="tools/call", params={"name": "run_recipe", "arguments": {
+            "name": "hold", "params": {"folder": str(folder)}, "timeout": 600}})
+        wait_for(folder / "started")
+    finally:
+        agent.proc.terminate()  # (as an agent that ends this server with SIGTERM)
+        assert agent.proc.wait(10) == 0
+    wait_for(folder / "stopped")
 
 
 def test_an_agent_that_paused_a_device_is_not_told_a_person_did(tools, server):

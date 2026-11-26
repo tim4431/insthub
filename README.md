@@ -88,6 +88,16 @@ flowchart LR
   script whether anything needs doing, and `--json` says it as data. In the
   window it is **Update** on a server, or **Update all**. The window and an
   agent's `insthub mcp` say when they run older code themselves.
+- **Recipes.** Keep the snippets you run again and again (a square wave on
+  the Red Pitaya, arm it and wait for a trigger, a comb across two
+  instruments) as Python functions in a folder, and run them by name: from
+  the window, with `insthub run square freq=2e3`, or by asking an agent. Each
+  of these checks the recipe against its devices first, so a missing device or
+  a misspelled command stops it before anything runs; something marked
+  dangerous asks first, and agents cannot run it. The recipe then runs in a
+  program of its own, with Stop. In a script, `recipes.run("square")` runs it
+  in the script's own program, with no check and no question, as calling the
+  function would.
 - **AI agents, in plain sight.** Claude Code or any agent that speaks MCP can
   read your instruments' documentation and use them, and the window shows
   when one does.
@@ -135,6 +145,7 @@ insthub set synth frequency 2500
 insthub watch scope ch1              # the live trace, as text
 insthub view scope                   # the live trace, as a plot
 python examples/03_experiment.py    # a script that uses several at once
+insthub run examples/sim_recipes.py:cw mhz=2500    # a recipe: the synth's output on at 2500 MHz
 ```
 
 ## Put your instrument on it
@@ -206,6 +217,9 @@ you list:
   each starts at login, edit their config, and see which programs are
   connected, and which servers run older code than their folders hold;
   **Update** (or **Update all**) loads the new code.
+- **Recipes**: your recipes, each with its code, **Run** and **Stop**. A
+  device's page lists those that use it, and **Save as recipe...** keeps a
+  command you just ran as one.
 - **Add**: write the config of a new server by picking its drivers (or the
   devices your extensions offer), keep a server running in the background, or
   add the devices of another computer.
@@ -224,8 +238,8 @@ claude mcp add --scope user insthub -- insthub mcp     # with the insthub comman
 ```
 
 Claude Code (or any agent that speaks MCP) can then list the instruments, read
-their documentation from your docstrings, call commands, set properties and
-take live traces, with large arrays handed over as files. What a device marks
+their documentation from your docstrings, call commands, set properties, take
+live traces and run your recipes, with large arrays handed over as files. What a device marks
 dangerous needs a separate tool, `call_dangerous`, so you can let the agent
 use everything else without being asked. The **AI agents** page of `insthub
 gui` does this setup with a click and shows which agents are connected. See
@@ -237,19 +251,19 @@ gui` does this setup with a click and shows which agents are connected. See
 |---|---|
 | [How insthub works](docs/architecture.md) | the pieces, what happens during a call and a stream, how programs find each other, what happens when things break, how the window is built, and why it is built this way |
 | [Adding an instrument](docs/adding-a-device.md) | putting your instrument on the bus step by step: the config file and every key in it, trying it, keeping it running, changing it later, what to do when it does not work |
-| [Using insthub](docs/guide.md) | writing devices, putting existing drivers on the bus, calls, streams, errors, GUIs, the window, the command line |
+| [Using insthub](docs/guide.md) | writing devices, putting existing drivers on the bus, calls, streams, errors, GUIs, the window, extensions, recipes, the command line |
 | [Running servers](docs/running-servers.md) | starting servers, keeping them running in the background, who sets up what, several computers |
 | [AI agents](docs/agents.md) | letting Claude Code or another agent use the instruments: setup, the tools, what comes back |
-| [Design](docs/design.md) | the rules every change follows, extensions (an instrument's driver and UI in one folder, each run where its libraries are), and what we learned from other lab-control projects |
-| [examples/](examples/) | four runnable examples, and [a reference extension](examples/extension) (a laser with a panel and an app) to start your own from, all on simulated instruments |
+| [Design](docs/design.md) | the rules every change follows, extensions (an instrument's driver and UI in one folder, each run where its libraries are), recipes, and what we learned from other lab-control projects |
+| [examples/](examples/) | four runnable examples, a file of recipes, and [a reference extension](examples/extension) (a laser with a panel and an app) to start your own from, all on simulated instruments |
 
 ## Status
 
-- 513 tests cover calls, streams, device lifecycle, finding servers,
+- 569 tests cover calls, streams, device lifecycle, finding servers,
   reconnecting, mixed insthub versions, the command line, config files,
-  services, extensions (the reference extension among them), the GUIs, the
-  agent interface, and how little `import insthub` loads. Run them with
-  `python -m pytest tests` (about a minute).
+  services, extensions (the reference extension among them), recipes, the
+  GUIs, the agent interface, and how little `import insthub` loads. Run them
+  with `python -m pytest tests` (about a minute).
 - Developed and tested on Linux with Python 3.11, 3.12 and 3.14. Written to
   run on Windows, but never run there.
 - Not included: passwords or encryption for network connections, clients for
@@ -274,6 +288,7 @@ insthub/
   config.py     servers from a TOML file        tomlfile.py changing one in place, comments kept
   service.py    insthub service: background services, and bringing them up to date
   extensions.py finding, checking and starting extensions (insthub ext, check, open)
+  recipes.py    recipes: Python functions you keep, read without running them, run by name
   qt.py         helpers for Qt GUIs             viewer.py   the generic live viewer
   controls.py   a device's settings and commands, for the window and for panels
   mcp.py        insthub mcp: the bus for AI agents

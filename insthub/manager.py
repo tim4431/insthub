@@ -1,12 +1,14 @@
 """The manager window (`insthub gui`): the servers and devices on this computer,
 how each one is reached, and the controls to look after them and set them up.
 
-    sidebar      Devices, Servers, AI agents, Settings; how many of each, what is broken
+    sidebar      Devices, Servers, Recipes, AI agents, Settings; how many of each, what is
+                 broken
     Devices      a tile per device, in a section per server: its status, a small live
                  preview of what it publishes (else the figures of its state), its streams
     a device     is the instrument connected (and if not, why), what it is doing, which
                  programs watch it; its properties to read and change, its streams, its
-                 periodic tasks (a switch each), its state, and its commands to run.
+                 periodic tasks (a switch each), its state, its commands to run (or save
+                 as a recipe), and the recipes that use it.
                  Connect now / Release / Pause and Resume / Live view / Open <a UI of its
                  extension> (a menu of them, for several) / Edit in its config.
     Servers      a card per server: running here, installed as a service, or on another
@@ -16,6 +18,7 @@ how each one is reached, and the controls to look after them and set them up.
                  (forms.ServerDialog, which changes the file in place, comments kept).
                  Update (and Update all, on Servers) loads new code: service.update for a
                  service, a restart for a server the window started.
+    Recipes      every recipe (recipes.py): its code, what it uses; Run and Stop
     AI agents    giving Claude Code or another agent the instruments; which are connected
     Settings     appearance, previews, notifications, start at login, the files insthub uses,
                  your extensions (folders added and removed; what is wrong with each), and
@@ -38,8 +41,10 @@ the stream's last frame (`$latest`), so watching does not make an instrument
 acquire.  Live plots open as a separate `insthub view` process, and a device's
 UIs (from its extension's manifest) as programs run with the extension's Python:
 the window never imports an extension's code.  Their output goes to log files,
-shown when one fails.  `insthub gui --install` adds the window to the
-applications menu (see launcher.py).
+shown when one fails.  A recipe is read from its file without running it, and
+runs in a process of its own (recipes.start), stopped if the window quits for
+good.  `insthub gui --install` adds the window to the applications menu (see
+launcher.py).
 """
 from __future__ import annotations
 
@@ -55,7 +60,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import extensions, forms, launcher, pages, registry, service
+from . import extensions, forms, launcher, pages, recipes, registry, service
 from . import widgets as ui
 from .client import PROCESS_TOKEN, log_text
 from .device import busy_with
@@ -88,6 +93,7 @@ REFRESH_MS = 1000
 HIDDEN_REFRESH_MS = 3000  #: while only the tray icon is watching
 HISTORY = 90  #: the values the preview of a number remembers
 UIS_FRESH = 30.0  #: seconds what a device's extension offers is believed before it is looked up again
+RECIPES_FRESH = 3.0  #: seconds the recipes read from their files are believed (reading again is cheap)
 
 _ORIGIN_ORDER = {"local": 0, "service": 1, "remote": 2}
 QAction = getattr(QtGui, "QAction", None) or QtWidgets.QAction  # QtWidgets in Qt 5
@@ -163,6 +169,11 @@ class Manager(QtWidgets.QMainWindow):
         self._spawned: list = []  # programs this window started: servers, windows for devices (inventory.Launched)
         self._uis: dict[str, tuple] = {}  # server address -> what its devices can open here (see _look_up_uis)
         self._uis_asking: set[str] = set()  # server addresses whose devices' UIs a worker is finding out
+        self._recipes: tuple | None = None  # recipes.available(), once read (see known_recipes)
+        self._recipes_at = -math.inf  # when they were last read (-inf: read them again at once)
+        self._recipes_reading = False
+        self._extensions: tuple = (None, -math.inf)  # (extensions.discover(), when), for the extensions' recipes
+        self._runs: list[recipes.Run] = []  # recipes started from this window (see start_recipe)
         self._logs: dict[str, pages.LogDialog] = {}
         self._detail: tuple | None = None  # ("device", key, name) or ("server", key) while one is shown
         self.login_pending: dict[str, bool] = {}  # service -> the Starts at login asked, until it is done
@@ -182,11 +193,12 @@ class Manager(QtWidgets.QMainWindow):
         self.servers_page = pages.ServersPage(self)
         self.device_page = pages.DevicePage(self)
         self.server_page = pages.ServerPage(self)
+        self.recipes_page = pages.RecipesPage(self)
         self.agents_page = pages.AgentsPage(self)
         self.settings_page = pages.SettingsPage(self)
         self.pages = QtWidgets.QStackedWidget()
-        for page in (self.devices_page, self.servers_page, self.device_page, self.server_page, self.agents_page,
-                     self.settings_page):
+        for page in (self.devices_page, self.servers_page, self.device_page, self.server_page, self.recipes_page,
+                     self.agents_page, self.settings_page):
             self.pages.addWidget(page)
         central = QtWidgets.QWidget()
         frame = QtWidgets.QHBoxLayout(central)
@@ -214,6 +226,9 @@ class Manager(QtWidgets.QMainWindow):
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self.refresh)
         self._timer.start(refresh_ms)
+        # However the program ends (Quit; the last window closed; Ctrl-C or SIGTERM, which end the event
+        # loop while the window is in the tray), the recipes started here are stopped.  (Once: see _closed.)
+        QtWidgets.QApplication.instance().aboutToQuit.connect(self._shutdown)
         self.refresh()
 
     def _build_add_menu(self) -> None:
@@ -581,16 +596,21 @@ class Manager(QtWidgets.QMainWindow):
                     self._follow = (key, None)
             else:
                 self.server_page.show_server(s)
+        elif page is self.recipes_page:
+            self.recipes_page.sync(self.known_recipes())
         elif page is self.agents_page:
             self.agents_page.show_connected()
 
     def show_page(self, name: str) -> None:
-        """One of the pages of the sidebar: "devices", "servers", "agents" or "settings"."""
+        """One of the pages of the sidebar: "devices", "servers", "recipes", "agents" or "settings"."""
         self._detail, self._follow = None, None  # (another page chosen: no restart takes it back)
         self.pages.setCurrentWidget({"devices": self.devices_page, "servers": self.servers_page,
-                                     "agents": self.agents_page, "settings": self.settings_page}[name])
+                                     "recipes": self.recipes_page, "agents": self.agents_page,
+                                     "settings": self.settings_page}[name])
         self.sidebar.select(name)
-        if name == "agents":
+        if name == "recipes":
+            self._recipes_at = -math.inf  # (read again now: you may have just written one)
+        elif name == "agents":
             self.agents_page.check()
         elif name == "settings":
             self.settings_page.sync()
@@ -603,6 +623,7 @@ class Manager(QtWidgets.QMainWindow):
         self._follow = None
         if s.address in self._uis:  # its UIs looked up again (manifests and your list of extensions change)
             self._uis[s.address] = -math.inf, *self._uis[s.address][1:]
+        self._recipes_at = -math.inf
         from_server = self.pages.currentWidget() is self.server_page
         self._back = ("server", key) if from_server else "devices"
         self._detail = ("device", key, name)
@@ -858,6 +879,54 @@ class Manager(QtWidgets.QMainWindow):
 
         self.submit(self.probes, lambda: extensions.server_uis(devices, address), found,
                     lambda exc: found(dict.fromkeys(devices, (None, [], ui.error_text(exc)))))
+
+    def known_recipes(self) -> tuple | None:
+        """Every recipe, as recipes.available() says: (recipes, the files that cannot be read); None
+        until a worker has read them, after which the window renders again.  Read again after
+        RECIPES_FRESH seconds, and when a page that shows them opens (a file that did not change is
+        not read again); the extensions are looked for again after UIS_FRESH seconds."""
+        if self._recipes_reading or time.monotonic() - self._recipes_at <= RECIPES_FRESH:
+            return self._recipes
+        self._recipes_reading, self._recipes_at = True, time.monotonic()
+        found, when = self._extensions
+        discovered = found if time.monotonic() - when <= UIS_FRESH else None
+
+        def read():
+            exts = extensions.discover() if discovered is None else discovered  # (it may ask systemd)
+            return exts, recipes.available(exts)
+
+        def done(result):
+            self._recipes_reading = False
+            if discovered is None:
+                self._extensions = result[0], time.monotonic()
+            if result[1] != self._recipes:
+                self._recipes = result[1]
+                self.render()
+
+        def failed(exc):
+            self._recipes_reading = False
+            self._recipes = [], [pages.error_text(exc)]
+            self.render()
+
+        self.submit(self.actions, read, done, failed)
+        return self._recipes
+
+    def device_recipes(self, device: str) -> tuple | None:
+        """The recipes that use a device, as recipes.for_device() says, from known_recipes()."""
+        known = self.known_recipes()
+        return None if known is None else ([r for r in known[0] if device in r.devices], known[1])
+
+    def recipes_changed(self) -> None:
+        """A recipes file changed (Save as recipe): read them again now."""
+        self._recipes_at = -math.inf
+        self.render()
+
+    def start_recipe(self, recipe: recipes.Recipe, values: dict) -> recipes.Run:
+        """Run a recipe in a process of its own (recipes.start), which is stopped if the window quits
+        for good (not when it goes to the tray).  Raises RecipeError for values it does not take."""
+        job = recipes.start(recipe, values, capture=True)
+        self._runs = [other for other in self._runs if not other.done()] + [job]
+        return job
 
     def open_ui(self, s: Server, device: str, ext, ui_) -> None:
         """Start a UI of a device's extension (extensions.launch), with the extension's Python."""
@@ -1227,6 +1296,9 @@ class Manager(QtWidgets.QMainWindow):
             self.tray.hide()
         for dialog in self._logs.values():
             dialog.close()
+        for job in self._runs:
+            job.stop()  # (it returns at once, and the program waits to kill one that goes on; one already
+            #              stopping is left to finish its finally blocks: a second stop does nothing)
         self.probes.shutdown(wait=False, cancel_futures=True)
         self.actions.shutdown(wait=False, cancel_futures=True)
         threading.Thread(target=self.backend.close, daemon=True).start()

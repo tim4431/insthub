@@ -375,7 +375,7 @@ class Commands(_Part):
         self.result.setPlaceholderText("The result appears here.")
         self.result.setMaximumHeight(150)
         self.took = ui.label("", "small")
-        line = QtWidgets.QHBoxLayout()
+        self.line = line = QtWidgets.QHBoxLayout()  # (the window adds its Save as recipe here)
         line.setSpacing(8)
         line.addWidget(self.args, 1)
         line.addWidget(self.run_button)
