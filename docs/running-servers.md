@@ -39,11 +39,20 @@ running in the background, register it as a service:
 insthub service install lab.toml           # or a .py server script
 ```
 
-This writes a small *systemd user service*, starts it, and from then on:
+This writes a small *systemd user service*, starts it, waits until its server
+answers (up to a minute), and from then on:
 
 - it starts by itself when you log in (unless installed with `--no-login`),
-- it is restarted if it crashes,
+- it is restarted 5 seconds after it crashes, but not forever: after 5 starts
+  within 5 minutes systemd gives up and marks it *failed*, so a server that
+  cannot start (a broken config, an instrument it cannot do without) does not
+  restart all day. `insthub service list` and its page in the window say how
+  often it was restarted,
 - its output is kept and can be read with `insthub service logs lab`.
+
+If the server stops, or does not answer within a minute, `install` (and
+`start` and `restart`) say so and print the last 20 lines of its log, which
+usually name the problem.
 
 An instrument that is not always connected may be better off with
 `--no-login`: installed, with its logs and its buttons in the window, but
@@ -55,11 +64,11 @@ login** switch on the server's page in the window.
 |---|---|
 | `insthub service install TARGET [--name NAME] [--python PATH]` | register and start, now and at every login; run it again to replace the definition |
 | `... install TARGET --no-login` | register and start now, but not at login |
-| `insthub service list` | what is installed, whether it is running, and whether it starts at login ("at login") or only when started ("by hand") |
+| `insthub service list` | what is installed, whether it is running, whether it starts at login ("at login") or only when started ("by hand"), and how often it was restarted after a crash |
 | `insthub service logs NAME [-f]` | its output; `-f` follows it live |
-| `insthub service restart NAME` | restart, after changing code or config |
+| `insthub service restart NAME` | restart, after changing code or config, and wait until it answers |
 | `insthub service stop NAME` | stop it; it starts again with `start`, or, if it starts at login, the next time your user's services start (a login after all your sessions ended, or a boot with lingering on) |
-| `insthub service start NAME` | start it again |
+| `insthub service start NAME` | start it again, also one that gave up after too many restarts, and wait until it answers |
 | `insthub service enable NAME` / `disable NAME` | start it at every login from now on, or no longer |
 | `insthub service remove NAME` | stop it and remove it |
 
@@ -106,6 +115,34 @@ system's own autostart mechanism.
 **Servers with a window** are different. A program that shows a GUI belongs to
 your desktop session, so start it from a launcher or the desktop's autostart,
 not as a service.
+
+## Reading a server's log
+
+Every server keeps the last 1000 lines it logged, and `insthub logs` shows
+them from any computer that can reach it. This works where there is no
+journal to read: for a server started in a terminal, a program that hosts
+its own server, or a server on another computer.
+
+```bash
+insthub logs lab                     # by the server's name, as insthub list shows it, or one of its devices' (this computer's first)
+insthub logs lab -f                  # and what it logs from now on, until Ctrl-C (also across a restart)
+insthub logs lab --level WARNING     # only warnings and errors
+insthub -a tcp://labpc:8700 logs     # a server on another computer, by its address
+```
+
+| The server is | It keeps |
+|---|---|
+| `insthub serve`, `insthub sim`, or a script that calls `insthub.serve(...)` | everything the program logs, from INFO up, and exceptions that nothing caught, in any thread |
+| a program that makes a `Server` itself (a GUI that hosts its own) | insthub's own lines, at the level the program's logging lets through: warnings and errors unless it sets up logging |
+
+Keeping them changes nothing about where the lines are printed: a program
+that leaves logging alone still shows its warnings on stderr, and so in a
+service's journal. The lines are kept in the server's memory, so after a
+restart only the new run's are there; a service's journal (`insthub service
+logs`) has the earlier runs too. A server of an older insthub keeps none and says so: read
+its output where it runs. In the window, a server's **Logs** button shows a
+service's journal, the output of a server the window started, and this log
+for any other server.
 
 ## Using insthub from an instrument's project
 
@@ -256,6 +293,26 @@ alone is enough:
 awg = "tcp://192.168.1.20:8765"
 ```
 
+To use every device of a server there without listing each one, name the
+server instead:
+
+```toml
+[servers]
+labpc = "tcp://192.168.1.20:8765"
+```
+
+When a name is not found on this computer or in `[devices]`, insthub asks
+the servers of `devices.toml` which devices they have (each gets about a
+second to answer, and the answers are kept for 5 seconds, or until
+`devices.toml` changes). The name `labpc` is for you: insthub calls a server
+by the name it gives itself. `insthub list`, `insthub states`, the window and
+AI agents show these servers and their devices too, and say which ones do
+not answer. A server is shown once, however many addresses reach it, so
+every computer of the lab can share one `devices.toml`: a computer's own
+server, named there by its network address, is shown as this computer's.
+If `devices.toml` cannot be read, they say so, naming the file, and go on
+with this computer's servers.
+
 There is no password and no encryption. Anyone who can reach the port can use
 the instruments, so open a TCP port only on a network you trust.
 
@@ -275,7 +332,8 @@ the instruments, so open a TCP port only on a network you trust.
 5. Use it from experiment scripts with `insthub.device("name")`.
 6. To offer it to others, give its folder an `insthub-extension.toml` and
    check it with `insthub check FOLDER --import`
-   ([share it as an extension](adding-a-device.md#8-share-it-as-an-extension)).
+   ([share it as an extension](adding-a-device.md#8-share-it-as-an-extension);
+   `examples/extension/` is a complete one to start from).
 
 [Adding an instrument](adding-a-device.md) walks through each step, with every
 key of a config file and what to do when something does not work.
@@ -285,9 +343,10 @@ key of a config file and what to do when something does not work.
 | What | Where |
 |---|---|
 | Sockets and announcements of running servers | `$XDG_RUNTIME_DIR/insthub/` (for example `/run/user/1000/insthub/`); without `XDG_RUNTIME_DIR`, `/tmp/insthub-UID`, used only if it is your account's alone; override with `INSTHUB_DIR` |
-| Addresses of devices on other computers | `~/.config/insthub/devices.toml`; override with `INSTHUB_DEVICES` |
+| Addresses of devices and servers on other computers | `~/.config/insthub/devices.toml`; override with `INSTHUB_DEVICES` |
+| A server's last 1000 log lines | in the server's memory; `insthub logs SERVER` reads them |
 | Your list of extension folders | `~/.config/insthub/extensions.toml`, written by `insthub ext add`; `INSTHUB_EXTENSIONS` (folders) looks only there instead |
-| Output of what the window or `insthub open` started | in the runtime folder (the first row): `NAME.log` for a server, `ui/DEVICE-UI.log` for a UI of a device's extension, `ui/DEVICE-view.log` for its live view |
+| Output of what the window or `insthub open` started | in the runtime folder (the first row): `NAME.log` for a server, `ui/DEVICE/UI.log` for a UI of a device's extension, `ui/DEVICE/_view.log` for its live view. Each run adds to its log, after a line that says when it started and what ran |
 | Service definitions | `~/.config/systemd/user/insthub-NAME.service` |
 | The insthub command for yourself | `~/.local/bin/insthub`; its environment in `~/.local/share/uv/tools/insthub/` |
 | Results saved for AI agents by `insthub mcp` | `.insthub/` in the folder the agent was started in; override with `INSTHUB_DATA` or `--data` |

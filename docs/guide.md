@@ -192,6 +192,13 @@ class Supply(insthub.Wrapped):
         self.set_state(temperature=self.target.temperature())
 ```
 
+A subclass says what `wrap()`'s other options say in its own way:
+`extension`, `extension_version` and `dangerous` on the class, `accessors`
+and `exclude` to `super().__init__()`, and `self.poll`, `self.simulated` and
+`self.set_meta(...)` in its constructor, where limits can depend on its
+arguments. The reference extension's device,
+`examples/extension/demolaser_insthub/device.py`, does all of this.
+
 Or use no code at all, with a config file and `insthub serve lab.toml`:
 
 ```toml
@@ -267,6 +274,35 @@ Most of these also work directly, as `dev.subscribe(...)`, `dev.state()` and
 so on. If a device has its own command with one of these names, the device's
 command wins, and the bus version is still there under `dev.bus`.
 
+### Every device at once
+
+To keep with a measurement what every instrument was set to, save
+`insthub.states()` next to the data file:
+
+```python
+import json
+
+with open("run42-instruments.json", "w") as f:
+    json.dump(insthub.states(), f, indent=2, default=str)
+```
+
+It asks every server at once: those on this computer, and those on other
+computers that `devices.toml` names. Each device gets its server, its type,
+its extension, whether it is connected, its state dict and the time it was
+read. A device whose server does not answer within 2 s (`timeout=`) gets
+`{"server": ..., "error": ...}` instead, so one stuck server does not stop
+the rest. Each name is read where `insthub.device(name)` would find it: a
+device of this computer before one elsewhere, and a name that two servers
+of this computer have, or two elsewhere, gets `{"error": ...}` naming them,
+since `insthub.device` refuses to guess too. `insthub.states(["scope", "synth"])` asks only those, and
+`insthub.states(address="tcp://labpc:8700")` only the devices of that
+server.
+
+`insthub states --json` prints the same from the command line (`insthub -a
+ADDRESS states` for one server). It exits with 1 when a device you named, or
+every device, could not be read, so a script can tell that what it saved is
+not what it meant to save.
+
 ## Streams
 
 ```python
@@ -312,7 +348,9 @@ insthub's own errors:
 
 **Timeouts.** A waiting call waits as long as the device takes. For a limit,
 use `dev.with_timeout(5)` or `fut.result(timeout=5)`. This stops the waiting,
-not the instrument.
+not the instrument. Connecting gives up after 5 s;
+`insthub.connect(address, connect_timeout=1)` waits less for a server that
+may be off.
 
 **Server restarts.** Calls under way fail with `ConnectionLost`. The next call
 reconnects by itself, and open subscriptions resume when the server is back. A
@@ -327,6 +365,27 @@ client.info().get("version")                # "0.1.0"; None from a server too ol
 if client.supports("pause"):                # False for a server older than that feature
     client.psu.bus.pause()
 ```
+
+**A server's log.** Every server keeps the last 1000 lines it logged, and
+`client.logs()` reads them, from any computer:
+
+```python
+for record in client.logs(50, level="WARNING"):     # the last 50 warnings and errors, oldest first
+    print(record["time"], record["logger"], record["message"], record["exc"] or "")
+print(insthub.client.log_text(client.logs()))       # as text, as the server printed it
+```
+
+`client.logs(since=n)` gives only the lines after the one numbered `n` (each
+has its `"seq"`), which is how `insthub logs SERVER -f` follows a log. A
+program that hosts a server keeps insthub's own lines, at the level its
+logging lets through (warnings and errors unless it sets up logging).
+Keeping them changes nothing about where they are printed: a program that
+leaves logging alone still sees its warnings on stderr.
+`insthub serve`, `insthub sim` and `insthub.serve()` keep everything the
+program logs, from INFO up, and also log exceptions that nothing caught,
+in any thread (`insthub.server.keep_logs(everything=True)` does that for
+a program of your own). A server of an older insthub keeps none, and
+`logs()` raises a `BusError` that says so.
 
 ## What can be sent
 
@@ -350,19 +409,79 @@ over.
 ## GUIs
 
 A GUI must not freeze while an instrument works, and may only touch its
-widgets from the GUI thread. Two helpers in `insthub.qt` take care of both:
+widgets from the GUI thread. Four helpers in `insthub.qt` take care of both:
 
 ```python
 from insthub import qt
 
 watcher = qt.watch(scope.subscribe("ch1"), lambda frame: curve.setData(frame.data), fps=30)
-qt.deliver(scope.measure.future("VPP"), lambda vpp: label.setText(f"{vpp:.3f} V"))
+qt.deliver(qt.start(scope.measure.future, "VPP"), lambda vpp: label.setText(f"{vpp:.3f} V"))
+timebase = qt.coalesce(scope.set_timebase.future)
+slider.valueChanged.connect(lambda us: timebase(seconds_per_div=us * 1e-6))
 ```
 
 - `qt.watch` calls your function in the GUI thread with the newest frame, at
   most `fps` times a second.
+- `qt.start(scope.measure.future, "VPP")` starts a call and returns its future
+  at once. `scope.measure.future("VPP")` alone also returns at once while the
+  server is there, but if the server has gone away, it first tries to
+  reconnect, which can take seconds (a computer that is switched off). `qt.start`
+  does that on a thread of its own, keeping the order of the calls, so the
+  window never waits. When the server cannot be reached, the future fails with
+  `ConnectionLost`. The function you give it runs on that thread: give it the
+  device's `.future` (or `device.bus.future`), not code that touches widgets.
 - `qt.deliver` calls your function in the GUI thread with the result of a call
-  when it is ready (and an optional error function if it failed).
+  when it is ready (and an optional error function if it failed). With
+  `owner=widget`, it calls nothing once that widget is deleted, so an answer
+  that comes late never reaches a widget that is gone.
+- `qt.coalesce` is for a setting that changes faster than the instrument takes
+  it, such as a slider being dragged. It keeps one call on its way at a time,
+  started as `qt.start` starts one. Values sent meanwhile wait, and only the
+  newest of each name goes out next, so the instrument never works through a
+  backlog of old values. Its optional functions: `done(result)` for the last
+  call (one with nothing waiting behind it), `error(exception)` for each call
+  that fails, and `merge(waiting, new)` for names that go together (a new
+  center makes a waiting start and stop wrong). `timebase.busy` says whether a
+  call is on its way.
+
+A control that shows the device's own value (the timebase the scope reports
+in its state) leaves the control alone while a call is on its way, because
+until the instrument has taken the new value it may still report the old one.
+But it does not drop what the device reports meanwhile: it keeps it and shows
+it when the last call ends, in `done` or `error` (where `busy` is false unless
+values that waited went out). Otherwise, an instrument that rounds what it is
+sent (to 1-2-5 steps, say) or refuses it would be shown with the value that was
+typed, not the one it has:
+
+```python
+reported = {}                             # the scope's state, as it said last
+
+def on_state(frame):                      # qt.watch(scope.subscribe("state"), on_state)
+    reported.update(frame.data)
+    show()
+
+def show():
+    if not timebase.busy and "timebase" in reported:
+        box.blockSignals(True)            # (showing a value is not sending it)
+        box.setValue(reported["timebase"])
+        box.blockSignals(False)
+
+def taken(seconds):                       # set_timebase returns the value it took
+    reported["timebase"] = seconds
+    show()
+
+timebase = qt.coalesce(scope.set_timebase.future, done=taken, error=lambda exc: show())
+```
+
+`insthub/sim_ui.py` does this for its timebase.
+
+A value that the device only reads now and then (with `poll`) needs one more
+step. The device may read it just before it takes the new value, and that old
+report then reaches the window with the answer, to be shown a moment after it.
+So keep the subscription (`reports = laser.subscribe("power")`, watched with
+`qt.watch(reports, on_power)`), and in `done` call `reports.poll()` first: it
+drops a report that has come in and is not shown yet. The demo laser's panel,
+`examples/extension/demolaser_insthub/ui/panel.py`, does this.
 
 A GUI can live in the server's program or in a separate one; the code is the
 same. In the server's program, use `server.device("scope")` and frames arrive
@@ -385,22 +504,59 @@ def make(device, parent=None) -> QWidget:
 | The panel... | How |
 |---|---|
 | gets its device | as `device`, an ordinary proxy: the same thing `insthub.device("scope")` returns |
-| never freezes the window | streams through `qt.watch`, results through `qt.deliver`, calls as `device.command.future(...)` |
+| never freezes the window | streams through `qt.watch`, calls started with `qt.start(device.command.future, ...)`, results through `qt.deliver(..., owner=the panel)`, so a panel closed inside a larger app gets no late answers |
+| sends a setting as fast as the instrument takes it | `qt.coalesce` for a slider, a spin box's arrows or a wheel: one call at a time, with the newest values |
+| shows the rest without code of its own | `controls.Controls(device, exclude=[...])` (see below) |
 | reaches the instrument only through the bus | commands, properties and streams, so a script or an agent can do all it does |
 | stops what it watches when it closes | in its widget's `closeEvent`: `watcher.stop()` for each watcher |
+| never disagrees with the device | it shows what the device reports, also after a call it rounded or refused (see `busy` above); the limits of a command's parameters (`min`, `max`, `unit`) come from `device.bus.describe(refresh=False)`, which the proxy already has, so reading them makes no call |
+
+A panel often shows a few things in a way of its own (a trace with markers,
+an image) and needs plain controls for the rest. `insthub.controls` has them,
+made from what the device says about itself. They are the **Settings** and
+**Commands** tabs of the window's device page:
+
+```python
+from insthub.controls import Controls
+
+layout.addWidget(Controls(device, exclude=["live", "set_timebase"]))  # what the panel shows itself
+```
+
+| Name | What it is |
+|---|---|
+| `Controls(device, include=None, exclude=None)` | both, in two tabs; a tab with nothing to show is hidden |
+| `Settings(device, include, exclude)` | the properties alone: read when shown and on **Reload**, each changed with a list, a spin box with its unit, a switch or a text field |
+| `Commands(device, include, exclude)` | the commands alone, and a line to run one with arguments as on the command line |
+
+`include` keeps only the names it lists, in its order; `exclude` leaves names
+out (each takes a list of names, or one name). Writing a property or running a
+command that the device marks dangerous asks first. The controls start their
+calls with `qt.start`, so they never freeze the panel, also when the server has
+gone away, and they say an error in red under the setting or command it is
+about, in your program too. The controls show the device as it was when they
+were made; call `load(device.bus.describe())` on them to show it as it is now,
+for example after it was paused. `Settings` emits `changed(name, value)` once a
+value is set.
 
 `insthub/sim_ui.py` is a complete example: insthub's own panel for its
-simulated scope (two traces, the timebase, live on or off, a measurement). To
+simulated scope (two traces, the timebase from 1 ns to 10 s per division as
+the device takes it, sent through `qt.coalesce` and shown as the scope took
+it, live on or off, a measurement, and the scope's other commands as
+`Controls`). The reference extension's panel,
+`examples/extension/demolaser_insthub/ui/panel.py`, is a smaller one: a
+laser's power as a slider, its temperature, and `Controls` for the rest. To
 try a panel, run it in a window of its own:
 
 ```bash
-insthub panel scope insthub.sim_ui:scope          # [-a ADDRESS] [--title TITLE]
+insthub [-a ADDRESS] panel scope insthub.sim_ui:scope [--title TITLE]
 ```
 
 or from Python:
 
 ```python
+import insthub
 from insthub import qt, sim_ui
+
 window = qt.device_window(sim_ui.scope, insthub.device("scope"), "Scope panel")
 window.show()
 qt.run()
@@ -416,7 +572,9 @@ An *app* is a whole program instead, for a device whose UI is a full
 application. It takes the device's address and name (`--address ADDRESS
 --name NAME`, as its manifest says), and when it is given an address it only
 attaches to that device, so it never starts a second server for the same
-instrument.
+instrument. Without an address, it may host the device itself when no server
+runs, importing the device's code only then.
+`examples/extension/demolaser_insthub/ui/__main__.py` does both.
 
 ### The manager window
 
@@ -456,7 +614,8 @@ it is doing, and which programs are watching it. Its tabs show:
 
 Writing a property or running a command that the device marks dangerous asks
 you first. A simulated device has a SIM mark on its tile and on its page, and
-the page shows the extension the device belongs to.
+the page shows the extension the device belongs to. The Settings and Commands
+tabs are the same controls that a [panel](#writing-a-panel) can show.
 
 Its buttons open the instrument session now (**Connect now**), close it for
 other software (**Release**), or open its live plots (**Live view**).
@@ -475,8 +634,12 @@ one ends with an error, the window shows its last lines.
 **Servers** shows a card per server. Open one to see its process, its
 addresses, its service, its config file, its devices and the programs
 connected to it. A service can be started, stopped, restarted and removed
-there, its log read, and **Starts at login** switched on or off. A server
-started by hand can be stopped. **⋯ → Edit lab.toml...** changes its config
+there, and **Starts at login** switched on or off; its page says how often
+systemd restarted it after a crash. A server started by hand can be
+stopped. **Logs** shows what a server logged: a service's journal, the
+output of a server the window started, or, for any other server (one
+started in a terminal, one on another computer), the last lines it keeps
+itself. **⋯ → Edit lab.toml...** changes its config
 file in a form: only what you change is written, the file's comments stay,
 and **Save and restart** makes the server use it. The **Add a device** tile
 after its devices opens the same form with a new device in it (for a server
@@ -543,7 +706,8 @@ its device, and its own windows if it has some. One small file in it,
 `insthub-extension.toml` (its *manifest*), says what it adds. insthub reads
 the manifest as data and never runs it, so listing extensions loads no vendor
 library. [Design](design.md#extensions) explains the model; this is how to
-use it.
+use it. [`examples/extension/`](../examples/extension) is a complete one to
+copy: a simulated laser, with a panel and an app, which runs without hardware.
 
 | To | Do |
 |---|---|
@@ -606,14 +770,20 @@ announces the extension's `id`, or with `types` only for the devices whose
 type (as `insthub info` shows it: the class name) is listed. For a device on
 this computer, the extension is found from the device's own folder, so
 **Open** starts the copy of the extension that its server runs; for one on
-another computer, from your extensions. Its output goes to
-`ui/DEVICE-NAME.log` in insthub's runtime folder. `insthub open` waits 3
+another computer, from your extensions. insthub runs nothing of an
+extension whose manifest or folder another user may change (see
+[the design](design.md#the-manifest)). Its output goes to
+`ui/DEVICE/NAME.log` in insthub's runtime folder. `insthub open` waits 3
 seconds and, if it ended with an error by then, prints the log's last lines.
 
 ## Command line
 
 ```
-insthub list                                   servers and devices on this computer
+insthub list                                   servers and devices on this computer, and on the computers
+                                               devices.toml names
+insthub states [DEVICE ...] [--json]           what every device is like now (to save next to a data file);
+                                               with -a, one server's; exit code 1 if what you asked for is missing
+insthub logs SERVER [-n N] [--level L] [-f]    what a server logged, from any computer; -f follows it
 insthub info DEVICE                            commands, properties, streams, status; units, limits, choices,
                                                what is dangerous, and whether it is simulated
 insthub call DEVICE COMMAND [ARG ...] [KEY=VALUE ...] [--save FILE]
@@ -641,4 +811,5 @@ insthub mcp                                    the bus for AI agents, see agents
 ```
 
 Values are read as JSON where possible (`1e3`, `true`, `[1, 2]`) and as text
-otherwise. Add `-a ADDRESS` to talk to a server by address instead of by name.
+otherwise. Add `-a ADDRESS` before the command (`insthub -a tcp://labpc:8700 info
+scope`) to talk to a server by address instead of by name.

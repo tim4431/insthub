@@ -110,8 +110,10 @@ There are two steps, and you only set up the first.
    tells the agent what insthub is and where to start. You do not need to
    explain it in your prompt.
 2. **insthub finds the instruments** the same way every client does: the
-   servers running on this computer, plus the devices on other computers
-   listed in `devices.toml` (see [running servers](running-servers.md#reaching-a-server-from-another-computer)).
+   servers running on this computer, plus the devices and servers on other
+   computers that `devices.toml` names (see [running servers](running-servers.md#reaching-a-server-from-another-computer)).
+   `list_devices` notes a server there that does not answer, and a
+   `devices.toml` that cannot be read.
    A server you start later is visible at the agent's next call.
 
 The agent's knowledge of each instrument is whatever `describe` returns: the
@@ -296,6 +298,11 @@ The same things make a device pleasant to use from a notebook:
   its plots have the right axis.
 - **Keep state up to date** with `set_state`. `describe` includes it, so the
   agent sees the current settings without a query per property.
+
+The device of the reference extension,
+`examples/extension/demolaser_insthub/device.py`, does most of this for a
+wrapped driver: units and limits, choices from an annotation, a value polled
+every second, what is dangerous, and that it is simulated.
 
 ## Trying it without hardware
 

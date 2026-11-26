@@ -289,9 +289,6 @@ class _LocalTransport:
         """What a socket connection's hello would say."""
         return self._server._hello()
 
-    def info(self) -> dict:
-        return self.hello
-
     def request(self, device, method, args, kwargs) -> CallFuture:
         fut = CallFuture()
         fut.where = f"{device}.{method}"
@@ -334,9 +331,6 @@ class _SocketTransport:
         self.closed = False
         self.hello: dict = {}
         self._connect(connect_timeout)
-
-    def info(self) -> dict:
-        return self.request("", "info", (), {}).result(10.0)
 
     # -- connection ----------------------------------------------------------
     def _connect(self, timeout: float) -> None:
@@ -560,6 +554,18 @@ def meta_text(meta: dict) -> str:
     return ", ".join(parts)
 
 
+def log_text(records: list[dict]) -> str:
+    """Log records (Client.logs) as text, one line each as `insthub serve` prints them
+    ("2026-11-25 14:03:11,250 INFO insthub.scope: connected"), an exception's traceback under its line."""
+    lines = []
+    for r in records:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["time"]))
+        lines.append(f"{stamp},{int(r['time'] % 1 * 1000):03d} {r['level']} {r['logger']}: {r['message']}")
+        if r.get("exc"):
+            lines.append(r["exc"])
+    return "\n".join(lines)
+
+
 class RemoteMethod:
     """A command of a remote device.  Call it, or use `.future()` (don't wait),
     `.notify()` (don't even want the result) or `await .aio()`."""
@@ -574,7 +580,9 @@ class RemoteMethod:
 
     def future(self, *args, **kwargs) -> CallFuture:
         """Start the call and return at once.  `fut.result(timeout)` waits for it;
-        calls to one device still run in the order they were made."""
+        calls to one device still run in the order they were made.  (To a server
+        that has gone away since the last call, it first reconnects, which can take
+        seconds; a GUI starts it with `insthub.qt.start` instead.)"""
         return self._t.request(self._device, self._name, args, kwargs)
 
     def notify(self, *args, **kwargs) -> None:
@@ -785,8 +793,15 @@ class Client:
         return self._t.closed
 
     def info(self) -> dict:
-        """Server name, pid, addresses and device names."""
-        return self._t.info()
+        """What the server says about itself now: its hello (see `hello`), and "clients", the
+        programs connected to it."""
+        return self._t.request("", "info", (), {}).result(self.timeout or 10.0)
+
+    @property
+    def hello(self) -> dict:
+        """What the server said about itself when this connection was made (or made again): its
+        name ("server"), "pid", "version", "features", "devices" and "addresses"."""
+        return dict(self._t.hello)
 
     @property
     def features(self) -> frozenset[str]:
@@ -798,6 +813,19 @@ class Client:
         """Whether the server has a feature: ask before relying on a server call or key that an
         older insthub may not have."""
         return feature in self.features
+
+    def logs(self, n: int = 200, level: str | int = "INFO", since: int | None = None) -> list[dict]:
+        """The last `n` log records of the server's process at `level` or above ("DEBUG", "INFO",
+        "WARNING", ...), oldest first; with `since`, only those after the record of that number (to
+        follow the log: pass the last "seq" you have).  Each is {"seq", "time", "level", "logger",
+        "message", "exc": an exception's traceback, or None}; log_text() makes them text.  A server
+        keeps its last 1000: all its process logs for `insthub serve`, insthub's own for a program
+        that hosts one (see server.keep_logs).  Raises BusError for a server older than this."""
+        if not self.supports("logs"):
+            raise BusError(f"{self._t.hello.get('server') or self.address} runs an older insthub, which keeps "
+                           "no log for others to read: update insthub there and restart it, or read its output "
+                           "where it runs (its terminal, or `insthub service logs NAME` on that computer)")
+        return self._t.request("", "logs", (n, level, since), {}).result(self.timeout or 10.0)
 
     def devices(self) -> list[str]:
         return list(self.info()["devices"])
@@ -845,10 +873,11 @@ class Client:
 
 
 # ---------------------------------------------------------------- entry points
-def connect(address: str, *, timeout: float | None = None) -> Client:
+def connect(address: str, *, timeout: float | None = None, connect_timeout: float = 5.0) -> Client:
     """Connect to a server by address: "tcp://host:port", "ipc:///path/to.sock"
     or "inproc://server-name".  `timeout` is the default for blocking calls
-    (None: wait as long as the device takes)."""
+    (None: wait as long as the device takes); `connect_timeout`, how long the
+    server may take to answer at all (then ConnectionLost)."""
     kind, target = wire.parse_address(address)
     if kind == "inproc":
         with _server._local_lock:
@@ -856,24 +885,38 @@ def connect(address: str, *, timeout: float | None = None) -> Client:
         if srv is None:
             raise ConnectionLost(f"no server named {target!r} is running in this process")
         return Client(_LocalTransport(srv), timeout)
-    return Client(_SocketTransport(address), timeout)
+    return Client(_SocketTransport(address, connect_timeout), timeout)
 
 
 _pool: dict[str, Client] = {}
 _pool_lock = threading.Lock()
 
 
-def _pooled(address: str) -> Client:
+def _pooled(address: str, connect_timeout: float = 5.0) -> Client:
     with _pool_lock:
         client = _pool.get(address)
-        if client is None or client.closed:
-            client = _pool[address] = connect(address)
+    if client is not None and not client.closed:
         return client
+    client = connect(address, connect_timeout=connect_timeout)  # (not under the lock: others need not wait)
+    with _pool_lock:
+        other = _pool.get(address)
+        if other is not None and not other.closed:  # another thread was quicker
+            client.close()
+            return other
+        _pool[address] = client
+    return client
+
+
+def _nearest(addresses: list[str]) -> str:
+    """Of the addresses of one server, the one to use: in this process or on this computer, else TCP."""
+    return next((a for a in addresses if not a.startswith("tcp://")), addresses[0])
 
 
 def locate(name: str) -> str:
     """Address of the server hosting the device `name`: this process first, then
-    the servers running on this machine, then the static table (registry.py)."""
+    the servers running on this machine, then the static table (registry.py), then
+    the servers on other computers that the static table names (asked which devices
+    they have: see discover)."""
     for srv in _server.local_servers():
         if name in srv._devices:
             return f"inproc://{srv.name}"
@@ -882,12 +925,18 @@ def locate(name: str) -> str:
         raise DeviceNotFound(f"device name {name!r} is ambiguous: servers "
                              f"{[e['server'] for e in entries]} all have one; pass address=")
     if entries:
-        addresses = entries[0]["addresses"]
-        return next((a for a in addresses if a.startswith("ipc://")), addresses[0])
+        return _nearest(entries[0]["addresses"])
     static = registry.static_devices()
     if name in static:
         return static[name]
-    known = sorted({d for s in registry.servers() for d in s.get("devices", ())} | set(static))
+    remote = [e for e in _remote_servers(fresh=_REMOTE_FRESH) if not e.get("error")]
+    hosts = [e for e in remote if name in e.get("devices", ())]
+    if len(hosts) > 1:
+        raise DeviceNotFound(f"device name {name!r} is ambiguous: servers on other computers "
+                             f"{[e['address'] for e in hosts]} all have one; pass address=")
+    if hosts:
+        return hosts[0]["address"]
+    known = sorted({d for s in [*registry.servers(), *remote] for d in s.get("devices", ())} | set(static))
     raise DeviceNotFound(f"no device {name!r} on the bus (known devices: {', '.join(known) or 'none'}; "
                          "is its server running?)")
 
@@ -898,13 +947,139 @@ def device(name: str, address: str | None = None, *, timeout: float | None = Non
     return _pooled(address or locate(name)).device(name, timeout=timeout)
 
 
-def discover() -> list[dict]:
+def discover(remote: bool = False) -> list[dict]:
     """The servers visible from here, in this process and on this machine: their registry
-    entries (for one in this process, what its entry would say; see Server._entry)."""
+    entries (for one in this process, what its entry would say; see Server._entry), each with
+    "address", the one of its "addresses" to connect to from here.
+
+    With `remote`, also the servers on other computers that the static table names
+    (registry.remote_addresses), all asked at once: what each says about itself ("server",
+    "pid" there, "devices", "version", "features", ...) with "remote": True, and as "address"
+    (and "addresses") the address it was reached at.  A server is listed once, however many
+    addresses reach it: one of this computer that devices.toml names too (by an address of this
+    computer's network) is listed as this computer's.  One that does not answer within about a
+    second has "error" (why), "server" None, and as "devices" those the static table lists
+    there; if devices.toml itself cannot be read, one entry says so in "error", with "address"
+    None."""
     found = [{**srv._entry(), "addresses": [f"inproc://{srv.name}", *srv.addresses]}
              for srv in _server.local_servers()]
     names = {f["server"] for f in found}
     found += [s for s in registry.servers() if s.get("server") not in names]
+    for entry in found:
+        entry["address"] = _nearest(entry["addresses"])
+    if remote:
+        here = {address for f in found for address in f["addresses"]}
+        found += _distinct([e for e in _remote_servers() if e["address"] not in here],
+                           {registry.identity(f) for f in found})
+    return found
+
+
+_REMOTE_TIMEOUT = 1.0  #: seconds a server on another computer may take to answer when it is looked for
+_REMOTE_FRESH = 5.0  #: seconds locate() believes what those servers said about their devices
+_remote_lock = threading.Lock()
+_remote_seen: list = [float("-inf"), None, []]  # [when, the servers devices.toml named, what they said]
+
+
+def _remote_servers(fresh: float = 0.0) -> list[dict]:
+    """What each server on another computer that the static table names says about itself
+    (see discover), asked in parallel, each server once; unless the same servers were asked
+    less than `fresh` seconds ago."""
+    try:
+        listed = registry.remote_addresses()
+    except BusError as e:  # devices.toml cannot be read: said as for a server that does not answer
+        return [_unanswered(None, [], str(e))]
+    with _remote_lock:
+        when, named, found = _remote_seen
+        if named == listed and time.monotonic() - when < fresh:
+            return found
+    found = []
+    if listed:
+        from concurrent.futures import ThreadPoolExecutor  # here: only programs that look further use it
+
+        with ThreadPoolExecutor(min(16, len(listed)), thread_name_prefix="insthub:remote") as pool:
+            found = _distinct(pool.map(_ask_remote, listed, listed.values()), set())
+    with _remote_lock:
+        _remote_seen[:] = [time.monotonic(), listed, found]
+    return found
+
+
+def _ask_remote(address: str, listed: list[str]) -> dict:
+    """What the server at an address on another computer says about itself (its hello), on a
+    connection of its own that is closed at once: looking at a server keeps nothing open to it."""
+    try:
+        with connect(address, connect_timeout=_REMOTE_TIMEOUT) as client:
+            hello = client.hello
+    except (BusError, OSError, ValueError) as e:  # (ValueError: not an address)
+        return _unanswered(address, listed, str(e))
+    return {**hello, "addresses": [address], "address": address, "remote": True}
+
+
+def _unanswered(address: str | None, devices: list[str], why: str) -> dict:
+    """discover()'s entry for a server elsewhere that could not be asked (address None: devices.toml
+    could not be read)."""
+    return {"server": None, "pid": None, "devices": devices, "addresses": [address] if address else [],
+            "address": address, "remote": True, "error": why}
+
+
+def _distinct(entries, seen: set) -> list[dict]:
+    """The entries of servers whose identity (registry.identity) is not in `seen`, each server
+    once: one that answers at two addresses is one server.  Entries with "error" all stay."""
+    kept = []
+    for entry in entries:
+        if not entry.get("error"):
+            if registry.identity(entry) in seen:
+                continue
+            seen.add(registry.identity(entry))
+        kept.append(entry)
+    return kept
+
+
+def states(names=None, timeout: float = 2.0, address: str | None = None) -> dict:
+    """What each device on the bus is like now, for saving next to a data file: {device: {"server",
+    "type", "extension", "connected", "state": its state dict, "time": when it was read}}, from
+    every server discover(remote=True) finds, all asked at once.  `names`: only these devices.
+    Each is read where locate() finds it, so it is the device that device(name) gives; a name that
+    locate() cannot place (two servers have it, it is nowhere, or devices.toml cannot be read)
+    gets {"error"}.  A device whose server does not answer within `timeout` seconds gets
+    {"server", "error"} instead.  With `address`: the devices of the server there only (BusError
+    if it does not answer)."""
+    end = time.monotonic() + timeout
+    wanted = [names] if isinstance(names, str) else None if names is None else list(names)
+    found, where, unanswered = {}, {}, {}
+    if address is not None:
+        if wanted is None:
+            info = _pooled(address, timeout)._t.request("", "info", (), {}).result(timeout)
+            wanted = sorted(info["devices"])
+        where[address] = wanted
+    else:
+        entries = discover(remote=True)
+        unanswered = {e["address"]: e["error"] for e in entries if e.get("error") and e["address"]}
+        for name in sorted({n for e in entries for n in e.get("devices", ())}) if wanted is None else wanted:
+            try:
+                where.setdefault(locate(name), []).append(name)
+            except BusError as e:
+                found[name] = {"error": str(e)}
+    asked = []
+    for at, mine in where.items():
+        try:
+            if at in unanswered:
+                raise ConnectionLost(unanswered[at])
+            client = _pooled(at, timeout)
+            t = client._t
+            asked.append((client.hello.get("server"), t.request("", "devices", (), {}),
+                          {n: t.request(n, "$state", (), {}) for n in mine}))
+        except BusError as e:
+            found.update({n: {"server": None, "error": str(e)} for n in mine})
+    for server, described, pending in asked:
+        for name, future in pending.items():
+            try:
+                state = future.result(max(0.0, end - time.monotonic()))  # (first: it says why one is not there)
+                d = described.result(max(0.0, end - time.monotonic()))[name]
+            except (BusError, TimeoutError, KeyError) as e:
+                found[name] = {"server": server, "error": str(e) or type(e).__name__}
+                continue
+            found[name] = {"server": server, "type": d["type"], "extension": d.get("extension"),
+                           "connected": d["status"]["connected"], "state": state, "time": time.time()}
     return found
 
 
@@ -918,4 +1093,4 @@ def close_all() -> None:
 
 
 __all__ = ["BusError", "UnknownCommand", "CallFuture", "Client", "DeviceProxy", "RemoteMethod", "Subscription",
-           "close_all", "connect", "device", "discover", "gather", "locate"]
+           "close_all", "connect", "device", "discover", "gather", "locate", "log_text", "states"]

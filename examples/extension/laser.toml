@@ -1,0 +1,16 @@
+# A server for the demo laser, as the window's New server dialog writes one (it writes the folder
+# in full).  From this folder:
+#
+#     .venv/bin/insthub serve laser.toml               # until Ctrl-C
+#     .venv/bin/insthub service install laser.toml     # or in the background, at every login
+#
+# Use the extension's own insthub (.venv/bin/insthub): a server runs in the Python that starts it,
+# and a real instrument's libraries are only in its extension's .venv.
+
+[server]
+name = "demo-laser"
+
+[devices.laser]
+driver = "demolaser_insthub.device:Laser"
+path = "."                           # where its modules are: this file's folder, wherever it runs
+port = "sim"                         # passed to Laser(port=...)

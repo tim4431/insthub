@@ -11,6 +11,9 @@ thread that produced them with a non-blocking send; whatever does not fit in
 the socket buffer is handed to the writer.  A client that reads slowly
 therefore never stalls a device, and stream frames it has not been sent yet are
 replaced by newer ones (per subscription, unless it asked for a queue).
+
+A server's process keeps its last log records, which clients read with the
+server call "logs" from any computer (keep_logs).
 """
 from __future__ import annotations
 
@@ -42,8 +45,10 @@ _UNIX_SOCKETS = hasattr(socket, "AF_UNIX") and os.name != "nt"
 #: (`Client.supports("pause")`) before it relies on a newer server call or key, so
 #: that old and new insthub versions can share a lab.  Add a name with each one.
 #: "meta": describe() may carry metadata (units, limits, choices) and what a device is
-#: (extension, simulated); "dangerous": it marks what is dangerous to use.
-FEATURES = frozenset({"pause", "meta", "dangerous"})
+#: (extension, simulated); "dangerous": it marks what is dangerous to use; "logs": the
+#: server call "logs" (see keep_logs).
+FEATURES = frozenset({"pause", "meta", "dangerous", "logs"})
+LOG_RECORDS = 1000  #: how many of its last log records a server's process keeps (keep_logs)
 
 _local_lock = threading.Lock()
 _local_servers: dict[str, Server] = {}
@@ -60,6 +65,102 @@ def local_servers() -> list[Server]:
 def _stop_all() -> None:
     for server in list(_started):
         server.stop()
+
+
+# ---------------------------------------------------------------- its log, for others to read
+class _Recent(logging.Handler):
+    """The last log records of this process, for the server call "logs": so that a server's log
+    can be read from any computer, also when it has no journal or log file (one started in a
+    terminal, a GUI that hosts its own).  A record keeps what can be sent: its number, time,
+    level, logger, message, and an exception's traceback as text."""
+
+    def __init__(self, size: int):
+        super().__init__()
+        self._records: collections.deque = collections.deque(maxlen=size)  # (levelno, record)
+        self._count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:  # (Handler.handle holds self.lock)
+        try:
+            message = record.getMessage()
+            exc = logging.Formatter().formatException(record.exc_info) if record.exc_info else record.exc_text
+        except Exception:  # noqa: BLE001 - e.g. a format string its arguments do not fit: logging says so
+            self.handleError(record)
+            return
+        self._count += 1
+        self._records.append((record.levelno, {"seq": self._count, "time": record.created,
+                                               "level": record.levelname, "logger": record.name,
+                                               "message": message, "exc": exc}))
+        # Python prints a record that no handler takes (logging.lastResort: WARNING and above, to
+        # stderr), but only while no logger on its way has a handler at all, and this is one: so it
+        # prints it in Python's stead, and keeping a program's log never hides it.
+        last = logging.lastResort
+        if last is not None and record.levelno >= last.level and not self._others(record):
+            last.handle(record)
+
+    def _others(self, record: logging.LogRecord) -> bool:
+        """Whether another handler is on the record's way up the loggers (as Logger.callHandlers
+        goes: whatever their levels)."""
+        logger: logging.Logger | None = logging.getLogger(record.name)
+        while logger is not None:
+            if any(handler is not self for handler in logger.handlers):
+                return True
+            logger = logger.parent if logger.propagate else None
+        return False
+
+    def select(self, n: int = 200, level: str | int = "INFO", since: int | None = None) -> list[dict]:
+        """The last `n` records at `level` or above (a name, as "WARNING", or a number) that came
+        after the one numbered `since`, oldest first."""
+        floor = level if isinstance(level, int) else logging.getLevelNamesMapping().get(str(level).upper())
+        if floor is None:
+            raise ValueError(f"unknown log level {level!r}: DEBUG, INFO, WARNING, ERROR or CRITICAL")
+        with self.lock:
+            kept = list(self._records)
+        found = [record for levelno, record in kept
+                 if levelno >= floor and (since is None or record["seq"] > since)]
+        return found[max(0, len(found) - int(n)):]
+
+
+_RECENT = _Recent(LOG_RECORDS)
+
+
+def keep_logs(everything: bool = False) -> None:
+    """Keep this process's last log records (LOG_RECORDS of them) for the server call "logs"
+    (`insthub logs SERVER`, `Client.logs`): insthub's own, as every Server does when it starts.
+    With `everything`, those of every logger, and uncaught exceptions, of the main thread and of
+    the others, go to the log too instead of straight to stderr: what serve(), `insthub serve` and
+    `insthub sim` do, where the process is a server and nothing else.  Logging is then set up to
+    print INFO and above, if nothing set it up before.  Only records that the loggers' levels let
+    through are kept: a program that leaves logging alone has WARNING and above, and still sees
+    them on stderr, as before (see _Recent.emit)."""
+    ours, root = logging.getLogger("insthub"), logging.getLogger()
+    if not everything:
+        if _RECENT not in root.handlers:
+            ours.addHandler(_RECENT)
+        return
+    if not root.handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    ours.removeHandler(_RECENT)  # the root's handler sees insthub's records too: each is kept once
+    root.addHandler(_RECENT)
+    if sys.excepthook is sys.__excepthook__:  # (a hook the program set itself stays)
+        sys.excepthook = _uncaught
+    if threading.excepthook is threading.__excepthook__:
+        threading.excepthook = _uncaught_in_thread
+
+
+def _uncaught(kind, value, tb) -> None:
+    """sys.excepthook of a server's process (keep_logs): an exception nothing caught is logged."""
+    if issubclass(kind, KeyboardInterrupt):
+        sys.__excepthook__(kind, value, tb)
+    else:
+        logging.getLogger().critical("uncaught exception", exc_info=(kind, value, tb))
+
+
+def _uncaught_in_thread(args) -> None:
+    """threading.excepthook of a server's process (keep_logs)."""
+    if not issubclass(args.exc_type, SystemExit):  # (as Python's own: a thread may end that way)
+        name = args.thread.name if args.thread is not None else "?"
+        logging.getLogger().error("uncaught exception in thread %s", name,
+                                  exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 
 
 # ---------------------------------------------------------------- sending
@@ -372,6 +473,7 @@ class Server:
 
     # -- lifecycle -------------------------------------------------------------
     def start(self) -> Server:
+        keep_logs()  # first: what starting the devices logs ("not connected at start") is kept too
         with self._lock:
             if self._running:
                 return self
@@ -589,6 +691,8 @@ class Server:
             return {**self._hello(), "clients": [c.summary() for c in list(self._conns)]}
         if method == "devices":
             return {name: dev._rt.describe() for name, dev in list(self._devices.items())}
+        if method == "logs":  # args: n, level, since (see Client.logs)
+            return _RECENT.select(*args)
         raise UnknownCommand(f"unknown server command {method!r}")
 
     def __repr__(self) -> str:
@@ -709,7 +813,7 @@ _BUILTINS = {
 
 
 def serve(*devices, name: str | None = None, tcp: int | str | None = None, ipc: bool = True) -> None:
-    """Host the given devices until Ctrl-C.  Shorthand for `Server(...).serve_forever()`."""
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    """Host the given devices until Ctrl-C.  Shorthand for `Server(...).serve_forever()`, in a
+    process that is a server and nothing else: its whole log is kept for others to read (keep_logs)."""
+    keep_logs(everything=True)
     Server(name, devices, tcp=tcp, ipc=ipc).serve_forever()

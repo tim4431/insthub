@@ -5,6 +5,7 @@ import re
 import sys
 import tomllib
 import warnings
+from pathlib import Path
 
 import pytest
 
@@ -263,6 +264,28 @@ def test_a_drivers_own_error_is_not_one_of_the_file(tmp_path, imports):
     with pytest.raises(config.DriverError, match=r"^\[devices.box\]: cannot load driver 'brokendrv:Box': "
                                                  r"ValueError: numpy.dtype size changed"):
         config.check(cfg)
+
+
+def test_a_relative_path_counts_from_the_files_folder(tmp_path, imports, monkeypatch):
+    """Wherever `insthub serve` runs, as a service and the window run it (in the file's folder)."""
+    lab = tmp_path / "lab"
+    module(lab / "drivers", "reldrv")
+    module(tmp_path / "home" / "code", "homedrv")
+    for home in ("HOME", "USERPROFILE"):  # (where ~ is, on POSIX and on Windows)
+        monkeypatch.setenv(home, str(tmp_path / "home"))
+    (lab / "lab.toml").write_text('[devices.a]\ndriver = "reldrv:PowerSupply"\npath = "drivers"\nport = 1\n\n'
+                                  '[devices.b]\ndriver = "reldrv:PowerSupply"\npath = "./drivers/../drivers"\n'
+                                  'port = 2\n\n'
+                                  '[devices.c]\ndriver = "homedrv:PowerSupply"\npath = "~/code"\nport = 3\n\n'
+                                  f'[devices.d]\ndriver = "reldrv:PowerSupply"\npath = "{lab / "drivers"}"\n'
+                                  'port = 4\n')
+    (tmp_path / "elsewhere" / "drivers").mkdir(parents=True)  # (no reldrv here: it would not be found)
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    config.check("../lab/lab.toml")
+    _, devices = config.load("../lab/lab.toml")
+    assert [d._kwargs["port"] for d in devices] == [1, 2, 3, 4]
+    assert Path(sys.modules["reldrv"].__file__) == (lab / "drivers" / "reldrv.py").resolve()
+    assert Path(sys.modules["homedrv"].__file__) == (tmp_path / "home" / "code" / "homedrv.py").resolve()
 
 
 def test_a_file_that_is_no_toml_is_named(tmp_path):

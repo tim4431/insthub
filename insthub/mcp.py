@@ -41,7 +41,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import __version__, client, registry
+from . import __version__, client
 from .device import busy_with
 from .errors import DevicePaused, RemoteError
 from .render import Renderer
@@ -239,32 +239,24 @@ class Tools:
 
     # -- tools ----------------------------------------------------------------
     def list_devices(self) -> Reply:
-        targets, known = [], set()
-        for srv in client.discover():
-            addresses = srv.get("addresses") or []
-            for scheme in ("inproc://", "ipc://", ""):
-                address = next((a for a in addresses if a.startswith(scheme)), None)
-                if address:
-                    targets.append(address)
-                    break
-            known.update(addresses)
-        targets += sorted(set(registry.static_devices().values()) - known)
+        servers = client.discover(remote=True)
+        notes = [f"{s['address']}: unreachable ({s['error']})" if s["address"] else s["error"]
+                 for s in servers if s.get("error")]  # (no address: devices.toml cannot be read)
+        targets = [(s["server"], s["address"]) for s in servers if not s.get("error")]
 
-        def fetch(address):
+        def fetch(target):
             try:
-                c = self._client(address)
-                return c.info()["server"], c.describe()
+                return self._client(target[1]).describe()
             except Exception as e:  # noqa: BLE001
                 return e
 
         with ThreadPoolExecutor(max(1, min(8, len(targets)))) as pool:
             results = list(pool.map(fetch, targets))
-        devices, owner, notes = {}, {}, []
-        for address, result in zip(targets, results):
-            if isinstance(result, Exception):
-                notes.append(f"{address}: unreachable ({_error_text(result)})")
+        devices, owner = {}, {}
+        for (server, address), described in zip(targets, results):
+            if isinstance(described, Exception):
+                notes.append(f"{address}: unreachable ({_error_text(described)})")
                 continue
-            server, described = result
             for name, d in sorted(described.items()):
                 if name in owner:
                     if owner[name] != server:
@@ -273,7 +265,7 @@ class Tools:
                     continue
                 owner[name] = server
                 devices[name] = _brief(server, d)
-        if not targets:
+        if not servers:
             notes.append("no insthub server is running on this computer, and none is listed in devices.toml")
         out = {"devices": devices}
         if notes:

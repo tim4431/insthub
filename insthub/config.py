@@ -7,7 +7,8 @@
     [devices.psu]                # the section name is the device name on the bus
     driver = "mydriver:PowerSupply"   # "module:Class".  A Device subclass is used as is;
                                  # any other class is hosted with insthub.wrap().
-    path = "~/Code/mydriver"     # optional: where the module lives
+    path = "~/Code/mydriver"     # optional: where the module lives (a relative
+                                 # folder counts from this file's)
     lazy = true                  # optional: open on first use, not at start
     port = "/dev/ttyUSB0"        # every other key is a constructor argument
 
@@ -520,7 +521,8 @@ def _raise(problems: list[str], unloadable: list[ImportError]) -> None:
 
 
 def build_device(name: str, spec: dict) -> Device:
-    """The device of the table [devices.NAME].  Raises ImportError if its driver cannot be
+    """The device of the table [devices.NAME] (with no file around it, a relative `path` counts
+    from the working folder).  Raises ImportError if its driver cannot be
     loaded, ConfigError listing every problem of the table (see validate), or naming what
     meta, poll or dangerous names that the device does not have, and DriverError if the
     constructor of a Device subclass fails."""
@@ -548,7 +550,18 @@ def _checked(path: str | Path, advise: bool = False) -> tuple[dict, list[tuple[s
     server = {"name": path.stem, **config.get("server", {})}
     problems = [f"[server] {key}: not one of {', '.join(_SERVER_KEYS)}" + did_you_mean(key, _SERVER_KEYS)
                 for key in server if key not in _SERVER_KEYS]
-    return server, _tables(config.get("devices", {}), advise, problems)
+    return server, _tables(_counted_from(config.get("devices", {}), path.resolve().parent), advise, problems)
+
+
+def _counted_from(devices, folder: Path):
+    """The [devices] tables of a file in `folder`, with each relative `path` counted from there: a
+    server file means the same wherever `insthub serve` runs, as it does to a service and to the
+    window (which run it in that folder) and to `insthub check` (extensions._device_folders)."""
+    if not isinstance(devices, dict):
+        return devices
+    return {name: {**spec, "path": str((folder / Path(spec["path"]).expanduser()).resolve())}
+            if isinstance(spec, dict) and isinstance(spec.get("path"), str) and spec["path"].strip() else spec
+            for name, spec in devices.items()}
 
 
 def check(path: str | Path) -> None:

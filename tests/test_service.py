@@ -20,6 +20,8 @@ def test_unit_for_a_config_and_for_a_script(tmp_path):
     assert f'ExecStart="/opt/venv/bin/python" "-m" "insthub" "serve" "{cfg}"' in text
     assert f"WorkingDirectory={tmp_path}" in text
     assert "Restart=on-failure" in text and "WantedBy=default.target" in text
+    unit = text.split("[Service]")[0]                                   # a crash loop ends: 5 starts in 5 min
+    assert "StartLimitIntervalSec=300" in unit and "StartLimitBurst=5" in unit and "RestartSec=5" in text
     script = tmp_path / "my server 100%.py"
     script.write_text("")
     text = service.unit_text("gui", script, python="/usr/bin/python3")
@@ -39,7 +41,7 @@ def test_bad_targets_and_names(tmp_path):
         service.unit_text("has space", cfg)
 
 
-def test_units_come_from_one_systemctl_call(tmp_path, monkeypatch):
+def test_units_come_from_one_systemctl_call(tmp_path, monkeypatch, capsys):
     folder = tmp_path / "systemd" / "user"
     folder.mkdir(parents=True)
     for name in ("lab", "rf"):
@@ -49,8 +51,9 @@ def test_units_come_from_one_systemctl_call(tmp_path, monkeypatch):
     def systemctl(*args, check=True):
         calls.append(args)
         out = ("Id=insthub-lab.service\nActiveState=active\nSubState=running\nUnitFileState=enabled\nMainPID=4242\n"
+               "NRestarts=0\nResult=success\n"
                "\nId=insthub-rf.service\nActiveState=activating\nSubState=auto-restart\nUnitFileState=disabled\n"
-               "MainPID=0\n")
+               "MainPID=0\nNRestarts=3\nResult=exit-code\n")
         return subprocess.CompletedProcess(args, 0, out, "")
 
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
@@ -59,11 +62,17 @@ def test_units_come_from_one_systemctl_call(tmp_path, monkeypatch):
     assert len(calls) == 1 and calls[0][0] == "show"
     assert (lab["name"], lab["state"], lab["sub"], lab["enabled"], lab["pid"]) == ("lab", "active", "running", True, 4242)
     assert (rf["state"], rf["sub"], rf["enabled"], rf["pid"]) == ("activating", "auto-restart", False, None)
+    assert (lab["restarts"], rf["restarts"], rf["result"]) == (0, 3, "exit-code")
+    assert service.restarts_text(lab) == "" and service.restarts_text(rf) == "restarted 3 times"
+    assert service.restarts_text({"restarts": 1, "result": "start-limit-hit"}) == ("restarted 1 time, gave up: "
+                                                                                   "too many restarts")
+    assert cli.main(["service", "list"]) == 0
+    assert "\n                 restarted 3 times\n" in capsys.readouterr().out
     assert lab["command"] == '"/usr/bin/python3" "lab.py"'
     with pytest.raises(insthub.BusError, match="no service insthub-nope"):
         service.restart("nope")
-    service.restart("lab")
-    assert calls[-1] == ("restart", "insthub-lab.service")
+    service.restart("lab", wait=0)
+    assert calls[-2:] == [("reset-failed", "insthub-lab.service"), ("restart", "insthub-lab.service")]
 
 
 @pytest.mark.skipif(shutil.which("systemd-analyze") is None, reason="needs systemd")
@@ -255,6 +264,7 @@ def test_cli_start_stop_restart(monkeypatch, capsys):
 
 def test_starting_at_login_is_a_choice(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(service, "WAIT", 0)                             # (no server announces itself here)
     calls = []
     monkeypatch.setattr(service, "_systemctl", lambda *a, check=True: calls.append(a) or
                         subprocess.CompletedProcess(a, 0, "", ""))
@@ -282,3 +292,55 @@ def test_starting_at_login_is_a_choice(tmp_path, monkeypatch, capsys):
     assert ("enable", unit) not in calls and "does not start at login" in out and "service enable lab" in out
     assert cli.main(["service", "enable", "lab"]) == 0 and "starts at every login" in capsys.readouterr().out
     assert cli.main(["service", "disable", "lab"]) == 0 and "no longer starts at login" in capsys.readouterr().out
+
+
+class FakeSystemd:
+    """systemctl --user for one service, insthub-lab: it records what it is asked, and `show` says
+    what `unit` holds."""
+
+    def __init__(self, folder, monkeypatch):
+        (folder / "systemd" / "user").mkdir(parents=True)
+        (folder / "systemd" / "user" / "insthub-lab.service").write_text('[Service]\nExecStart="python" "lab.toml"\n')
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(folder))
+        monkeypatch.setattr(service, "_systemctl", self)
+        monkeypatch.setattr(service, "journal", lambda name, lines=200: f"the last {lines} lines of {name}\nboom")
+        self.calls, self.unit = [], {"ActiveState": "active", "SubState": "running", "MainPID": "0"}
+
+    def __call__(self, *args, check=True):
+        self.calls.append(args)
+        out = "".join(f"{k}={v}\n" for k, v in {"Id": "insthub-lab.service", **self.unit}.items())
+        return subprocess.CompletedProcess(args, 0, out if args[0] == "show" else "", "")
+
+
+def test_starting_a_service_waits_until_its_server_answers(tmp_path, monkeypatch):
+    systemd = FakeSystemd(tmp_path, monkeypatch)
+    systemd.unit["MainPID"] = str(os.getpid())                         # its process is this one ...
+    with insthub.Server("lab", [insthub.sim.Loopback()]):              # ... and its server has announced itself
+        assert service.start("lab") == os.getpid()
+        assert systemd.calls[:2] == [("reset-failed", "insthub-lab.service"), ("start", "insthub-lab.service")]
+        assert service.restart("lab", wait=1) == os.getpid()           # (one that gave up starts again too)
+        assert ("restart", "insthub-lab.service") in systemd.calls
+
+
+@pytest.mark.parametrize("unit, why", [
+    ({"ActiveState": "activating", "SubState": "auto-restart"}, "stopped with an error"),  # crashed, to be restarted
+    ({"ActiveState": "failed", "SubState": "failed"}, "stopped with an error"),
+    ({"ActiveState": "inactive", "SubState": "dead"}, "ended"),
+    ({"ActiveState": "active", "SubState": "running", "MainPID": "4242"},                  # runs, but no server
+     "has announced no insthub server after 0.3 s"),
+])
+def test_a_service_that_does_not_come_up_shows_the_end_of_its_log(tmp_path, monkeypatch, capsys, unit, why):
+    systemd = FakeSystemd(tmp_path, monkeypatch)
+    systemd.unit.update(unit)
+    with pytest.raises(insthub.BusError) as e:
+        service.restart("lab", wait=0.3)
+    assert str(e.value) == (f"insthub-lab {why}. The end of its log (insthub service logs lab):\n"
+                            "the last 20 lines of lab\nboom")
+    monkeypatch.setattr(service, "WAIT", 0.3)
+    assert cli.main(["service", "start", "lab"]) == 1
+    assert f"error: insthub-lab {why}." in capsys.readouterr().err
+    cfg = tmp_path / "lab.toml"
+    cfg.write_text("[server]\n")
+    monkeypatch.setattr(service, "check_python", lambda target, python: [])
+    with pytest.raises(insthub.BusError, match=rf"^installed .*insthub-lab.service, but insthub-lab {why}"):
+        service.install(cfg)                                             # installed all the same: it says so
