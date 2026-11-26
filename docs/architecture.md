@@ -216,7 +216,9 @@ never sees it.
 ### Finding a device by name
 
 There is no central directory service. Each server announces itself with two
-files in a folder that belongs to your user account:
+files in a folder that belongs to your user account (`$XDG_RUNTIME_DIR/insthub`;
+without `XDG_RUNTIME_DIR`, `/tmp/insthub-UID`, which insthub refuses if another
+account made it or may write to it):
 
 ```
   /run/user/1000/insthub/
@@ -225,6 +227,12 @@ files in a folder that belongs to your user account:
       rf.sock
       rf.json                                                   ["synth", "sa"]
 ```
+
+The `.json` file also says two things that only programs on this computer
+need, so the server never sends them over the network: the Python it runs in,
+and for each device the folders its code comes from. From those folders, the
+window and `insthub ext list` find the device's
+[extension](design.md#how-a-device-finds-its-extension).
 
 `insthub.device("synth")` looks, in this order:
 
@@ -411,6 +419,20 @@ sequenceDiagram
   The control for each property, and the hints under a command, come from the
   device's description (its metadata), not from reading the instrument.
 - **Live view** opens `insthub view` as a program of its own.
+- **Extensions** are read, never run: the New server dialog and the Settings
+  page list the devices of the manifests that `extensions.discover()` finds,
+  on a worker thread (it asks systemd about services). The window imports no
+  extension's code; the server it starts does, in the extension's Python.
+- **Open** on a device's page starts a UI of the device's extension
+  (`extensions.launch`) as a program of its own, with the extension's Python:
+  an app, or a panel that `insthub panel` puts in a window. Which UIs a device
+  has is found out on a worker thread (`extensions.device_uis`, from the
+  folders in its server's `.json` file when the server runs here) and looked
+  up again every 30 seconds and whenever the page opens.
+- **What the window starts** (servers, the live view, UIs) runs in a session
+  of its own, so it outlives the window, and writes its output to a log file
+  in the runtime folder (`inventory.spawn`). When one of them ends with an
+  error, the window shows the last lines of its log.
 
 ## Why it is built this way
 

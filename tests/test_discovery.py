@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -175,6 +176,29 @@ def test_long_runtime_dir_falls_back_to_tcp(tmp_path, monkeypatch, caplog):
         assert registry.find("loopback")[0]["addresses"] == server.addresses      # still found by name
         assert insthub.connect(server.addresses[0]).loopback.echo(1) == 1
     assert registry.servers() == []
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="Windows: the temporary folder is the user's own")
+def test_a_runtime_folder_in_the_shared_temporary_folder_must_be_this_user_s_alone(tmp_path, monkeypatch):
+    monkeypatch.delenv("INSTHUB_DIR")
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))  # (what gettempdir() says)
+    path = registry.runtime_dir()
+    assert path == tmp_path / f"insthub-{os.getuid()}" and path.stat().st_mode & 0o077 == 0
+    path.chmod(0o755)  # someone else could have put files in it: refused
+    with pytest.raises(PermissionError, match=f"insthub will not use {path}: it is not a folder of this user"):
+        registry.servers()
+    path.chmod(0o700)
+    assert registry.servers() == []
+    path.rmdir()
+    (tmp_path / "elsewhere").mkdir(mode=0o700)
+    path.symlink_to(tmp_path / "elsewhere")  # a link, which another user could have made
+    with pytest.raises(PermissionError):
+        registry.runtime_dir()
+    (tmp_path / "insthub-4242").mkdir(mode=0o700)
+    monkeypatch.setattr(os, "getuid", lambda: 4242)  # as if another user made this user's folder
+    with pytest.raises(PermissionError):
+        registry.runtime_dir()
 
 
 def test_proxy_notices_new_commands_after_a_server_restart():

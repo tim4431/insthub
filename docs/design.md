@@ -11,7 +11,7 @@ rest describe insthub as it is.
 
 - [The three rules](#the-three-rules)
 - [Where code lives](#where-code-lives)
-- [Extensions](#extensions) (proposed; a device already says what it is)
+- [Extensions](#extensions) (manifests; finding, checking and starting them)
 - [A generic UI good enough for most devices](#a-generic-ui-good-enough-for-most-devices)
 - [Keeping the core light](#keeping-the-core-light)
 - [The plan, in order](#the-plan-in-order)
@@ -32,10 +32,10 @@ tests.
 **2. Everything about an instrument belongs in an extension.** An extension
 holds a device's driver and, if it has one, its user interface, the way a VS
 Code extension can hold both a language server and the views that show its
-results. insthub will provide the framework that finds extensions, joins
-their parts and runs each part in the right place (see
-[Extensions](#extensions), proposed). The smallest extension is a driver
-class and four lines of config.
+results. insthub provides the framework that finds extensions, joins their
+parts and runs each part in the right place (see
+[Extensions](#extensions)). The smallest extension is a driver class and four
+lines of config.
 
 **3. insthub stays light, because everything imports it.** Every driver
 server, experiment script, notebook and GUI in the lab runs `import insthub`.
@@ -70,8 +70,8 @@ flowchart TB
         drv["driver<br/>plain Python + vendor library"]
     end
     subgraph opt["Optional parts of insthub: loaded only by the programs that use them"]
-        gui["qt, viewer, manager, pages,<br/>forms, widgets, inventory"]
-        rest["cli, config, service, launcher, sim, bench,<br/>mcp, render, extensions (proposed)"]
+        gui["qt, viewer, sim_ui, manager, pages,<br/>forms, widgets, inventory"]
+        rest["cli, config, service, launcher, sim, bench,<br/>mcp, render, extensions"]
     end
     subgraph core["The core: what import insthub loads"]
         c["device, server, client, codec,<br/>wire, registry, errors<br/>needs only numpy and msgpack"]
@@ -94,14 +94,14 @@ An extension mechanism must keep this true.
 
 ## Extensions
 
-*Status: proposed, except that a device already says which extension it
-belongs to and whether it is simulated (`extension`, `extension_version` and
-`simulated` in `describe()`; see [how a device finds its
-extension](#how-a-device-finds-its-extension)). Manifests, finding extensions
-and starting their UIs are not implemented yet. Today an instrument's project
-puts its driver on the bus with a `bus_server.py` or a `.toml`, and a
-device-specific GUI is a separate program. Examples are the lab's own
-instrument projects, folders beside insthub: `hp_8562a_gpib`,
+*Status: implemented, except entry points. A device says which extension it
+belongs to and whether it is simulated (step 4). Manifests, finding
+extensions, `insthub ext` and `insthub check`, the folders in the servers'
+`.json` files and the New server dialog's list are step 7
+(`insthub/extensions.py`). Starting an extension's UIs (`insthub open`,
+`insthub panel`, `qt.device_window`, the device page's **Open** buttons) is
+step 8. The reference extension (step 9) is still to come. Examples are the
+lab's own instrument projects, folders beside insthub: `hp_8562a_gpib`,
 `windfreak_sythHDprov2`, `m8195a_ripa` and `oscilloscopes`.*
 
 ### What an extension is
@@ -174,11 +174,9 @@ flowchart LR
 
 - The **server half** (driver, device) runs in the server program, as today.
 - The **UI half** (panel, app) runs as a program of its own, started with the
-  extension's Python. The window already starts `insthub view` as a program
-  of its own, though with its own Python and with its output thrown away. It
-  already chooses a project's Python for servers (`inventory.find_python`)
-  and writes their output to a log (`inventory.spawn`). Starting an app
-  combines the two.
+  extension's Python (`extensions.launch`), as the window starts `insthub
+  view` for a live view. Its output goes to a log file, as that of a server
+  the window starts does (`inventory.spawn`).
 - The **window** reads manifests as data and starts programs. It never
   imports an extension's code. A crashing or hanging vendor UI therefore
   cannot take down the window, its tray icon or its probing of other servers.
@@ -192,6 +190,10 @@ the driver. So it can do nothing a script could not do, and it works on any
 computer with `insthub[gui]` and the extension installed.
 
 ### The manifest
+
+*Status: implemented: `extensions.load()` reads one, and the New server
+dialog offers its devices (step 7); `insthub open` and the device page's
+**Open** buttons start its UIs (step 8).*
 
 `insthub-extension.toml` is data. insthub reads it with `tomllib` and never
 runs it, so listing extensions never imports a vendor library. A manifest
@@ -222,18 +224,21 @@ run = ["-m", "hp8562a_insthub.ui", "--address", "{address}", "--name", "{device}
 [ui.quick]                            # a panel: one widget, in a window insthub provides
 title = "Quick look"
 panel = "hp8562a_insthub.ui.panel:make"
+types = ["HP8562A", "SimHP8562A"]     # only for devices of these types (default: every device of it)
 ```
 
 | Table | Used by | What it does |
 |---|---|---|
-| `[devices.NAME]` | the window's **New server** dialog, `insthub ext list`, `insthub check` | a ready-made `[devices.x]` table for a server file. `driver` names a `Device` subclass or a plain driver class to wrap, exactly as in a server's `.toml`. `doc` describes it. Every other key (constructor arguments, `exclude`, `link_errors`, `lazy`, ...) is copied into the server file as it is. The dialog reads the constructor's arguments from the source without importing it, as it already does, and adds `path` and `extension`. The server it creates runs with the extension's Python. |
-| `[ui.NAME]` | the device page's **Open** button, `insthub open DEVICE [NAME]` | with `run`, an app, started as `<python> <run...>`; with `panel`, a panel, put in a window of its own (see [writing the UI half](#writing-the-ui-half)). Offered for every device that belongs to this extension. |
+| `[devices.NAME]` | the window's **New server** dialog, `insthub ext list`, `insthub check` | a ready-made `[devices.x]` table for a server file. `driver` names a `Device` subclass or a plain driver class to wrap, exactly as in a server's `.toml`. `doc` describes it. Every other key (constructor arguments, `exclude`, `link_errors`, `lazy`, ...) is copied into the server file as it is; insthub's own keys among them are checked as in a server file (what `link_errors` names is imported, so it is loaded by `insthub check --import`, in the extension's Python). The dialog reads the constructor's arguments from the source without importing it, as it already does, and adds `path` and `extension`, so a manifest never gives those (nor `extension_version`, see [versions](#versions)). The server it creates runs with the extension's Python. A server runs in one Python, so the dialog says so when the extensions of two of its devices run in different ones (as `insthub check` warns about a server file), and keeps a Python you chose yourself. Typing another driver in place of the one chosen takes away the keys the choice brought, `extension` among them. |
+| `[ui.NAME]` | the device page's **Open** buttons and its tile's menu, `insthub open DEVICE [NAME]` | with `run`, an app, started as `<python> <run...>`; with `panel`, a panel, put in a window of its own (see [writing the UI half](#writing-the-ui-half)). Offered for every device that belongs to this extension, or with `types` only for the devices whose `type` (in `describe()`: the class name, which for a wrapped driver is the driver's) is listed. insthub's own manifest offers its scope panel this way, for its simulated scope only. |
 
 Each module name in a manifest is found with the manifest's folder first on
 the module search path. An app or panel starts with that folder as its
 working directory and on `PYTHONPATH`, so an extension works as a plain
 folder, without being installed. `{device}` and `{address}` in `run` are
-replaced by the device's name and its server's address.
+replaced by the device's name and its server's address; another `{...}` is
+left as it is. Its output goes to `ui/DEVICE-NAME.log` in insthub's runtime
+folder.
 
 A driver class wrapped from a manifest keeps its safety options in its
 table. For example, the Windfreak synthesizer's raw protocol methods must
@@ -250,13 +255,24 @@ Further kinds of table are reserved, but nothing reads them yet: `match` (how
 to recognise the hardware on a scan), `docs` (for people and agents), and
 `implements` (a tag saying a device offers a standard set of commands, so one
 UI can serve two vendors' instruments). A new kind is added only together
-with the code that reads it and a test. A field nothing reads drifts out of
+with the code that reads it and a test (in `extensions.py` it is one entry of
+`_ADDS` and an attribute of `Extension`). A field nothing reads drifts out of
 date, as PyroLab's `detect_devices` did.
+
+A manifest is unusable, and listed with the reason, when something insthub
+reads is wrong: it is not valid TOML, its `api` is too new, its `id` or a
+name is not a valid name, a table lacks what it needs, it has no Python. A
+key or kind of table this insthub does not read is left alone, since a newer
+insthub may read it; `insthub check` warns about it. insthub's own manifest,
+`insthub/insthub-extension.toml`, lists the simulated instruments; its
+version is insthub's, and it runs in any Python that has insthub.
 
 ### How a device finds its extension
 
-*Status: a device saying what it is, below, is implemented (step 4); the
-folders in the server's `.json` file and the window's use of them are not.*
+*Status: implemented: a device saying what it is (step 4); the folders and
+the Python in the server's `.json` file, and `extensions.for_device()`, which
+finds the manifest from them (step 7); `extensions.device_uis()`, which
+`insthub open` and the window use to find a device's UIs (step 8).*
 
 A running device says which extension it belongs to:
 
@@ -292,7 +308,7 @@ commands a device happens to have, as `hp8562a_gui` does today with its
 
 To go from a running device to its folder, each server's `.json` file in
 insthub's runtime folder (see [finding a device by
-name](architecture.md#finding-a-device-by-name)) will list, for each device,
+name](architecture.md#finding-a-device-by-name)) lists, for each device,
 the folder of the file its class comes from (for a `Wrapped` device, the
 driver's too), and the server's Python. The window looks for the nearest
 `insthub-extension.toml` in that folder or a folder above it. This works
@@ -300,7 +316,9 @@ however the server was started: from a `bus_server.py` in another folder,
 from a `.toml` the New server dialog wrote into `~/.config/insthub/servers`,
 or with devices from two extensions in one server. These two facts go only
 into the `.json` file, which only your user account can read. They are never
-sent to other computers.
+sent to other computers. Without `XDG_RUNTIME_DIR` that folder is
+`/tmp/insthub-UID`, a name any account could take first, so insthub refuses
+it unless it belongs to your account and no other may use it.
 
 **Security.** A UI is offered when `describe()["extension"]` equals a
 manifest's `id`, but only a manifest found on *this* computer can cause code
@@ -311,6 +329,10 @@ from another computer.
 
 ### Where insthub looks for extensions
 
+*Status: implemented (step 7, `extensions.discover()` and `for_device()`;
+the hint for a device without its extension here, step 8), except entry
+points (5.).*
+
 For a device on this computer, insthub uses the manifest found from the
 device's own folder, as above. **Open** therefore starts the copy of the
 extension that its server runs, even when you have two copies (a working copy
@@ -318,21 +340,37 @@ and the one a service runs).
 
 Everywhere else (a device on another computer, the New server dialog,
 `insthub ext list`), it looks in this order. The first manifest with a given
-`id` wins, and `insthub ext list` reports the others as hidden by it:
+`id` that can be used wins, and `insthub ext list` reports the others as
+hidden by it. One that cannot be used hides nothing, so a fresh clone without
+its `.venv` yet does not hide the copy a service runs:
 
 1. insthub's own manifest, shipped with it. It lists the simulated
    instruments of `insthub sim` and runs with the Python insthub runs in, so
-   every run of the test suite exercises the mechanism.
-2. folders you add with `insthub ext add PATH` or **Add extension folder** in
-   the window, kept in `~/.config/insthub/extensions.toml`. `insthub ext
-   remove PATH` and a **Remove** button take them out again.
-3. the folders of the installed services' devices: the `path` of each device
-   in their server files.
-4. the folders of the servers running on this computer, as above.
+   every run of the test suite exercises the mechanism. Another copy of
+   insthub has the same manifest: in a lab, the window runs from its own `uv
+   tool` environment while the projects' servers run the checkout beside
+   them (`-e ../insthub`). insthub knows such a copy by where its manifest is
+   (in a package `insthub`, next to its `_version.py`) and counts it as its
+   own: it is listed once, and a simulated device of such a server gets the
+   extension of the insthub that asks, whose code runs here.
+2. folders you add with `insthub ext add PATH` or **Add folder...** on the
+   window's Settings page, kept in `~/.config/insthub/extensions.toml`.
+   `insthub ext remove PATH` and a **Remove** button take them out again.
+3. the folders of the installed services' code: for a server file, each
+   device's `path`, or the folder the server runs in for a device whose
+   module is there (`insthub check lab.toml` looks in the same folders); for
+   a `.py` server, its folder.
+4. the folders of the devices of the servers running on this computer, as
+   above.
 5. later, installed packages that declare an `insthub.extensions` *entry
    point* (a name a package registers in its `pyproject.toml`, which other
    programs can look up without importing the package). This is for when
    extensions are pip-installed into shared environments.
+
+Setting `INSTHUB_EXTENSIONS` to folders (separated by `:`, or `;` on
+Windows) replaces 2 to 4 with them, and `none` leaves only insthub's own: for
+trying an extension without adding it, and for the tests, which never see
+this computer's extensions.
 
 `insthub serve` never looks for extensions. A server is built from its own
 file, so a service does not depend on what one user has listed.
@@ -340,18 +378,26 @@ file, so a service does not depend on what one user has listed.
 **A device on another computer** gets its UI from a copy of the same
 extension on this computer, run with that copy's Python. If there is none,
 its page stays generic and says "extension hp8562a is not installed on this
-computer: `insthub ext add FOLDER`".
+computer: `insthub ext add FOLDER`", and so does `insthub open`. A device on
+this computer whose folders lead to no manifest of its extension gets the
+same.
 
 ### Installing, updating and broken extensions
 
 insthub installs nothing. An extension is a folder: clone it, make its
 environment (for a packaged one, `uv sync --extra gui`), then `insthub ext
 add` it. Updating is `git pull`; the window then says which servers run older
-code and need a restart. A manifest that cannot be used (it is not valid
-TOML, its `api` is too new, its `id` is not a valid name, its Python or its
-folder is missing) is listed with its error by `insthub ext list` and in the
-window. It never hides the other extensions, and `insthub check FOLDER` says
-what to do about it.
+code and need a restart (proposed). A manifest that cannot be used (it is not
+valid TOML, its `api` is too new, its `id` is not a valid name, its Python or
+its folder is missing) is listed with its error by `insthub ext list` and on
+the window's Settings page. It never hides the other extensions, and `insthub
+check FOLDER` says what to do about it. `insthub check FOLDER --import` also
+imports each of its drivers, and the exception classes their `link_errors`
+name, in the extension's Python, in a program of its own that needs nothing
+but the standard library there, and reports those that fail and those that
+load Qt. For a server file, `insthub check lab.toml
+--import` makes the check `insthub service install` makes, in the Python of
+its devices' extensions.
 
 ### When code is loaded
 
@@ -359,7 +405,7 @@ what to do about it.
 |---|---|---|
 | the manifest | the window, `insthub ext`, `insthub check` | to list extensions; it is data, nothing runs |
 | the driver and device | the server that hosts the device | when the server builds it (`config.load_object`, as today) |
-| the app or panel | the program started for it, with the extension's Python | when someone clicks **Open** |
+| the app or panel | the program started for it, with the extension's Python | when someone clicks **Open** or runs `insthub open` |
 | `insthub.extensions` itself | the window and the command line | never by `import insthub` |
 
 Unlike VS Code, insthub has no list of events that wake an extension up, and
@@ -367,6 +413,11 @@ no long-running program that hosts extensions. "Activating" an extension just
 means importing it in the program that needs it.
 
 ### Writing the UI half
+
+*Status: implemented (step 8): `qt.device_window`, `insthub panel`, `insthub
+open`, and insthub's own panel for its simulated scope, `insthub/sim_ui.py`,
+which is the example to copy. [Writing a panel](guide.md#writing-a-panel)
+in the guide is the how-to.*
 
 A panel is one function:
 
@@ -377,19 +428,21 @@ def make(device, parent=None) -> QWidget:
 
 `device` is an ordinary proxy, the same thing `insthub.device(name)` returns.
 The panel uses `qt.watch` for streams and `qt.deliver` for results, so it
-never blocks the GUI thread. It stops its watchers when its widget closes. It
-talks only through commands, properties and streams, so everything it does can
-also be done from a script or by an agent. qudi has the same rule: a GUI adds
+never blocks the GUI thread. It stops its watchers in its widget's
+`closeEvent`, which the window around it sends when it closes. It talks only
+through commands, properties and streams, so everything it does can also be
+done from a script or by an agent. qudi has the same rule: a GUI adds
 nothing that the logic's API cannot do.
 
 The same panel can run in two places without change:
 
-- in a window of its own. The window runs `python -m insthub -a ADDRESS panel
-  DEVICE MODULE:FUNCTION` with the extension's Python, where the `insthub`
-  command itself may not be installed. A small `qt.device_window` helper
-  builds the window around the panel. It imports the panel's module before
-  `insthub.qt`, so the panel's own Qt binding (PyQt6, PySide6, ...) is the one
-  used. This is the default.
+- in a window of its own. The window (or `insthub open`) runs `python -m
+  insthub -a ADDRESS panel DEVICE MODULE:FUNCTION --title TITLE` with the
+  extension's Python, where the `insthub` command itself may not be
+  installed. That imports the panel's module before `insthub.qt`, so the
+  panel's own Qt binding (PyQt6, PySide6, ...) is the one used, and then a
+  small helper, `qt.device_window`, builds the window around the panel. This
+  is the default.
 - inside an app that hosts its own server in the same process, where frames
   arrive without being copied (as in `examples/04_server_with_gui.py`).
 
@@ -401,14 +454,19 @@ takes the device's address and name, and when it is given an address it only
 attaches to that device. Otherwise a name that does not resolve at that
 moment could make it start a second server for the same instrument.
 
-The window writes an app's output to a log file in insthub's runtime folder.
-If the app exits within a few seconds, the window shows the log's last lines,
-for example "No module named PyQt6: install the extension's gui extra into
-this Python".
+The window writes the output of an app or a panel to a log file in insthub's
+runtime folder, as it does for the live view and the servers it starts. If
+one ends with an error, at once or later, the window shows the log's last
+lines, for example "cannot load the panel 'x:make': No module named 'PyQt6'
+(this is .../python; does it have the libraries of the extension's UI, such
+as its gui extra?)". `insthub open` waits three seconds and prints them if it
+ended with an error by then.
 
 The launched program runs the extension's own insthub, which may be older
-than the window's. If that insthub has no `panel` command yet, the log says
-which version is needed.
+than the window's. If that insthub has no `panel` command yet, the log ends
+with argparse's `invalid choice: 'panel'`: insthub needs an update in that
+environment. (insthub's version has not changed since `panel` arrived, so
+there is no version number to name.)
 
 ### Rules inside an extension
 
@@ -422,7 +480,7 @@ which version is needed.
    own modules.** A server often runs as a background service with no screen,
    so it must not need Qt. `insthub service install` already warns when a
    driver of the server's `.toml` loads Qt, and `insthub check PATH
-   --import` will warn when importing the device does. Vendor exception classes for `link_errors` come
+   --import` warns when importing the device does. Vendor exception classes for `link_errors` come
    through the driver (for example a `LINK_ERRORS` tuple defined in the
    driver module), or as `"module:Class"` strings in the `.toml`. A `Wrapped` subclass that a
    manifest or `.toml` names defines its own `__init__(self, name=None,
@@ -464,7 +522,7 @@ which version is needed.
 | What | How |
 |---|---|
 | the manifest's format | `api = 1`. insthub refuses a manifest with a higher number and accepts lower ones until one is deliberately dropped. |
-| the extension's code | `version` in the manifest, `extension_version` on the device. When the device states one, the window can say "running 0.3, the folder has 0.4: restart", as LabRAD's node does. The New server dialog never writes `extension_version` into a `.toml`, because it would freeze there, and `insthub check` warns when a class's `extension_version` differs from its manifest's `version`. |
+| the extension's code | `version` in the manifest, `extension_version` on the device. When the device states one, the window can say "running 0.3, the folder has 0.4: restart", as LabRAD's node does. The New server dialog never writes `extension_version` into a `.toml`, because it would freeze there, and `insthub check` warns when a class's `extension_version` (read from its source, without running it) differs from its manifest's `version`. |
 | the bus between two programs | Every connection starts with the bytes `INSTHUB1`, so a program that speaks another protocol is refused. The server's first message about itself, the *hello*, carries `protocol`, insthub's `version` and a list of `features` (`server.FEATURES`, today `["dangerous", "meta", "pause"]`), so that a client can ask (`client.supports("pause")`) before it relies on something newer. Both sides skip kinds of message they do not know instead of closing the connection. Together these let a feature arrive without everyone upgrading at once. |
 | `describe()` | Keys are only ever added, and they are optional, so older programs ignore them. |
 
@@ -566,8 +624,8 @@ What `import insthub` may load:
 
 What it must not load: Qt in any binding, pyqtgraph, matplotlib,
 `importlib.metadata`, `asyncio`, or any of insthub's optional modules
-(`config`, `extensions`, `qt`, `viewer`, `manager`, `pages`, `forms`,
-`widgets`, `inventory`, `render`, `mcp`, `sim`, `bench`, `service`,
+(`config`, `extensions`, `qt`, `viewer`, `sim_ui`, `manager`, `pages`,
+`forms`, `widgets`, `inventory`, `render`, `mcp`, `sim`, `bench`, `service`,
 `launcher`, `cli`, `tomlfile`). It must not write a file or open a connection
 either.
 
@@ -622,8 +680,8 @@ so they are built on guard rails.
 | 4 | **Done.** Devices say what they are: `extension`, `extension_version`, `simulated` (a SIM badge on the tile and the device page, in `insthub info`, and in `list_devices` for agents), as `Device` attributes, `wrap()` options and config keys | `device.py`, `config.py`, window, `mcp.py` | small |
 | 5 | **Done.** Metadata for properties and command parameters (`META_KEYS`, `set_meta`, choices from `Literal` and `Enum`), accessor pairs, polling from the config; the names that a wrapped driver's `meta`, `poll` and `dangerous` use are checked with the file (so by `insthub service install`); the device page's controls follow the metadata, and `insthub info` shows it | `device.py`, `config.py`, `pages.py`, `mcp.py` | small to medium |
 | 6 | **Done.** Dangerous commands: `@command(dangerous=True)`, also for a whole wrapped driver at once. The MCP tools refuse them, including through `$set`, and a seventh tool, `call_dangerous`, runs them, so an agent can be allowed everything else without asking. The window asks before running one. A config file can only add marks, and an accessor pair is marked as a whole. | `device.py`, `mcp.py`, `pages.py` | small |
-| 7 | Extension manifests: `insthub/extensions.py` (standard library only); `insthub ext list`, `add` and `remove`; `insthub check PATH [--import]`; insthub's own manifest for its simulators; each device's folder and the server's Python in the server's `.json` file (not in the hello); the New server dialog offers the manifests' devices and runs them with the extension's Python | new module, `cli.py`, `server.py`, `forms.py` | medium |
-| 8 | Starting UIs: `insthub open`, `insthub panel`, `qt.device_window`, the **Open** button, and launched programs writing to log files (the live view's output is thrown away today) | `cli.py`, `qt.py`, `manager.py`, `inventory.py` | medium |
+| 7 | **Done.** Extension manifests: `insthub/extensions.py` (no Qt, never imported by `import insthub`); `insthub ext list`, `add` and `remove`, and the same on the window's Settings page, with what is wrong with each; `insthub check PATH [--import]` (with `--import`, a manifest's drivers are imported in the extension's Python, and a server file gets the check of `insthub service install`); insthub's own manifest for its simulators; each device's folders and the server's Python in the server's `.json` file (not in the hello); the New server dialog offers the manifests' devices, fills in their keys and runs them with the extension's Python | new module, `cli.py`, `server.py`, `forms.py` | medium |
+| 8 | **Done.** Starting UIs: `extensions.launch` (an app or a panel, in the extension's folder and Python) and `device_uis` (a device's UIs, from its own folders when its server runs here, or why there are none); `insthub open`, `insthub panel`, `qt.device_window`; the device page's **Open** buttons and its tile's menu, and the hint for an extension not installed here; `types` in a `[ui.NAME]` table; insthub's own scope panel (`sim_ui.py`); everything the window starts (servers, live views, UIs) writes a log file through one helper (`inventory.spawn`), and the window shows its last lines when one ends with an error; a stop asked before a Qt program's event loop runs is no longer lost | `extensions.py`, `cli.py`, `qt.py`, `manager.py`, `pages.py`, `inventory.py` | medium |
 | 9 | The reference extension: a skeleton in `examples/extension/`, and `hp_8562a_gpib` converted | `examples/`, the project | medium |
 | 10 | Operations: a server keeps its last log lines, and `insthub logs SERVER` shows them from any computer; `service install` waits until the server answers, and shows the journal if it does not; a limit on restart loops; `insthub.states()` collects every device's state for saving next to a data file; remote addresses in one place for `locate`, `list`, the window and MCP; a public `insthub.connect(address, timeout=...)` | `server.py`, `service.py`, `client.py`, `registry.py` | small each |
 | 11 | Qt helpers for panels: `qt.coalesce` (one request in flight, later values merged into it), and the device page's settings as a widget a panel can embed | `qt.py`, `pages.py` | medium |
@@ -699,9 +757,11 @@ pulse sequencer.
 1. **Packaged extensions**: should the manifest stay a file of its own
    (shipped inside the package), or become a `[tool.insthub]` table in
    `pyproject.toml`? The separate file works for folders today.
-2. **One id per extension, or per kind of device?** An extension with two
-   devices that need different UIs could use `"hp8562a/analyzer"`. Until one
-   needs it, an instrument family that needs two ids gets two manifests.
+2. **One id per extension, or per kind of device?** A UI can already say
+   which types of device it is for (`types`, as insthub's own scope panel
+   does), so one manifest serves devices that need different UIs. An id per
+   kind of device (`"hp8562a/analyzer"`) would be needed only where the type
+   cannot tell them apart.
 3. **Panels inside the window**: when an extension's UI half is installed in
    the window's own environment, should its panel be offered as a tab? Only
    as an opt-in, built inside `try`/`except` so the generic tabs keep working

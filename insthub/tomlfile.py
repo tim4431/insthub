@@ -314,6 +314,14 @@ def _remove_section(statements: list[_Statement], start: int, end: int) -> None:
             del statements[-1]
 
 
+def _parsed(statements: list[_Statement]):
+    """What the statements say now (None if they do not parse)."""
+    try:
+        return tomllib.loads("\n".join(line for s in statements for line in s.lines))
+    except tomllib.TOMLDecodeError:
+        return None
+
+
 def _lookup(doc: dict, path: tuple):
     for p in path:
         if not isinstance(doc, dict) or p not in doc:
@@ -446,7 +454,7 @@ def edit(text: str, changes: dict, renames: dict | None = None) -> str:
             if found is None and not subs:
                 if any(p != path and path[:len(p)] == p and changes[p] is None for p in changes):
                     continue  # removed with a table it is in
-                if path and was(path) is not None:
+                if path and was(path) is not None and _lookup(_parsed(statements), path) is not None:
                     raise ValueError(f"[{'.'.join(path)}] is not written as a table of its own; edit it by hand")
                 continue
             for start in sorted(subs + ([found[0]] if found else []), reverse=True):
@@ -554,20 +562,29 @@ def write(path: str | Path, text: str) -> None:
 
 
 def _target(path: Path) -> Path:
-    """The file a path names, through symbolic links, but only links of this user's or root's (as
-    the kernel's protected_symlinks has it for shared sticky folders): one somebody else put in a
-    shared folder would have this user overwrite a file of their choosing (PermissionError)."""
-    seen = 0
-    while path.is_symlink():
-        owner = os.lstat(path).st_uid
-        if hasattr(os, "geteuid") and owner not in (os.geteuid(), 0):
+    """The file a path names, as a physical path, through symbolic links, but only through links
+    that this user, root or the owner of the folder they are in made (the rule of the kernel's
+    protected_symlinks for shared sticky folders): one that somebody else put in a shared folder
+    would have this user overwrite a file of their choosing (PermissionError)."""
+    def trusted(link: Path) -> bool:
+        if not hasattr(os, "geteuid"):  # (Windows)
+            return True
+        owner = os.lstat(link).st_uid
+        return owner in (os.geteuid(), 0) or owner == os.stat(link.parent).st_uid
+
+    path = path if path.is_absolute() else Path.cwd() / path  # (not normalized: "x/.." is physical)
+    for folder in reversed(path.parents):  # the folders on the way, top down
+        if folder.is_symlink() and not trusted(folder):
+            raise PermissionError(errno.EACCES, f"{folder} is a symbolic link made by another user; not followed",
+                                  str(path))
+    for _ in range(40):
+        if not path.is_symlink():
+            return Path(os.path.realpath(path.parent)) / path.name  # (physical: "x/.." as the kernel reads it)
+        if not trusted(path):
             raise PermissionError(errno.EACCES, "it is a symbolic link made by another user; not followed",
                                   str(path))
-        seen += 1
-        if seen > 40:
-            raise OSError(errno.ELOOP, "too many levels of symbolic links", str(path))
-        path = (path.parent / os.readlink(path)).absolute()
-    return path
+        path = Path(os.path.realpath(path.parent)) / os.readlink(path)
+    raise OSError(errno.ELOOP, "too many levels of symbolic links", str(path))
 
 
 def _umask() -> int:

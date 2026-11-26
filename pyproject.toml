@@ -31,7 +31,7 @@ include = ["insthub*"]
 version = { attr = "insthub._version.__version__" }   # read from the file, without importing insthub
 
 [tool.setuptools.package-data]
-insthub = ["insthub.svg"]   # the icon of `insthub gui`
+insthub = ["insthub.svg", "insthub-extension.toml"]   # the icon of `insthub gui`; insthub's own extension
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -182,7 +182,8 @@ def test_every_option_is_a_reserved_key():
     assert wrap_options <= set(config._RESERVED)
     device_options = {name for name, value in vars(insthub.Device).items()
                       if not name.startswith("_") and not callable(value) and not isinstance(value, property)}
-    not_keys = {"name": "the table's own name", "open_on_start": "set by lazy", "streams": "declared by the class"}
+    not_keys = {"name": "the table's own name", "open_on_start": "set by lazy", "streams": "declared by the class",
+                "address": "taken from the constructor's arguments (and many drivers take an `address`)"}
     assert device_options - set(config._RESERVED) == set(not_keys)
 
 
@@ -406,3 +407,20 @@ def test_what_is_wrong_with_those_keys(tmp_path, imports):
     config.check(tmp_path / "lab.toml")
     assert problems(config.load, devices) == ["[devices.synth] synth: poll names 'temprature'",
                                               "[devices.scope] scope.identify() -> str has no parameter 'x'"]
+
+
+def test_a_description_and_where_the_instrument_is(tmp_path, imports):
+    module(tmp_path, "psudrv")
+    module(tmp_path, "devdrv", "import insthub\nclass Meter(insthub.Device):\n"
+                               "    def __init__(self, resource, name=None):\n        super().__init__(name)\n")
+    cfg = tmp_path / "lab.toml"
+    cfg.write_text(f'[devices.psu]\ndriver = "psudrv:PowerSupply"\npath = "{tmp_path}"\nport = "/dev/ttyUSB0"\n'
+                   'description = "the one on the optics table"\n\n'
+                   f'[devices.meter]\ndriver = "devdrv:Meter"\npath = "{tmp_path}"\nresource = "GPIB0::22::INSTR"\n')
+    _, devices = config.load(cfg)
+    psu, meter = (d._rt.describe() for d in devices)
+    assert psu["description"] == "the one on the optics table" and psu["address"] == "/dev/ttyUSB0"
+    assert meter["address"] == "GPIB0::22::INSTR" and "description" not in meter    # a Device subclass too
+    cfg.write_text(f'[devices.psu]\ndriver = "psudrv:PowerSupply"\npath = "{tmp_path}"\nport = 1\ndescription = 5\n')
+    with pytest.raises(ValueError, match="description"):
+        config.load(cfg)

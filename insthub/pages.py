@@ -5,7 +5,8 @@ a server: anything it asks for goes through the window's workers.
     Sidebar        the way to each page; how many servers and devices, what is broken
     DevicesPage    a tile per device, in a section per server, with a search
     DevicePage     a device: its connection, its properties (to read and change), streams,
-                   periodic tasks, state and commands (to run); Pause and Resume
+                   periodic tasks, state and commands (to run); Pause and Resume; an Open
+                   button for each UI of its extension
     ServersPage    a card per server
     ServerPage     a server: its process, addresses, service (and whether it starts at
                    login), devices and clients
@@ -28,9 +29,10 @@ import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import __version__, cli, launcher, registry, service, tomlfile
+from . import __version__, cli, extensions, launcher, registry, service, tomlfile
 from . import widgets as ui
 from .client import meta_text
+from .device import busy_with
 from .errors import BusError
 from .inventory import (
     BAD,
@@ -137,14 +139,17 @@ def _caption(s: Server, name: str, d: dict, preview: ui.Preview | None) -> str:
     return " · ".join(parts[:3])
 
 
-def device_view(s: Server, name: str, previews: bool = True) -> ui.TileView:
-    """What a device's tile shows: a preview of its stream if there is one (and `previews`),
-    else the figures of its state; why, if it is broken."""
+def device_view(s: Server, name: str, previews: bool = True, server_shown: bool = True) -> ui.TileView:
+    """What a device's tile shows: its kind and where it is (its address; its server, unless
+    `server_shown` is False, on the server's own page), a preview of its stream if there is one
+    (and `previews`), else the figures of its state, else what it is; why, if it is broken."""
     d = s.device(name)
     status, word, sentence = device_state(d, s.origin == "local")
     kind = d["type"] if d else ""
-    view = ui.TileView(title=name, subtitle=" · ".join(x for x in (kind, s.name) if x), icon=_device_icon(name, kind),
-                       status=status, word=word, tip=f"{name}: {sentence}")
+    where = (kind, d.get("address") if d else None, s.name if server_shown else None)
+    about = (d.get("description") or d.get("doc") or "") if d else ""
+    view = ui.TileView(title=name, subtitle=" · ".join(x for x in where if x), icon=_device_icon(name, kind),
+                       status=status, word=word, tip=f"{name}: {sentence}" + (f"\n{about}" if about else ""))
     if d is not None and d.get("simulated"):
         view.badge, view.tip = "SIM", f"{view.tip}\n{SIM_TIP}"
     if d is None:
@@ -165,9 +170,10 @@ def device_view(s: Server, name: str, previews: bool = True) -> ui.TileView:
         view.preview, view.stale = preview, preview.age() > STALE
     else:
         view.figures = _figures(s.probe["states"].get(name) or {})
-        if not view.figures:
-            view.message = d["doc"] or (f"{d['type']}: {_count(len(d['commands']), 'command')}, "
-                                        f"{_count(len(d['properties']), 'property', 'properties')}.")
+        if not view.figures:  # what this one is (its description), else what its kind is (its docstring)
+            view.message = d.get("description") or d["doc"] or (
+                f"{d['type']}: {_count(len(d['commands']), 'command')}, "
+                f"{_count(len(d['properties']), 'property', 'properties')}.")
     view.caption = _caption(s, name, d, preview)
     return view
 
@@ -370,8 +376,8 @@ class _Page(QtWidgets.QWidget):
             outer.addLayout(self.body, 1)
 
 
-def _sync_tiles(window: Manager, grid: ui.GridFlow, tiles: dict, s: Server, names: list[str]) -> None:
-    """Keep one tile per device in `tiles` (name -> Tile), in the order of `names`."""
+def _sync_tiles(window: Manager, grid: ui.GridFlow, tiles: dict, s: Server, names: list[str], after=()) -> None:
+    """Keep one tile per device in `tiles` (name -> Tile), in the order of `names` (then `after`)."""
     for name in [n for n in tiles if n not in names]:
         tile = tiles.pop(name)
         grid.removeWidget(tile)
@@ -381,7 +387,7 @@ def _sync_tiles(window: Manager, grid: ui.GridFlow, tiles: dict, s: Server, name
             tile = tiles[name] = ui.Tile(parent=grid.parentWidget())
             tile.clicked.connect(lambda key=s.key, name=name: window.open_device(key, name))
             tile.menu_requested.connect(lambda pos, key=s.key, name=name: window.device_menu(key, name, pos))
-    grid.set_order([tiles[n] for n in names])
+    grid.set_order([*(tiles[n] for n in names), *after])
 
 
 def _where(s: Server) -> str:
@@ -434,7 +440,8 @@ class _Section(QtWidgets.QWidget):
             tile = self.tiles[name]
             tile.set_view(device_view(s, name, previews))
             d = s.device(name)
-            match = not query or query in f"{name} {d['type'] if d else ''} {s.name}".lower()
+            found = f"{name} {d['type']} {d.get('address') or ''} {d.get('description') or ''}" if d else name
+            match = not query or query in f"{found} {s.name}".lower()
             tile.setVisible(match)
             shown += match
         self.grid_host.setVisible(shown > 0)
@@ -601,6 +608,9 @@ class ServerPage(_Page):
         self.more = ui.button("", "more", kind="ghost", tip="More")
         self.more.setFixedWidth(38)
         menu = QtWidgets.QMenu(self.more)
+        self.add_device = menu.addAction(ui.icon("plus"), "Add a device...")
+        self.add_device.setToolTip("Another instrument in this server: written into its config, then it restarts")
+        self.add_device.triggered.connect(lambda *_: window.edit_config(self.server.key, add=True))
         self.edit_file = menu.addAction(ui.icon("edit"), "Edit its config...")
         self.edit_file.setToolTip("Change its devices and their settings here; the file's comments are kept")
         self.edit_file.triggered.connect(lambda *_: window.edit_config(self.server.key))
@@ -636,6 +646,8 @@ class ServerPage(_Page):
         self.grid_host = QtWidgets.QWidget()
         self.grid = ui.GridFlow(self.grid_host)
         self.tiles: dict[str, ui.Tile] = {}
+        self.add_tile = ui.AddTile("Add a device", parent=self.grid_host)  # (last in the grid: see show_server)
+        self.add_tile.clicked.connect(lambda: window.edit_config(self.server.key, add=True))
         self.clients_title = ui.label("Connected programs", "h2")
         self.clients = _table("Program", "Process", "Connected since", "Watching")
         self.clients_box = _boxed(self.clients)
@@ -652,6 +664,10 @@ class ServerPage(_Page):
 
     def _restart(self) -> None:
         self.window.restart_server(self.server, ask=True)  # (a service too: one restart at a time)
+
+    def _restartable(self, s: Server) -> bool:
+        """Whether saving its config can restart it (a service, or a server this window started)."""
+        return bool(s.service) or (s.origin == "local" and self.window.started_here(s.pid))
 
     def show_server(self, s: Server) -> None:
         self.server = s
@@ -728,19 +744,25 @@ class ServerPage(_Page):
         self.logs.setVisible(bool(u) or (running and server_log(s.name).is_file()))
         self.open_file.setVisible(config is not None)
         self.edit_file.setVisible(editable)
+        self.add_device.setVisible(editable)
         if editable:
             self.edit_file.setText(f"Edit {config.name}...")
+            self.add_tile.set_detail(f"to {config.name}, then {'restart it' if self._restartable(s) else 'save'}")
+            self.add_tile.setToolTip(f"Another instrument in this server: written into {config}"
+                                     + ("; the server is then restarted to use it" if self._restartable(s) else
+                                        "; restart the server where you started it to use it"))
         self.remove.setVisible(bool(u))
         self.forget.setVisible(s.origin == "remote")
         self.more.setVisible(config is not None or bool(u) or s.origin == "remote")
 
         names = s.device_names()
-        _sync_tiles(self.window, self.grid, self.tiles, s, names)
+        _sync_tiles(self.window, self.grid, self.tiles, s, names, after=[self.add_tile])
         for name in names:
-            self.tiles[name].set_view(device_view(s, name, self.window.previews_on))
+            self.tiles[name].set_view(device_view(s, name, self.window.previews_on, server_shown=False))
             self.tiles[name].show()
-        self.devices_title.setVisible(bool(names))
-        self.grid_host.setVisible(bool(names))
+        self.add_tile.setVisible(editable)
+        self.devices_title.setVisible(bool(names) or editable)
+        self.grid_host.setVisible(bool(names) or editable)
         clients = (s.probe["clients"] if s.probe else None) or []
         _fill(self.clients, [[c["program"], f"pid {c['pid']}" if c.get("pid") else (c.get("peer") or ""),
                               clock(c["since"]) if c.get("since") else "",
@@ -1147,8 +1169,13 @@ class DevicePage(_Page):
         self.edit_file.triggered.connect(lambda *_: window.edit_config(self.server.key, self.name))
         menu.addAction(ui.icon("copy"), "Copy its name").triggered.connect(lambda *_: window.copy(self.name))
         self.more.setMenu(menu)
-        for button in (self.connect_now, self.release, self.pause, self.live, self.more):
+        self.ui_buttons = QtWidgets.QHBoxLayout()  # Open <title>: one per UI of its extension (see _show_uis)
+        self.ui_buttons.setSpacing(8)
+        self._uis_shown: tuple | None = None
+        for button in (self.connect_now, self.release, self.pause, self.live):
             self.header.actions.addWidget(button)
+        self.header.actions.addLayout(self.ui_buttons)
+        self.header.actions.addWidget(self.more)
 
         self.facts = _Facts()
         self.instrument = self.facts.row("Instrument")
@@ -1201,6 +1228,27 @@ class DevicePage(_Page):
         paused = bool(d and d["status"].get("paused"))
         self.window.device_action(self.server, self.name, "$resume" if paused else "$pause")
 
+    def _show_uis(self, s: Server, name: str) -> str | None:
+        """An Open button for each UI of the device's extension (found on a worker: none until then);
+        returns why it has none, when that is not up to its extension (it is not installed here)."""
+        ext, uis, why = self.window.device_uis(s, name) or (None, [], None)
+        if (s.key, name, ext, uis) != self._uis_shown:
+            self._uis_shown = (s.key, name, ext, uis)
+            while self.ui_buttons.count():
+                button = self.ui_buttons.takeAt(0).widget()
+                button.hide()  # (at once: deleteLater waits for the event loop)
+                button.deleteLater()
+            for u in uis:
+                self.ui_buttons.addWidget(ui.button(
+                    f"Open {u.title}", "window", slot=lambda u=u: self.window.open_ui(self.server, self.name, ext, u)))
+        can, why_not = self.window.can_open(s)
+        for i in range(self.ui_buttons.count()):
+            button, u = self.ui_buttons.itemAt(i).widget(), uis[i]
+            button.setEnabled(can)
+            button.setToolTip(why_not or f"{ext.title}'s {'panel' if u.panel else 'app'} for it, in a window of its "
+                                         f"own (run with {ext.python})")
+        return why
+
     def show_device(self, s: Server, name: str) -> None:
         changed = (s, name) != (self.server, self.name)
         self.server, self.name = s, name
@@ -1210,9 +1258,9 @@ class DevicePage(_Page):
         h.title.setText(name)
         h.pill.set(status, word)
         h.pill.show()
-        doc = f" · {_esc(d['doc'])}" if d and d.get("doc") else ""
         what = _esc(d["type"]) if d else ("device listed in devices.toml" if s.origin == "remote" else "device")
-        h.subtitle.setText(what + doc)
+        about = [x for x in ((d.get("address"), d.get("description") or d.get("doc")) if d else ()) if x]
+        h.subtitle.setText(" · ".join([what, *(_esc(x) for x in about)]))
         f = self.facts
         config = server_file(s)
         editable = config is not None and config.suffix == ".toml"
@@ -1223,7 +1271,10 @@ class DevicePage(_Page):
             st = d["status"]
             if st["busy"]:
                 waiting = f", {st['queued']} more waiting" if st["queued"] else ""
-                activity = f"running <code>{_esc(st['busy'])}</code>{waiting}"
+                running = _esc(busy_with(st)) if st["busy"].startswith("$") else f"<code>{_esc(st['busy'])}</code>"
+                activity = f"busy with {running}{waiting}" if st["busy"].startswith("$") else f"running {running}{waiting}"
+            elif st.get("opening"):
+                activity = "opening the instrument session"
             else:
                 activity = "idle"
             f.show_row(self.activity, activity)
@@ -1234,8 +1285,9 @@ class DevicePage(_Page):
         how = route(s.address, s.origin) if s.address else ""
         pid = f" (pid {s.pid})" if s.origin == "local" and s.pid else ""
         f.show_row(self.via, f"{_esc(s.name)}{pid} · {ui.muted(how)}")
+        why = self._show_uis(s, name)
         f.show_row(self.extension, _esc(f"{d['extension']} {d.get('extension_version') or ''}".rstrip())
-                   if d and d.get("extension") else None)
+                   + (f"<br>{ui.muted(_esc(why))}" if why else "") if d and d.get("extension") else None)
         h.badge.setVisible(bool(d and d.get("simulated")))
         watching = {}
         reported = bool(s.probe) and s.probe["clients"] is not None
@@ -1506,13 +1558,24 @@ class SettingsPage(_Page):
             self.paths[key] = row.hint
             box3.addWidget(row)
 
+        exts, box5 = ui.card()
+        box5.addWidget(ui.label("Extensions", "h2"))
+        box5.addWidget(ui.label("Folders that add drivers, and windows, for their instruments; each has an "
+                                "<code>insthub-extension.toml</code>. New server offers their devices.", "small",
+                                wrap=True))
+        self.ext_rows = QtWidgets.QVBoxLayout()  # one per extension (see _show_extensions)
+        self.ext_rows.setSpacing(0)
+        box5.addLayout(self.ext_rows)
+        box5.addWidget(ui.button("Add folder...", "plus", tip="Add an extension's folder to your list (the same as "
+                                 "insthub ext add FOLDER)", slot=self._add_extension), 0, Qt.AlignmentFlag.AlignLeft)
+
         about, box4 = ui.card()
         box4.addWidget(ui.label("About", "h2"))
         version = QtCore.qVersion()
         box4.addWidget(ui.label(f"insthub {__version__} · Python {sys.version.split()[0]} "
                                 f"(<code>{_esc(sys.executable)}</code>) · {BINDING} on Qt {version}", "small",
                                 wrap=True, select=True))
-        for widget in (look, tray, files, about):
+        for widget in (look, tray, files, exts, about):
             self.body.addWidget(widget)
         self.body.addStretch(1)
 
@@ -1542,6 +1605,52 @@ class SettingsPage(_Page):
     def _uninstall(self) -> None:
         self.window.act("Removing the launcher", launcher.uninstall, "launcher removed", after=self.sync)
 
+    def _find_extensions(self) -> None:
+        self.window.submit(self.window.actions, extensions.discover, self._show_extensions)  # (it asks systemd)
+
+    def _show_extensions(self, found: list) -> None:
+        """A row per extension: what it is, where it was found, and what is wrong with it."""
+        while self.ext_rows.count():
+            row = self.ext_rows.takeAt(0).widget()
+            row.hide()  # (at once: deleteLater waits for the event loop)
+            row.deleteLater()
+        for ext in found:
+            kind, _, name = ext.source.partition(":")
+            where = {"insthub": "comes with insthub", "added": "in your list", "service": f"used by the service {name}",
+                     "server": f"used by the server {name}, running here"}.get(kind, ext.source)
+            detail = " · ".join(_esc(x) for x in (ext.id, ext.version, where) if x) + \
+                f"<br><code>{_esc(ext.folder)}</code>"
+            if ext.error:
+                detail += "<br>" + _badge(BAD, ext.error)
+            elif ext.hidden_by:
+                detail += f"<br>Not used: the one in <code>{_esc(Path(ext.hidden_by).parent)}</code> has its id"
+            remove = [ui.button("Remove", "trash", tip="Take it off your list (the folder stays as it is)",
+                                slot=lambda folder=ext.folder: self._remove_extension(folder))] \
+                if ext.source == "added" else []
+            self.ext_rows.addWidget(_setting(ext.title or ext.folder.name, detail, *remove))
+
+    def _add_extension(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "An extension's folder", str(Path.home()))
+        if not path:
+            return
+        try:
+            ext = extensions.add_folder(path)
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "Add an extension", str(e))
+            return
+        self.window.say(f"Added {ext.title or ext.folder}" + (f"; it cannot be used yet: {ext.error}" if ext.error
+                                                              else ""), 8000)
+        self._find_extensions()
+
+    def _remove_extension(self, folder: Path) -> None:
+        try:
+            removed = extensions.remove_folder(folder)
+        except ValueError as e:
+            self.window.say(str(e), 8000)
+            return
+        self.window.say(f"Took {', '.join(removed)} off your extensions")
+        self._find_extensions()
+
     def sync(self) -> None:
         settings = self.window.settings
         blocked = self.theme.blockSignals(True)
@@ -1556,6 +1665,7 @@ class SettingsPage(_Page):
         for key, path in self._locations().items():
             self.paths[key].setText(f"<code>{_esc(path)}</code>")
             self.paths[key].show()
+        self._find_extensions()
 
 
 # ---------------------------------------------------------------- the frame of the window

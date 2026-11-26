@@ -1,9 +1,11 @@
 """Finding servers by name, without a broker.
 
 Every running server writes `<runtime dir>/<server>.json` (its pid, addresses
-and device names) and listens on `<runtime dir>/<server>.sock`.  A client looks
-a device up by scanning those files.  The directory is private to the user
-(mode 0700), which is also what protects the Unix sockets.
+and device names; also its Python and the folders of its devices' code, which
+only programs on this computer need, so they are never sent over the network)
+and listens on `<runtime dir>/<server>.sock`.  A client looks a device up by
+scanning those files.  The directory is private to the user (mode 0700), which
+is also what protects the Unix sockets.
 
 Devices on other machines are listed by hand in a small TOML file
 (`$INSTHUB_DEVICES`, default `~/.config/insthub/devices.toml`):
@@ -19,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 import tomllib
 from collections.abc import Iterable
@@ -34,17 +37,37 @@ def check_name(name: str, what: str = "name") -> str:
 
 
 def runtime_dir() -> Path:
-    """Directory holding the socket and registry files of this user's servers."""
+    """Directory holding the socket and registry files of this user's servers.  Without
+    XDG_RUNTIME_DIR (nor INSTHUB_DIR), a folder of a known name in the temporary folder, which
+    every user may write to: insthub then makes sure that it is this user's, and private (see
+    _refuse_shared)."""
     base = os.environ.get("INSTHUB_DIR")
+    shared = False
     if base:
         path = Path(base)
     elif os.environ.get("XDG_RUNTIME_DIR"):
         path = Path(os.environ["XDG_RUNTIME_DIR"]) / "insthub"
     else:
         uid = os.getuid() if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
-        path = Path(tempfile.gettempdir()) / f"insthub-{uid}"
+        path, shared = Path(tempfile.gettempdir()) / f"insthub-{uid}", True
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if shared:
+        _refuse_shared(path)
     return path
+
+
+def _refuse_shared(path: Path) -> None:
+    """Raise PermissionError unless `path` is a folder (not a link) of this user that no one else
+    may write to.  Another user could make the folder first: then the .json files in it would lead
+    this user's programs to sockets of theirs, and to folders of theirs whose code may be run (the
+    extensions of the servers listed there)."""
+    if not hasattr(os, "getuid"):  # Windows: the temporary folder is the user's own
+        return
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise PermissionError(f"insthub will not use {path}: it is not a folder of this user that only this user may "
+                              "use (did another user make it?). Remove it, or set XDG_RUNTIME_DIR, or INSTHUB_DIR, to "
+                              "a folder of your own")
 
 
 def socket_path(server: str) -> Path:

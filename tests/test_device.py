@@ -527,16 +527,85 @@ def test_a_pause_while_it_opens_shows_as_pausing_and_nothing_runs_after_it(lazy)
         time.sleep(0.2)                                                    # it is opening
         bus = server.device("slow").bus
         st = bus.status()
-        assert st["busy"] == "$open" and not st["connected"]
+        assert st["opening"] and st["busy"] is None and not st["connected"]   # (not a command: busy stays free)
         bus._t.request("slow", "$pause", ("test",), {})                     # (does not wait)
         time.sleep(0.05)
         d = {"status": bus.status()}
         assert inventory.device_state(d)[1] == "pausing"                    # not "paused ... left alone"
-        assert "being opened" in inventory.device_state(d)[2]
+        assert "opening of its session" in inventory.device_state(d)[2]
         deadline = time.monotonic() + 3
-        while (bus.status()["connected"] or bus.status()["busy"]) and time.monotonic() < deadline:
+        while inventory.device_state({"status": bus.status()})[1] == "pausing" and time.monotonic() < deadline:
             time.sleep(0.02)
         assert inventory.device_state({"status": bus.status()})[1] == "paused"
         time.sleep(0.2)
         assert "task" not in dev.events                                    # its task did not run after the pause
         bus.resume()
+
+
+class Absent(Device):
+    """An instrument that is not there: opening it takes a while, then fails."""
+
+    reconnect_interval = 0.0
+
+    def open(self):
+        time.sleep(0.15)
+        raise TimeoutError("no answer")
+
+    @periodic(0.05)
+    def _acquire(self):
+        pass
+
+
+def test_an_instrument_that_is_not_there_shows_as_not_connected_while_it_is_tried_again():
+    from insthub import inventory
+    with insthub.Server("p", [Absent("gone")]) as server:
+        time.sleep(0.5)
+        words = set()
+        for _ in range(20):  # sampled while it opens again and again
+            words.add(inventory.device_state({"status": server.device("gone").bus.status()})[1])
+            time.sleep(0.03)
+        assert words == {"not connected"}
+
+
+def test_a_device_says_where_it_is_and_what_it_is():
+    from insthub import wrap
+
+    class Scpi:
+        """An instrument over TCP."""
+
+        def __init__(self, host, port=5000, timeout=None):
+            pass
+
+    class Gpib:
+        def __init__(self, board=0, pad=1):
+            pass
+
+    class Serial:
+        def __init__(self, port=None, baud=9600):
+            pass
+
+    assert wrap(Scpi, "a", kwargs={"host": "10.108.57.16"}).address == "10.108.57.16"
+    assert wrap(Scpi, "b", args=["10.0.0.5", 5025]).address == "10.0.0.5:5025"
+    assert wrap(Gpib, "c", kwargs={"board": 0, "pad": 18}).address == "GPIB0::18"
+    assert wrap(Serial, "d", kwargs={"port": "/dev/synthhd"}).address == "/dev/synthhd"
+    assert wrap(Serial, "e").address is None                          # nothing given: nothing said
+
+    class Own(Device):
+        address = "bench 3"                                            # says it itself
+
+        @command
+        def ping(self):
+            return "pong"
+
+    class Named(Device):
+        @prop
+        def address(self) -> str:                                      # a property of that name: left alone
+            return "0x1f"
+
+    with insthub.Server("p", [wrap(Scpi, "rp", kwargs={"host": "h"}), Own("own"), Named("named")]) as server:
+        server.devices["rp"].description = "the one on the optics table"
+        assert {k: server.device("rp").bus.describe()[k] for k in ("address", "description")} == \
+            {"address": "h", "description": "the one on the optics table"}
+        assert server.device("own").bus.describe()["address"] == "bench 3"
+        assert "address" not in server.device("named").bus.describe()
+        assert server.device("named").address == "0x1f"

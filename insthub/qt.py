@@ -14,7 +14,9 @@ GUI thread.  Two helpers cover that:
 
 The GUI can live in the server process (pass `server.device("scope")`: frames
 then arrive by reference, no copy) or anywhere else on the bus; the code is the
-same.  `insthub.viewer` is a ready-made viewer built on these.
+same.  `insthub.viewer` is a ready-made viewer built on these, and
+`insthub.sim_ui` an example of a panel: `make(device, parent)` -> a widget, which
+`device_window(make, device)` puts in a window of its own.
 """
 from __future__ import annotations
 
@@ -116,9 +118,9 @@ def application():
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
     if not getattr(app, "_insthub_ready", False):
         app._insthub_ready = True
-        try:
+        try:  # (queued: a quit() that comes before the loop runs would be lost, and the program never end)
             for sig in (signal.SIGINT, signal.SIGTERM):
-                signal.signal(sig, lambda *_: app.quit())
+                signal.signal(sig, lambda *_: QtCore.QTimer.singleShot(0, app.quit))
         except ValueError:  # not the main thread: leave signal handling to the application
             pass
         app._insthub_tick = QtCore.QTimer(app)  # Python only notices a signal while Python code runs
@@ -131,3 +133,27 @@ def run(app=None) -> int:
     """Run the Qt event loop until the last window closes."""
     app = app or application()
     return app.exec() if hasattr(app, "exec") else app.exec_()
+
+
+class _DeviceWindow(QtWidgets.QMainWindow):
+    """The window of device_window(): closing it closes its panel first."""
+
+    def closeEvent(self, event) -> None:
+        panel = self.centralWidget()
+        if panel is not None and not panel.close():  # its closeEvent stops what it watches (or says no)
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
+def device_window(make, device, title: str | None = None):
+    """A window of its own around a panel: `make(device, parent)` returns the widget of a panel for
+    one device (a proxy; see docs/guide.md#writing-a-panel).  The window is titled after the panel
+    (`title`) and the device.  Keep it, show() it and run(), as `insthub panel DEVICE
+    MODULE:FUNCTION` does in a program of its own.  Closing it closes the panel's widget, whose
+    closeEvent stops its watchers."""
+    application()
+    window = _DeviceWindow()
+    window.setCentralWidget(make(device, window))
+    window.setWindowTitle(f"{title} - {device.bus.name}" if title else device.bus.name)
+    return window

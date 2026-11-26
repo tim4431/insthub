@@ -11,6 +11,10 @@
                                                   the next command reopens it.  `insthub reopen DEVICE` does it now
     insthub pause DEVICE                           close it and refuse every command until `insthub resume DEVICE`
     insthub view DEVICE                            live plots of its streams (needs insthub[gui])
+    insthub open DEVICE [UI]                       a UI of its extension (a window made for it), run with the
+                                                  extension's Python; without UI, the one there is, or a list
+    insthub panel DEVICE MODULE:FUNCTION [--title TITLE]
+                                                  a panel, make(device, parent=None) -> QWidget, in a window
     insthub gui [--tray | --install | --uninstall] the manager window: every server and device, how each is
                                                   connected, and controls; it stays in the tray when closed.
                                                   --install adds a launcher icon
@@ -18,6 +22,13 @@
     insthub sim [--name NAME] [--tcp PORT] [--gui] simulated scope, synth, camera and spectrum analyzer
     insthub bench                                  latency and throughput on this machine
     insthub mcp [--data DIR] [--timeout S]         the bus for AI agents (MCP on stdin/stdout); see docs/agents.md
+
+    insthub ext list [--json]                      the extensions this computer knows of, and what is wrong with
+                                                  them (an extension: a folder with an insthub-extension.toml)
+    insthub ext add PATH | ext remove PATH         add an extension's folder to your list, or take it off
+    insthub check PATH [--import]                  what is wrong with an extension (its folder or manifest), or
+                                                  with the extensions of a server's .toml; --import also imports
+                                                  the drivers, in the extension's Python
 
     insthub service install TARGET [--name NAME] [--python PATH] [--no-login]
                                                   keep a server running in the background (systemd user service);
@@ -140,6 +151,7 @@ def _device(args):
 
 def _cmd_list(args) -> int:
     import insthub
+    from insthub.device import busy_with
 
     servers = [insthub.connect(args.address).info()] if args.address else insthub.discover()
     if not servers:
@@ -156,7 +168,7 @@ def _cmd_list(args) -> int:
         for name, d in sorted(described.items()):
             st = d["status"]
             state = _status_text(st)
-            busy = f", busy: {st['busy']}" if st["busy"] and not st.get("paused") else ""  # (pausing says it)
+            busy = f", busy: {busy_with(st)}" if busy_with(st) and not st.get("paused") else ""  # (pausing says it)
             print(f"    {name:16s} {d['type']:16s} {state}{busy}; {len(d['commands'])} commands, "
                   f"{len(d['properties'])} properties, streams: {', '.join(sorted(d['streams'])) or '-'}")
     return 0
@@ -252,12 +264,15 @@ def _cmd_watch(args) -> int:
 
 
 def _status_text(st: dict) -> str:
+    from .device import busy_with
+
     if st.get("paused"):
         by = f" by {st['paused']['by']}" if st["paused"].get("by") else ""
-        busy = st.get("busy") if st.get("busy") not in (None, "$pause") else None
-        if busy or st["connected"]:  # the pause itself closes the session: until then, what runs finishes
-            what = "the instrument is opened" if busy == "$open" else f"{busy or 'what it is doing'} finishes"
-            return f"pausing{by}: closed once {what}"
+        if st.get("busy") == "$pause":
+            return f"pausing{by}: its session is being closed"
+        what = busy_with(st)
+        if what or st["connected"]:  # the pause itself closes the session: until then, what runs finishes
+            return f"pausing{by}: closed once {what or 'what it is doing'} finishes"
         return f"paused{by} (insthub resume to end it)"
     if st["connected"]:
         return "connected"
@@ -270,6 +285,7 @@ def _status_text(st: dict) -> str:
 
 def _cmd_release(args) -> int:
     from .client import PROCESS_TOKEN
+    from .device import busy_with
 
     bus = _device(args).bus
     doing = {"pause": "pausing", "resume": "resuming"}.get(args.cmd)
@@ -281,15 +297,14 @@ def _cmd_release(args) -> int:
     if args.cmd == "resume" and not st.get("paused"):
         print(f"{args.device}: not paused ({_status_text(st)})")
         return 0
-    busy = st.get("busy") if st.get("busy") not in (None, "$pause") else None
+    busy = busy_with(st) if st.get("busy") != "$pause" else None
     if args.cmd == "resume" and not busy:  # paused and closed: the wait is for its own reopening
         waits, then = "resumed; opening the instrument again...", "resumed; the instrument is still being opened"
     else:
-        what = ("the instrument to finish opening", "it has finished opening") if busy == "$open" else \
-            (f"{busy or 'what it is doing'} to finish", f"{busy or 'what it is doing'} finishes")
-        waits = f"{doing}; waiting for {what[0]}..."
-        then = (f"paused (refusing every call already), and closed once {what[1]}" if args.cmd == "pause" else
-                f"resumed once {what[1]}")
+        what = busy or "what it is doing"
+        waits = f"{doing}; waiting for {what} to finish..."
+        then = (f"paused (refusing every call already), and closed once {what} finishes" if args.cmd == "pause" else
+                f"resumed once {what} finishes")
     request = {"release": ("$release", ()), "reopen": ("$open", ()), "resume": ("$resume", ()),
                "pause": ("$pause", (f"insthub {args.cmd}", PROCESS_TOKEN))}[args.cmd]
     reply = bus._t.request(bus.name, *request, {})
@@ -359,6 +374,55 @@ def _cmd_view(args) -> int:
     return _gui_module("viewer", "insthub view").main(_device(args))
 
 
+_STARTUP = 3.0  #: seconds `insthub open` waits to see whether the UI started (one that cannot, ends sooner)
+
+
+def _cmd_open(args) -> int:
+    import insthub
+
+    from . import extensions
+
+    address = args.address or insthub.locate(args.device)
+    described = insthub.device(args.device, address).bus.describe()
+    ext, uis, why = extensions.device_uis(described, address)
+    if why is None and not uis:
+        why = ("it has no UI of its own" if ext is None else f"its extension, {ext.title}, has no UI for it") + \
+            f" (insthub view {args.device} plots its streams)"
+    chosen = [ui for ui in uis if args.ui in (None, ui.name)]
+    if why is None and not chosen:
+        why = f"no UI named {args.ui!r}; it has {', '.join(ui.name for ui in uis)}"
+    if why:
+        print(f"error: {args.device}: {why}", file=sys.stderr)
+        return 1
+    if len(chosen) > 1:
+        print(f"error: {args.device} has {len(chosen)} UIs: name one, as  insthub open {args.device} NAME", file=sys.stderr)
+        for ui in chosen:
+            print(f"    {ui.name:16s} {ui.title} ({'app' if ui.run else 'panel'})", file=sys.stderr)
+        return 1
+    launched = extensions.launch(ext, chosen[0].name, args.device, address)
+    failure = launched.failure(wait=_STARTUP)
+    if failure:
+        print(f"error: {launched.title} ended with an error:\n{failure}\n(its log: {launched.log})", file=sys.stderr)
+        return 1
+    print(f"opened {launched.title} (pid {launched.pid}; its output goes to {launched.log})")
+    return 0
+
+
+def _cmd_panel(args) -> int:
+    from .config import load_object
+
+    try:
+        make = load_object(args.panel)  # before insthub.qt: then the panel's own Qt binding is the one used
+    except (ImportError, AttributeError, ValueError) as e:
+        print(f"error: cannot load the panel {args.panel!r}: {e} (this is {sys.executable}; does it have the "
+              "libraries of the extension's UI, such as its gui extra?)", file=sys.stderr)
+        return 1
+    qt = _gui_module("qt", "insthub panel")
+    window = qt.device_window(make, _device(args), args.title)
+    window.show()
+    return qt.run()
+
+
 def _cmd_gui(args) -> int:
     from . import launcher
 
@@ -385,7 +449,13 @@ def _cmd_serve(args) -> int:
         return 1
     if args.tcp is not None:
         kwargs["tcp"] = args.tcp
-    Server(kwargs.pop("name"), devices, **kwargs).serve_forever()
+    server = Server(kwargs.pop("name"), devices, **kwargs)
+    try:
+        server.start()
+    except OSError as e:  # a server of that name runs already, its TCP port is taken: said, without a traceback
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    server.serve_forever()  # (started: this only waits, until Ctrl-C)
     return 0
 
 
@@ -459,6 +529,46 @@ def _cmd_service(args) -> int:
     return 0
 
 
+def _cmd_ext(args) -> int:
+    from . import extensions
+
+    try:
+        if args.action == "add":
+            ext = extensions.add_folder(args.path)
+            print(f"added {ext.folder}" + (f": {ext.id} ({ext.title})" if ext.id else ""))
+            if ext.error:
+                print(f"warning: it cannot be used yet: {ext.error}", file=sys.stderr)
+            return 0
+        if args.action == "remove":
+            print(f"removed {', '.join(extensions.remove_folder(args.path))}")
+            return 0
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    found = extensions.discover()
+    if args.json:
+        print(json.dumps([{**dataclasses.asdict(ext), "folder": ext.folder} for ext in found], indent=2, default=str))
+        return 0
+    for ext in found:
+        print(f"{ext.id or '?'} {ext.version}".rstrip() + f"  {ext.title}  ({ext.source})")
+        uis = [f"{ui.name} ({'app' if ui.run else 'panel'}{', for ' + ', '.join(ui.types) if ui.types else ''})"
+               for ui in ext.ui.values()]
+        for what, text in (("folder", str(ext.folder)), ("devices", ", ".join(ext.devices)), ("ui", ", ".join(uis)),
+                           ("error", ext.error), ("hidden", ext.hidden_by and f"by {ext.hidden_by}")):
+            if text:
+                print(f"    {what:8s} {text}")
+    return 0
+
+
+def _cmd_check(args) -> int:
+    from . import extensions
+
+    problems = extensions.check(args.path, import_=args.import_)
+    print("\n".join(problems) or f"{args.path}: no problems found" +
+          ("" if args.import_ else " (--import also imports the drivers)"))
+    return 1 if problems else 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="insthub", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-a", "--address", help="server address (tcp://host:port, ipc:///path); default: find by name")
@@ -504,6 +614,16 @@ def main(argv=None) -> int:
     s = sub.add_parser("view", help="live plots of a device's streams")
     s.add_argument("device")
     s.set_defaults(fn=_cmd_view)
+    s = sub.add_parser("open", help="open a UI of a device's extension (a window made for it), with the "
+                                    "extension's Python")
+    s.add_argument("device")
+    s.add_argument("ui", nargs="?", help="which one, when there are several (without it, they are listed)")
+    s.set_defaults(fn=_cmd_open)
+    s = sub.add_parser("panel", help="show a panel for a device in a window of its own (insthub open runs this)")
+    s.add_argument("device")
+    s.add_argument("panel", metavar="MODULE:FUNCTION", help="the panel: make(device, parent=None) -> QWidget")
+    s.add_argument("--title", help="the window's title, before the device's name")
+    s.set_defaults(fn=_cmd_panel)
     s = sub.add_parser("gui", help="the manager window: servers, devices and how each is connected")
     s.add_argument("--install", action="store_true", help="add insthub to the applications menu and the desktop")
     s.add_argument("--no-desktop", action="store_true", help="with --install: no icon on the desktop")
@@ -528,6 +648,19 @@ def main(argv=None) -> int:
     s.add_argument("--timeout", type=float, default=60.0, metavar="S",
                    help="seconds a call may take unless the agent asks for longer (default 60)")
     s.set_defaults(fn=_cmd_mcp)
+    s = sub.add_parser("ext", help="extensions: folders that add drivers and UIs for their instruments")
+    s.set_defaults(fn=_cmd_ext)
+    actions = s.add_subparsers(dest="action", required=True)
+    actions.add_parser("list", help="the extensions this computer knows of, and what is wrong with them"
+                       ).add_argument("--json", action="store_true", help="as JSON")
+    actions.add_parser("add", help="add an extension's folder to your list").add_argument("path")
+    actions.add_parser("remove", help="take a folder off your list").add_argument("path")
+    s = sub.add_parser("check", help="what is wrong with an extension, or with the extensions of a server file")
+    s.add_argument("path", help="an extension's folder, its insthub-extension.toml, or a server's .toml")
+    s.add_argument("--import", dest="import_", action="store_true",
+                   help="also import the drivers, in the extension's Python (for a server file: the checks of "
+                        "`insthub service install`)")
+    s.set_defaults(fn=_cmd_check)
     s = sub.add_parser("service", help="keep servers running in the background (systemd user services)")
     s.set_defaults(fn=_cmd_service)
     actions = s.add_subparsers(dest="action", required=True)

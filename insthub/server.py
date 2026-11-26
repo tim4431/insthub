@@ -21,6 +21,7 @@ import os
 import signal
 import socket
 import struct
+import sys
 import threading
 import time
 import weakref
@@ -530,11 +531,19 @@ class Server:
                 "features": sorted(FEATURES), "devices": sorted(self._devices), "addresses": list(self.addresses),
                 "started": self.started_at}
 
+    def _entry(self) -> dict:
+        """What its registry file says: its hello, and what only this user's programs on this
+        computer need, so what the hello never carries: the Python it runs in, and for each
+        device the folders of its code, from which its extension is found (see
+        docs/design.md#how-a-device-finds-its-extension)."""
+        return {**self._hello(), "python": sys.executable,
+                "folders": {name: dev._insthub_folders() for name, dev in list(self._devices.items())}}
+
     def _register(self) -> None:
         if not self.addresses:  # in-process only: nothing for another process to find
             return
         try:
-            registry.write(self.name, self._hello())
+            registry.write(self.name, self._entry())
         except OSError as e:
             _log.warning("could not write the registry entry: %s", e)
 

@@ -95,6 +95,11 @@ Nothing here needs administrator rights. Two details:
   of [the insthub command for yourself](#the-insthub-command-for-yourself),
   which has insthub but none of your drivers.
 
+  `insthub check server.toml --import` makes the same check without
+  installing anything, in the Python of the devices'
+  [extensions](guide.md#extensions) (else the `.venv` next to the file), and
+  also checks each device's `extension` against the manifest of its folder.
+
 This needs Linux with systemd. On other systems, start servers with the
 system's own autostart mechanism.
 
@@ -268,6 +273,9 @@ the instruments, so open a TCP port only on a network you trust.
 4. When it works, `insthub service install` it (with `--no-login` if it is not
    always connected).
 5. Use it from experiment scripts with `insthub.device("name")`.
+6. To offer it to others, give its folder an `insthub-extension.toml` and
+   check it with `insthub check FOLDER --import`
+   ([share it as an extension](adding-a-device.md#8-share-it-as-an-extension)).
 
 [Adding an instrument](adding-a-device.md) walks through each step, with every
 key of a config file and what to do when something does not work.
@@ -276,8 +284,10 @@ key of a config file and what to do when something does not work.
 
 | What | Where |
 |---|---|
-| Sockets and announcements of running servers | `$XDG_RUNTIME_DIR/insthub/` (for example `/run/user/1000/insthub/`); override with `INSTHUB_DIR` |
+| Sockets and announcements of running servers | `$XDG_RUNTIME_DIR/insthub/` (for example `/run/user/1000/insthub/`); without `XDG_RUNTIME_DIR`, `/tmp/insthub-UID`, used only if it is your account's alone; override with `INSTHUB_DIR` |
 | Addresses of devices on other computers | `~/.config/insthub/devices.toml`; override with `INSTHUB_DEVICES` |
+| Your list of extension folders | `~/.config/insthub/extensions.toml`, written by `insthub ext add`; `INSTHUB_EXTENSIONS` (folders) looks only there instead |
+| Output of what the window or `insthub open` started | in the runtime folder (the first row): `NAME.log` for a server, `ui/DEVICE-UI.log` for a UI of a device's extension, `ui/DEVICE-view.log` for its live view |
 | Service definitions | `~/.config/systemd/user/insthub-NAME.service` |
 | The insthub command for yourself | `~/.local/bin/insthub`; its environment in `~/.local/share/uv/tools/insthub/` |
 | Results saved for AI agents by `insthub mcp` | `.insthub/` in the folder the agent was started in; override with `INSTHUB_DATA` or `--data` |
@@ -287,7 +297,10 @@ A server and its clients must use the same first folder to find each other by
 name. They do when both run under your account in a normal login session or as
 user services. A program started in some other way, for example from `cron` or
 as a system-wide service, may not have `XDG_RUNTIME_DIR` set; give both sides
-the same `INSTHUB_DIR` in that case.
+the same `INSTHUB_DIR` in that case. Without either, insthub uses
+`/tmp/insthub-UID`. Any account can make a folder in `/tmp`, so insthub
+refuses that one (`insthub will not use /tmp/insthub-1000: ...`) if another
+account made it or may write to it.
 
 ## Windows
 

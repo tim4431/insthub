@@ -12,6 +12,7 @@ file, read [adding an instrument](adding-a-device.md).
 - [Errors, timeouts and restarts](#errors-timeouts-and-restarts)
 - [What can be sent](#what-can-be-sent)
 - [GUIs](#guis)
+- [Extensions](#extensions)
 - [Command line](#command-line)
 
 ## Writing a device
@@ -371,6 +372,52 @@ without being copied. See `examples/04_server_with_gui.py`.
 panel per stream (traces, images, strip charts for numbers) and a table of the
 device's state.
 
+### Writing a panel
+
+A *panel* is the window of one device, written once and shown wherever it is
+needed. It is a function that makes a widget:
+
+```python
+def make(device, parent=None) -> QWidget:
+    ...
+```
+
+| The panel... | How |
+|---|---|
+| gets its device | as `device`, an ordinary proxy: the same thing `insthub.device("scope")` returns |
+| never freezes the window | streams through `qt.watch`, results through `qt.deliver`, calls as `device.command.future(...)` |
+| reaches the instrument only through the bus | commands, properties and streams, so a script or an agent can do all it does |
+| stops what it watches when it closes | in its widget's `closeEvent`: `watcher.stop()` for each watcher |
+
+`insthub/sim_ui.py` is a complete example: insthub's own panel for its
+simulated scope (two traces, the timebase, live on or off, a measurement). To
+try a panel, run it in a window of its own:
+
+```bash
+insthub panel scope insthub.sim_ui:scope          # [-a ADDRESS] [--title TITLE]
+```
+
+or from Python:
+
+```python
+from insthub import qt, sim_ui
+window = qt.device_window(sim_ui.scope, insthub.device("scope"), "Scope panel")
+window.show()
+qt.run()
+```
+
+`insthub panel` imports the panel's module before `insthub.qt`, so the Qt
+binding the panel imports (PyQt6, PySide6, ...) is the one used. Closing the
+window closes the panel's widget. An extension's manifest names its panels
+(see [extensions](#extensions)), and insthub then starts them with
+`insthub panel`, in the extension's Python.
+
+An *app* is a whole program instead, for a device whose UI is a full
+application. It takes the device's address and name (`--address ADDRESS
+--name NAME`, as its manifest says), and when it is given an address it only
+attaches to that device, so it never starts a second server for the same
+instrument.
+
 ### The manager window
 
 `insthub gui` opens a window with four pages, in its sidebar: **Devices**,
@@ -381,12 +428,15 @@ devices and servers, and marks the ones that are broken.
 servers on this computer, the installed services that are not running, and
 the servers of other computers listed in `devices.toml`. A tile says whether
 its instrument is connected (connected, busy, not opened yet, released, paused
-or pausing, or not connected and why). It shows a small live preview of what the device publishes: a trace, an
+or pausing, or not connected and why), and under its name its class and where
+it is (its address, from the arguments it was made with, such as
+`10.108.57.16` or `GPIB0::18`). It shows a small live preview of what the device publishes: a trace, an
 image or a number. A device that publishes nothing shows the figures of its
-state instead. The preview is the stream's last frame, fetched once a second,
+state instead, and one with neither its `description` from the config (else
+its driver's docstring). The preview is the stream's last frame, fetched once a second,
 so it never makes an instrument acquire: a scope that only reads out while
 somebody watches stays idle until something does. The search box filters by
-device, class or server.
+device, class, address, description or server.
 
 Click a tile to see whether its instrument is connected and since when, what
 it is doing, and which programs are watching it. Its tabs show:
@@ -414,6 +464,13 @@ other software (**Release**), or open its live plots (**Live view**).
 program's commands fail with `DevicePaused`) until **Resume**; the page says
 who paused it and since when. **⋯ → Edit in lab.toml...** (named after the
 server's config file) changes its driver, arguments or **Open at start** there.
+A device whose [extension](#extensions) has a UI for it gets a button for each,
+such as **Open Scope panel** for the scope of `insthub sim`; a right-click on
+its tile offers them too. Each opens in a program of its own, run with the
+extension's Python. If the extension is not on this computer, its page says so:
+"extension hp8562a is not installed on this computer: `insthub ext add
+FOLDER`". The live view and these windows write their output to a log file; if
+one ends with an error, the window shows its last lines.
 
 **Servers** shows a card per server. Open one to see its process, its
 addresses, its service, its config file, its devices and the programs
@@ -421,17 +478,25 @@ connected to it. A service can be started, stopped, restarted and removed
 there, its log read, and **Starts at login** switched on or off. A server
 started by hand can be stopped. **⋯ → Edit lab.toml...** changes its config
 file in a form: only what you change is written, the file's comments stay,
-and **Save and restart** makes the server use it.
+and **Save and restart** makes the server use it. The **Add a device** tile
+after its devices opens the same form with a new device in it (for a server
+that runs from a `.toml` file).
 
 **Add** (on the Devices and Servers pages) sets things up without editing
 files by hand:
 
 - **New server...** builds the config of a new server. You choose its devices:
-  a driver for each (`module:Class`, or a `.py` file to pick a class from) and
-  the arguments of its constructor. Those arguments are read from the driver's
-  source without running it, with their defaults shown. It writes `NAME.toml`
+  a driver for each (one from the list, `module:Class`, or a `.py` file to pick
+  a class from) and the arguments of its constructor. Those arguments are read
+  from the driver's source without running it, with their defaults shown. The
+  list offers the devices of your [extensions](#extensions), insthub's own
+  simulated instruments among them: choosing one fills in its driver, its
+  folder and the keys its manifest gives, and the extension's Python to run
+  the server. It writes `NAME.toml`
   (in `~/.config/insthub/servers` unless you choose another folder) and starts
   the server as a background service, or once, or not at all.
+- **Add a device to a server...** adds an instrument to a server that runs
+  from a `.toml` file (it asks which, if there are several), then restarts it.
 - **Keep a server running...** installs an existing `.toml` or `.py` server as
   a service.
 - **Devices on another computer...** asks a server there which devices it has
@@ -441,7 +506,9 @@ files by hand:
 **AI agents** lets an AI agent such as Claude Code use the instruments (see
 [agents](agents.md)); a connected agent is listed as "AI agent (Claude Code)"
 and counted in the sidebar. **Settings** chooses a light or dark look (or the
-desktop's), turns the previews off, and shows the files insthub uses.
+desktop's), turns the previews off, and shows the files insthub uses and your
+[extensions](#extensions): where each was found, and what is wrong with one
+that cannot be used. **Add folder...** and **Remove** change your list of them.
 
 The window is an ordinary client: it needs only Qt, never waits for a server,
 and can be closed and reopened at any time without affecting anything.
@@ -469,6 +536,80 @@ The launcher runs the window with the Python that installed it. On GNOME,
 right-click its icon in the dock and pin it to keep it there.
 `insthub gui --uninstall` removes it again.
 
+## Extensions
+
+An *extension* is a folder that adds an instrument to insthub: its driver,
+its device, and its own windows if it has some. One small file in it,
+`insthub-extension.toml` (its *manifest*), says what it adds. insthub reads
+the manifest as data and never runs it, so listing extensions loads no vendor
+library. [Design](design.md#extensions) explains the model; this is how to
+use it.
+
+| To | Do |
+|---|---|
+| see the extensions this computer knows, and what is wrong with them | `insthub ext list`, or **Settings** in the window |
+| add one you cloned | `insthub ext add ~/Code/hp8562a`, or **Settings → Add folder...** |
+| take it off your list | `insthub ext remove ~/Code/hp8562a`, or **Remove** next to it |
+| check one you are writing | `insthub check ~/Code/hp8562a`; with `--import`, its drivers (and the classes their `link_errors` name) are imported too, in its Python |
+| check the extensions of a server file | `insthub check lab.toml`; with `--import`, also what `insthub service install` checks |
+| make a server with its devices | **Add → New server...**: they are in the driver list |
+| open a device's UI | `insthub open scope` (with a name when there are several: `insthub open analyzer quick`), or **Open ...** on the device's page |
+
+insthub looks for extensions in this order: its own (the simulated
+instruments of `insthub sim`), the folders of your list
+(`~/.config/insthub/extensions.toml`), the folders the installed services'
+code comes from, and the folders of the devices of the servers running on this
+computer. Of two extensions with one `id` the first that can be used wins,
+and `insthub ext list` says which one it hides. One that cannot be used (its
+manifest is not valid TOML, its `api` is too new, it has no Python) is listed
+with the reason, and hides nothing. To try an extension without adding it,
+`INSTHUB_EXTENSIONS=~/Code/hp8562a insthub gui` looks only there (folders
+separated by `:`, or `;` on Windows).
+
+A manifest:
+
+```toml
+[extension]
+id = "hp8562a"                       # what its devices announce, as extension = "hp8562a"
+title = "HP 8562A spectrum analyzer"
+version = "0.3"                      # warned about when its class says another extension_version
+api = 1                              # the version of this file's format
+# python = ".venv/bin/python"        # default: a .venv in this folder or the one above
+
+[devices.analyzer]                   # a device New server offers
+driver = "hp8562a_insthub.device:SpectrumAnalyzer"
+doc = "HP 8562A over GPIB"           # shown in the list
+pad = 18                             # every other key goes into the server file as it is
+
+[ui.analyzer]                        # an app (run) or a panel (panel = "module:make")
+title = "Spectrum analyzer"
+run = ["-m", "hp8562a_insthub.ui", "--address", "{address}", "--name", "{device}"]
+# types = ["HP8562A", "SimHP8562A"]  # only for devices of these types (default: every device of it)
+```
+
+New server writes a device's table with two keys added: `path`, the
+extension's folder, and `extension`, its id. It runs the server with the
+extension's Python, unless you chose one yourself. A server runs in one
+Python, so if the extensions of two of its devices run in different ones,
+the dialog says so: give them a server each. If you type another driver in
+place of the one chosen, the keys the choice brought go again. A manifest
+never says `path`, `extension` or `extension_version`, and `insthub check`
+reports them.
+
+A `[ui.NAME]` table is a window for the extension's devices: an app, started
+as `<the extension's Python> <run...>` with `{device}` and `{address}`
+filled in, or a [panel](#writing-a-panel), started as `<the extension's
+Python> -m insthub -a ADDRESS panel DEVICE MODULE:FUNCTION`. Either runs in
+the extension's folder, which is also first on its `PYTHONPATH`, so a plain
+folder works without being installed. A UI is offered for every device that
+announces the extension's `id`, or with `types` only for the devices whose
+type (as `insthub info` shows it: the class name) is listed. For a device on
+this computer, the extension is found from the device's own folder, so
+**Open** starts the copy of the extension that its server runs; for one on
+another computer, from your extensions. Its output goes to
+`ui/DEVICE-NAME.log` in insthub's runtime folder. `insthub open` waits 3
+seconds and, if it ended with an error by then, prints the log's last lines.
+
 ## Command line
 
 ```
@@ -484,8 +625,14 @@ insthub reopen DEVICE                          open it again now (any command do
 insthub pause DEVICE                           close it and refuse every command until resumed
 insthub resume DEVICE                          end the pause
 insthub view DEVICE                            live plots
+insthub open DEVICE [UI]                       a window its extension provides for it (an app or a panel)
+insthub panel DEVICE MODULE:FUNCTION           a panel in a window of its own, to try one
 insthub gui [--tray | --install]               the manager window (stays in the tray); --install adds an icon
 insthub serve CONFIG.toml                      host the devices of a config file
+insthub ext list [--json]                      the extensions this computer knows of, and what is wrong with them
+insthub ext add PATH | ext remove PATH         add an extension's folder to your list, or take it off
+insthub check PATH [--import]                  what is wrong with an extension, or with a server file's extensions;
+                                               --import also imports the drivers, in the extension's Python
 insthub service install | list | start | stop | restart | enable | disable | remove | logs
                                                keep servers running in the background
 insthub sim [--gui]                            simulated instruments to try things on
