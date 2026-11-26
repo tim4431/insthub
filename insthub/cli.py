@@ -1,6 +1,14 @@
 """Command line.
 
-    insthub list                                   servers and devices on this machine
+    insthub list [--json]                          servers and devices on this machine, and on the other
+                                                  computers devices.toml names; a server here that runs
+                                                  older code than its folders hold says why
+    insthub states [DEVICE ...] [--json]           what every device is like now: its state, whether it is
+                                                  connected (to save next to a data file); with -a, the
+                                                  devices of that server; exit code 1 if a device named,
+                                                  or every device, could not be read
+    insthub logs SERVER [-n N] [--level L] [-f]    what a server logged (its last records; -f: follow it),
+                                                  from any computer; SERVER may also be one of its devices
     insthub info DEVICE                            its commands, properties and streams: units, limits, choices,
                                                   what is dangerous, and whether it is simulated
     insthub call DEVICE COMMAND [ARG ...] [KEY=VALUE ...] [--save FILE]
@@ -41,9 +49,16 @@
                                                   keep a server running in the background (systemd user service);
                                                   TARGET is a .toml config or a .py server script.  The service
                                                   runs this Python (or PATH), which must import its drivers.
+                                                  It waits until the server answers, or shows why it did not.
                                                   --no-login: started only by `insthub service start NAME`
     insthub service list | start NAME | stop NAME | restart NAME | remove NAME | logs NAME [-f]
     insthub service enable NAME | disable NAME     start it at every login, or no longer
+    insthub service update [NAME ...] [--check] [--json]
+                                                  after a git pull or an edited driver: write units of an
+                                                  older insthub anew (same file, same Python) and restart
+                                                  the services that run older code; never starts one that
+                                                  is stopped.  --check only says what it would do, with exit
+                                                  code 1 if anything would change
 
 Values are parsed as JSON when possible (1e3, true, [1,2], "text"), else taken
 as text.  `-a ADDRESS` talks to a server by address instead of looking the
@@ -160,24 +175,145 @@ def _cmd_list(args) -> int:
     import insthub
     from insthub.device import busy_with
 
-    servers = [insthub.connect(args.address).info()] if args.address else insthub.discover()
-    if not servers:
-        print("no insthub server is running on this machine")
+    servers = [insthub.connect(args.address).info()] if args.address else insthub.discover(remote=True)
+    unread = [s for s in servers if s.get("error") and not s.get("address")]  # devices.toml cannot be read
+    for info in unread:
+        print(f"error: {info['error']}", file=sys.stderr)
+    listed = [_listing(info, args.address) for info in servers if info not in unread]
+    if args.json:
+        print(json.dumps(_plain(listed), indent=2, default=str))
+        return 0 if listed else 1
+    if not listed:
+        print("no insthub server is running on this machine" + ("" if unread else ", and devices.toml names "
+                                                                "none on another"))
         return 1
-    for info in servers:
-        print(f"{info['server']}  (pid {info['pid']})  {'  '.join(info['addresses'])}")
-        try:
-            address = next((a for a in info["addresses"] if not a.startswith("inproc")), info["addresses"][0])
-            described = insthub.connect(args.address or address).describe()
-        except insthub.BusError as e:
-            print(f"    unreachable: {e}")
+    for s in listed:
+        if s["server"] is None:  # a server on another computer that does not answer
+            print(f"{s['address']}  (on another computer)\n    unreachable: {s['error']}")
             continue
-        for name, d in sorted(described.items()):
+        where = " on another computer" if s["remote"] else ""
+        print(f"{s['server']}  (pid {s['pid']}{where})  {'  '.join(s['addresses'])}")
+        if "error" in s:
+            print(f"    unreachable: {s['error']}")
+            continue
+        if s["outdated"]:
+            print(f"    out of date: {'; '.join(s['outdated'])}; a restart loads the new code")
+        for name, d in s["devices"].items():
             st = d["status"]
             state = _status_text(st)
             busy = f", busy: {busy_with(st)}" if busy_with(st) and not st.get("paused") else ""  # (pausing says it)
             print(f"    {name:16s} {d['type']:16s} {state}{busy}; {len(d['commands'])} commands, "
-                  f"{len(d['properties'])} properties, streams: {', '.join(sorted(d['streams'])) or '-'}")
+                  f"{len(d['properties'])} properties, streams: {', '.join(d['streams']) or '-'}")
+    return 0
+
+
+def _listing(info: dict, address: str | None) -> dict:
+    """What `insthub list` says of one server (`info`: its discover() entry; with -a, the info() of
+    the server at `address`): who it is and where; if it answers, why it runs older code
+    (extensions.outdated, judged only for a server of this computer, by its registry entry) and its
+    devices in brief; else "error" (and "server" None for one on another computer)."""
+    import insthub
+    from insthub.extensions import outdated
+
+    s = {"server": info.get("server"), "pid": info.get("pid"), "remote": bool(info.get("remote")),
+         "address": address or info.get("address"), "addresses": list(info.get("addresses") or ()),
+         "version": info.get("version")}
+    if info.get("error"):
+        return {**s, "error": info["error"]}
+    try:
+        described = insthub.connect(s["address"]).describe()
+    except insthub.BusError as e:
+        return {**s, "error": str(e)}
+    s["outdated"] = outdated(None if info.get("remote") or address else info, described)  # (with -a: no entry)
+    s["devices"] = {name: {"type": d["type"], "status": d["status"], "commands": sorted(d["commands"]),
+                           "properties": sorted(d["properties"]), "streams": sorted(d["streams"])}
+                    for name, d in sorted(described.items())}
+    return s
+
+
+def _cmd_states(args) -> int:
+    import insthub
+
+    found = insthub.states(args.devices or None, address=args.address)
+    unread = [name for name, d in found.items() if "error" in d]
+    # 1 when a device you named, or every device, could not be read: what was saved is not what was meant
+    code = 1 if not found or len(unread) == len(found) or (args.devices and unread) else 0
+    if args.json:
+        print(json.dumps(_plain(found), indent=2, default=str))
+        return code
+    for name, d in sorted(found.items()):
+        if "error" in d:
+            print(f"{name}" + (f"  (on {d['server']})" if d.get("server") else "") + f": {d['error']}")
+            continue
+        print(f"{name}  ({d['type']} on {d['server']}, {'connected' if d['connected'] else 'not connected'})")
+        for key, value in d["state"].items():
+            print(f"    {key}: {json.dumps(_plain(value), default=str)}")
+    if not found:
+        print("no device on the bus (insthub list shows the servers)", file=sys.stderr)
+    return code
+
+
+def _server_address(args) -> str:
+    """The address of the server `args.server` names: one on this computer or another (by its
+    name, as `insthub list` shows it), or the one that hosts a device of that name; or -a's.
+    This computer's servers and devices first: those on other computers may take a second to
+    answer."""
+    import insthub
+
+    from .errors import BusError, DeviceNotFound
+
+    if args.address:
+        return args.address
+    if not args.server:
+        raise BusError("name a server (insthub list shows them), or give its address before the command: "
+                       "insthub -a tcp://HOST:PORT logs")
+    here = insthub.discover()
+    for info in here:
+        if info["server"] == args.server:
+            return info["address"]
+    if any(args.server in info.get("devices", ()) for info in here):
+        return insthub.locate(args.server)  # (which says so if two servers here have one)
+    for info in insthub.discover(remote=True):
+        if info.get("server") == args.server:
+            return info["address"]
+    try:
+        return insthub.locate(args.server)  # a device elsewhere: from what those servers just said
+    except DeviceNotFound:
+        raise BusError(f"no server or device named {args.server!r} answers (insthub list shows them)"
+                       ) from None
+
+
+def _cmd_logs(args) -> int:
+    import insthub
+
+    from .client import log_text
+    from .errors import ConnectionLost
+    from .server import LOG_RECORDS
+
+    client = insthub.connect(_server_address(args), timeout=10.0)
+    records = client.logs(args.lines, args.level)
+    print(log_text(records) or f"({client.hello.get('server')} has logged nothing at {args.level} or above)",
+          flush=True)
+    last, pid, gone = (records[-1]["seq"] if records else None), client.hello.get("pid"), False
+    try:
+        while args.follow:
+            time.sleep(1.0)
+            try:
+                records = client.logs(LOG_RECORDS, args.level, last)
+            except ConnectionLost:
+                if not gone:
+                    print(f"--- {client.hello.get('server')} does not answer; waiting for it", flush=True)
+                gone = True
+                continue
+            if client.hello.get("pid") != pid:  # started again: its records are numbered from 1 again
+                pid, gone, last = client.hello.get("pid"), False, None
+                print(f"--- {client.hello.get('server')} started again", flush=True)
+                records = client.logs(LOG_RECORDS, args.level)
+            if records:
+                print(log_text(records), flush=True)
+                last = records[-1]["seq"]
+    except KeyboardInterrupt:
+        pass
     return 0
 
 
@@ -462,7 +598,7 @@ def _cmd_open(args) -> int:
     if len(chosen) > 1:
         print(f"error: {args.device} has {len(chosen)} UIs: name one, as  insthub open {args.device} NAME", file=sys.stderr)
         for ui in chosen:
-            print(f"    {ui.name:16s} {ui.title} ({'app' if ui.run else 'panel'})", file=sys.stderr)
+            print(f"    {ui.name:16s} {ui.title} ({ui.kind})", file=sys.stderr)
         return 1
     launched = extensions.launch(ext, chosen[0].name, args.device, address)
     failure = launched.failure(wait=_STARTUP)
@@ -506,6 +642,7 @@ def _cmd_gui(args) -> int:
 
 def _cmd_serve(args) -> int:
     from . import Server, config
+    from .server import keep_logs
 
     try:
         kwargs, devices = config.load(args.config)
@@ -514,6 +651,7 @@ def _cmd_serve(args) -> int:
         return 1
     if args.tcp is not None:
         kwargs["tcp"] = args.tcp
+    keep_logs(everything=True)  # (once loaded: a problem of the file is printed as it is, not logged)
     server = Server(kwargs.pop("name"), devices, **kwargs)
     try:
         server.start()
@@ -526,7 +664,9 @@ def _cmd_serve(args) -> int:
 
 def _cmd_sim(args) -> int:
     from . import Server, sim
+    from .server import keep_logs
 
+    keep_logs(everything=True)
     viewer = _gui_module("viewer", "insthub sim --gui") if args.gui else None  # before a server is made
     server = Server(args.name, [*sim.devices(), sim.Loopback()], tcp=args.tcp)
     if viewer is None:
@@ -556,10 +696,10 @@ def _cmd_service(args) -> int:
         path = service.install(args.target, args.name, start=not args.no_start, python=args.python, login=login)
         name = path.stem[len(service.PREFIX):]
         print(f"installed {path}")
-        if not args.no_start:
-            time.sleep(1.0)  # long enough for a bad config to have failed
-            state = next((u["state"] for u in service.units() if u["name"] == name), "unknown")
-            print(f"state: {state}" + ("" if state == "active" else f"   (see: insthub service logs {name})"))
+        if not args.no_start:  # (install waited until its server answered, or said why it did not)
+            unit = next((u for u in service.units() if u["name"] == name), {})
+            print(f"state: {unit.get('state', 'unknown')}" + (f", its server is up (pid {unit['pid']})"
+                                                             if unit.get("pid") else ""))
         print(f"restart after changing its code or config:  insthub service restart {name}")
         if login:
             hint = service.linger_hint()
@@ -585,12 +725,29 @@ def _cmd_service(args) -> int:
         print(f"{service.PREFIX}{args.name}: " + ("starts at every login" if args.action == "enable" else
                                                   "no longer starts at login (start it by hand)"))
         return 0
+    if args.action == "update":
+        records = service.update(args.names or None, check=args.check)
+        if args.json:
+            print(json.dumps([dataclasses.asdict(r) for r in records], indent=2))
+        else:
+            print("\n".join(r.text() for r in records) or "no insthub services installed")
+        if args.check:  # for scripts: 1 when anything would change (or is wrong)
+            return 1 if any(r.plan or r.error for r in records) else 0
+        return 1 if any(r.error for r in records) else 0
     units = service.units()
     if not units:
         print("no insthub services installed (insthub service install TARGET)")
+    old = False
     for unit in units:
         boot = "at login" if unit["enabled"] else "by hand"
         print(f"{unit['name']:16s} {unit['state']:10s} {boot:9s} {unit['command']}")
+        told = service.restarts_text(unit)
+        found = service.Update(unit["name"], stale=unit.get("stale"), outdated=service.outdated(unit)).found
+        for line in ([told] if told else []) + found:
+            print(f"{'':16s} {line}")
+        old = old or bool(found)
+    if old:
+        print("insthub service update brings them up to date (--check: what it would do)")
     return 0
 
 
@@ -616,7 +773,7 @@ def _cmd_ext(args) -> int:
         return 0
     for ext in found:
         print(f"{ext.id or '?'} {ext.version}".rstrip() + f"  {ext.title}  ({ext.source})")
-        uis = [f"{ui.name} ({'app' if ui.run else 'panel'}{', for ' + ', '.join(ui.types) if ui.types else ''})"
+        uis = [f"{ui.name} ({ui.kind}{', for ' + ', '.join(ui.types) if ui.types else ''})"
                for ui in ext.ui.values()]
         for what, text in (("folder", str(ext.folder)), ("devices", ", ".join(ext.devices)), ("ui", ", ".join(uis)),
                            ("recipes", ", ".join(_recipe_file_text(path, ext.folder) for path in ext.recipes)),
@@ -818,9 +975,9 @@ def _print_check(recipe, values: dict, checked) -> None:
             print(f"  {what:9s} {text}")
 
 
-def _imports_drivers(path: Path) -> bool:
-    """Whether `insthub check PATH --import` would import drivers: a server's .toml, or an extension
-    that adds devices (not a file of recipes, nor an extension of recipes only)."""
+def _imports_code(path: Path) -> bool:
+    """Whether `insthub check PATH --import` would import code: a server's .toml, or an extension that
+    adds devices or UIs (not a file of recipes, nor an extension of recipes only)."""
     from . import extensions
 
     if path.suffix == ".py":
@@ -828,7 +985,10 @@ def _imports_drivers(path: Path) -> bool:
     if path.suffix == ".toml" and path.name != extensions.MANIFEST:
         return True
     manifest = extensions.find_manifest(path) if path.is_dir() else path
-    return manifest is not None and bool(extensions.load(manifest).devices)
+    if manifest is None:
+        return False
+    ext = extensions.load(manifest)
+    return bool(ext.devices or ext.ui)
 
 
 def _cmd_check(args) -> int:
@@ -843,8 +1003,8 @@ def _cmd_check(args) -> int:
         found = ", ".join(r.name for r in recipes.read_file(path)[0])
         print(f"{args.path}: no problems found" + (f"; its recipes: {found}" if found else ""))
     else:
-        hint = not args.import_ and _imports_drivers(path)
-        print(f"{args.path}: no problems found" + (" (--import also imports the drivers)" if hint else ""))
+        hint = not args.import_ and _imports_code(path)
+        print(f"{args.path}: no problems found" + (" (--import also imports the drivers and the UIs)" if hint else ""))
     return 0
 
 
@@ -854,7 +1014,20 @@ def main(argv=None) -> int:
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("list", help="servers and devices").set_defaults(fn=_cmd_list)
+    s = sub.add_parser("list", help="servers and devices, here and on the computers devices.toml names")
+    s.add_argument("--json", action="store_true", help="as JSON, with why each server here is out of date")
+    s.set_defaults(fn=_cmd_list)
+    s = sub.add_parser("states", help="what every device is like now (to save next to a data file)")
+    s.add_argument("devices", nargs="*", metavar="DEVICE",
+                   help="only these (default: every device, or with -a every device of that server)")
+    s.add_argument("--json", action="store_true", help="as JSON")
+    s.set_defaults(fn=_cmd_states)
+    s = sub.add_parser("logs", help="what a server logged, from any computer")
+    s.add_argument("server", nargs="?", help="a server's name, or one of its devices' (or -a ADDRESS)")
+    s.add_argument("-n", "--lines", type=int, default=50, help="how many records (default 50)")
+    s.add_argument("--level", default="INFO", help="DEBUG, INFO (default), WARNING, ERROR or CRITICAL")
+    s.add_argument("-f", "--follow", action="store_true", help="go on showing what it logs, until Ctrl-C")
+    s.set_defaults(fn=_cmd_logs)
     s = sub.add_parser("info", help="commands, properties and streams of a device, with units, limits, "
                                     "choices and what is dangerous")
     s.add_argument("device")
@@ -956,8 +1129,8 @@ def main(argv=None) -> int:
     s.add_argument("path", help="an extension's folder, its insthub-extension.toml, a server's .toml, or a .py "
                                 "file of recipes")
     s.add_argument("--import", dest="import_", action="store_true",
-                   help="also import the drivers, in the extension's Python (for a server file: the checks of "
-                        "`insthub service install`)")
+                   help="also import the drivers and the UIs' modules, in the extension's Python (for a "
+                        "server file: the checks of `insthub service install`, in the Python that serves it)")
     s.set_defaults(fn=_cmd_check)
     s = sub.add_parser("service", help="keep servers running in the background (systemd user services)")
     s.set_defaults(fn=_cmd_service)
@@ -970,9 +1143,16 @@ def main(argv=None) -> int:
     a.add_argument("--no-login", action="store_true", help="start it now, but not at every login "
                                                            "(later: insthub service start NAME)")
     a.add_argument("--python", metavar="PATH",
-                   help="the Python the service runs (default: the one running this command); "
-                        "it needs insthub and the drivers' packages")
-    actions.add_parser("list", help="installed services and their state")
+                   help="the Python the service runs (default: that of the devices' extensions, else a "
+                        "virtualenv next to the file or its drivers, else the one running this command); it "
+                        "needs insthub and the drivers' packages")
+    actions.add_parser("list", help="installed services and their state, and what is out of date")
+    a = actions.add_parser("update", help="bring services up to date after a git pull or an edited driver: "
+                                          "write old units anew, restart what runs older code")
+    a.add_argument("names", nargs="*", metavar="NAME", help="only these services (default: every one)")
+    a.add_argument("--check", action="store_true", help="only say what it would do; exit code 1 if anything "
+                                                        "would change")
+    a.add_argument("--json", action="store_true", help="as JSON: a record per service")
     for action, text in (("start", "start a service"),
                          ("stop", ("stop a service (until `start`, or the next start of your services if it "
                                    "starts at login)")),

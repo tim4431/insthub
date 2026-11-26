@@ -1,0 +1,22 @@
+# What this folder adds to insthub (docs/design.md#the-manifest).  insthub reads it as data and
+# never runs it.  `insthub check .` says what is wrong with it; `insthub ext add .` adds it.
+
+[extension]
+id = "demo-laser"                    # what its devices announce: EXTENSION in demolaser_insthub/__init__.py
+title = "Demo laser"
+version = "0.1"                      # = Laser.extension_version (insthub check warns when they differ)
+api = 1                              # the version of this file's format
+# python = ".venv/bin/python"        # default: a .venv in this folder or the one above
+
+[devices.laser]                      # offered by the window's New server dialog
+driver = "demolaser_insthub.device:Laser"
+doc = "a simulated diode laser, no hardware needed"
+port = "sim"                         # every other key goes into the server file as it is
+
+[ui.panel]                           # a panel: one widget, which insthub puts in a window of its own
+title = "Laser panel"
+panel = "demolaser_insthub.ui.panel:make"
+
+[ui.app]                             # an app: a whole program, started as <python> <run...>
+title = "Laser app"
+run = ["-m", "demolaser_insthub.ui", "--address", "{address}", "--name", "{device}"]

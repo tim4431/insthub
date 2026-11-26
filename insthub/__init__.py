@@ -35,6 +35,7 @@ from .client import (
                      discover,
                      gather,
                      locate,
+                     states,
 )
 from .codec import Record, register_type
 from .device import Device, Frame, Task, Wrapped, command, periodic, prop, wrap
@@ -54,5 +55,5 @@ __all__ = [
     "BusError", "CallFuture", "Client", "ConnectionLost", "Device", "DeviceNotConnected", "DeviceNotFound",
     "DevicePaused", "DeviceProxy", "Frame", "Record", "RemoteError", "Server", "Subscription", "SubscriptionClosed", "Task",
     "UnknownCommand", "Wrapped", "close_all", "command", "connect", "device", "discover", "gather", "locate", "periodic",
-    "prop", "register_type", "serve", "wrap",
+    "prop", "register_type", "serve", "states", "wrap",
 ]

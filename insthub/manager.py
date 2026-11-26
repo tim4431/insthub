@@ -10,16 +10,19 @@ how each one is reached, and the controls to look after them and set them up.
                  periodic tasks (a switch each), its state, its commands to run (or save
                  as a recipe), and the recipes that use it.
                  Connect now / Release / Pause and Resume / Live view / Open <a UI of its
-                 extension> / Edit in its config.
+                 extension> (a menu of them, for several) / Edit in its config.
     Servers      a card per server: running here, installed as a service, or on another
                  computer (devices.toml)
     a server     its process, addresses, service, devices and the programs connected to it.
-                 Start / Stop / Restart / Logs / Remove; Starts at login; Edit its config
+                 Start / Stop / Restart / Update / Logs / Remove; Starts at login; Edit its config
                  (forms.ServerDialog, which changes the file in place, comments kept).
+                 Update (and Update all, on Servers) loads new code: service.update for a
+                 service, a restart for a server the window started.
     Recipes      every recipe (recipes.py): its code, what it uses; Run and Stop
     AI agents    giving Claude Code or another agent the instruments; which are connected
     Settings     appearance, previews, notifications, start at login, the files insthub uses,
-                 your extensions (folders added and removed; what is wrong with each)
+                 your extensions (folders added and removed; what is wrong with each), and
+                 whether this window runs older insthub code than the disk holds
     Add          a new server (its config file is written for you; the driver list offers
                  the devices of your extensions), a server file to keep
                  running as a service (at login or not), devices on another computer
@@ -59,8 +62,9 @@ import numpy as np
 
 from . import extensions, forms, launcher, pages, recipes, registry, service
 from . import widgets as ui
-from .client import PROCESS_TOKEN
+from .client import PROCESS_TOKEN, log_text
 from .device import busy_with
+from .errors import BusError
 from .inventory import (
     BAD,
     BUSY,
@@ -94,6 +98,11 @@ RECIPES_FRESH = 3.0  #: seconds the recipes read from their files are believed (
 _ORIGIN_ORDER = {"local": 0, "service": 1, "remote": 2}
 QAction = getattr(QtGui, "QAction", None) or QtWidgets.QAction  # QtWidgets in Qt 5
 Qt = QtCore.Qt
+
+
+def _preview_limit(s: Server) -> int:
+    """The most elements a frame of the server's may have to be previewed."""
+    return PREVIEW_LIMIT // 8 if (s.address or "").startswith("tcp://") else PREVIEW_LIMIT
 
 
 def _qimage(a: np.ndarray) -> QtGui.QImage:
@@ -155,8 +164,11 @@ class Manager(QtWidgets.QMainWindow):
         self._closed = False
         self._systemd = False
         self._remote_error: str | None = None  # devices.toml cannot be read
+        self._local_ids: set[tuple] = set()  # registry.identity() of the servers here, at the last scan
+        self._here: dict[str, tuple] = {}  # address in devices.toml -> identity of the server here it reached
         self._spawned: list = []  # programs this window started: servers, windows for devices (inventory.Launched)
-        self._uis: dict[tuple, tuple] = {}  # (address, device, extension) -> (device_uis(), when it was asked)
+        self._uis: dict[str, tuple] = {}  # server address -> what its devices can open here (see _look_up_uis)
+        self._uis_asking: set[str] = set()  # server addresses whose devices' UIs a worker is finding out
         self._recipes: tuple | None = None  # recipes.available(), once read (see known_recipes)
         self._recipes_at = -math.inf  # when they were last read (-inf: read them again at once)
         self._recipes_reading = False
@@ -165,7 +177,8 @@ class Manager(QtWidgets.QMainWindow):
         self._logs: dict[str, pages.LogDialog] = {}
         self._detail: tuple | None = None  # ("device", key, name) or ("server", key) while one is shown
         self.login_pending: dict[str, bool] = {}  # service -> the Starts at login asked, until it is done
-        self.restarting: dict[str, dict] = {}  # server key -> a restart under way (see restart_server)
+        self.restarting: dict[str, dict] = {}  # server key -> a restart under way (see _restarting)
+        self.outdated_here: list[str] = []  # why this window runs older insthub code (extensions.outdated_here)
         self._follow: tuple | None = None  # (server key, device or None): the page to show again once its restart is over
         self._back: tuple | str = "devices"  # where the device page goes back to
 
@@ -252,6 +265,50 @@ class Manager(QtWidgets.QMainWindow):
     def previews_on(self) -> bool:
         return self.settings.value("previews", True, type=bool)
 
+    def preview_choice(self, name: str) -> str | None:
+        """The stream the preview of device `name` was told to show (see add_preview_choices); None: one
+        picked by inventory.preview_stream."""
+        return str(self.settings.value(f"preview-stream/{name}", "")) or None
+
+    def choose_preview(self, s: Server, name: str, stream: str | None) -> None:
+        if stream:
+            self.settings.setValue(f"preview-stream/{name}", stream)
+        else:
+            self.settings.remove(f"preview-stream/{name}")
+        self._fetch_previews(s)  # the new stream's last frame now, not at the next probe
+
+    def add_preview_choices(self, menu: QtWidgets.QMenu, s: Server, name: str) -> None:
+        """Items of `menu` that choose the stream the device's preview shows, on its tile and its page."""
+        d = s.device(name)
+        streams = {n: st for n, st in d["streams"].items() if n != "state"} if d else {}
+        chosen = self.preview_choice(name)
+        shown = preview_stream(d, chosen, s.shown.get(name, (None,))[0]) if d else None
+        menu.setToolTipsVisible(True)
+
+        def item(text, stream, checked, enabled=True, tip=""):
+            action = menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(checked)
+            action.setEnabled(enabled)
+            action.setToolTip(tip)
+            action.triggered.connect(lambda *_: self.choose_preview(s, name, stream))
+
+        item("Automatic", None, chosen is None, tip="A stream that is publishing now; if none is, the one "
+             "already shown")
+        menu.addSeparator()
+        for n, st in streams.items():
+            big = elements(st["kind"]) > _preview_limit(s)
+            item(f"{n}\t{st['kind'] or 'nothing yet'}", n, chosen is not None and n == shown,
+                 st["time"] is not None and not big,
+                 "Too large a frame to preview" if big else st["doc"] or "")
+
+    def preview_menu(self, s: Server, name: str, pos) -> None:
+        if s is None or not self.previews_on:
+            return
+        menu = QtWidgets.QMenu(self)
+        self.add_preview_choices(menu, s, name)
+        menu.exec(pos)
+
     def _desktop_switched(self, *_) -> None:
         if not self._closed and self.settings.value("theme", "system") == "system":
             self.apply_theme()
@@ -290,7 +347,7 @@ class Manager(QtWidgets.QMainWindow):
         self.toast.show_message(text, ms)
 
     def _report(self, exc) -> None:
-        self.say(pages.error_text(exc), 8000)
+        self.say(ui.error_text(exc), 8000)
 
     def act(self, doing: str, fn, done, after=None) -> None:
         """A user's action: say what is happening, then what came of it.  `done` is the
@@ -313,12 +370,7 @@ class Manager(QtWidgets.QMainWindow):
         self.submit(self.actions, fn, ok, failed)
 
     def confirm(self, title: str, text: str, action: str) -> bool:
-        box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Icon.Question, title, text,
-                                    QtWidgets.QMessageBox.StandardButton.Cancel, self)
-        yes = box.addButton(action, QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.Cancel)
-        box.exec()
-        return box.clickedButton() is yes
+        return ui.confirm(self, title, text, action)
 
     def copy(self, text: str) -> None:
         QtWidgets.QApplication.clipboard().setText(text)
@@ -326,7 +378,9 @@ class Manager(QtWidgets.QMainWindow):
 
     # -- looking -------------------------------------------------------------
     def refresh(self) -> None:
-        for p in self._spawned:  # a server or a window this window started that failed (at start, often) says why
+        ended = [p for p in self._spawned if not p.running]  # (once: one that ends meanwhile is seen next time)
+        self._spawned = [p for p in self._spawned if p not in ended]
+        for p in ended:  # a server or a window this window started that failed (at start, often) says why
             failure = p.failure()
             if failure:
                 self.say(f"{p.title} ended with an error: {failure.splitlines()[-1]} (its log: {p.log})", 15000)
@@ -336,10 +390,14 @@ class Manager(QtWidgets.QMainWindow):
                 box.setInformativeText(f"{failure}\n\nIts log: {p.log}")
                 box.setModal(False)
                 box.show()
-        self._spawned = [p for p in self._spawned if p.running]  # and those that ended
         if not self._scanning:
             self._scanning = True
-            self.submit(self.probes, self.backend.scan, self._on_scan, self._on_scan_failed)
+            self.submit(self.probes, self._scan, self._on_scan, self._on_scan_failed)
+
+    def _scan(self) -> dict:
+        """(On a worker) the servers and services, and why this window runs older code, if it does
+        (the first look notes the times of its code: see extensions.outdated_here)."""
+        return {**self.backend.scan(), "here": extensions.outdated_here()}
 
     def _on_scan_failed(self, exc) -> None:
         self._scanning = False
@@ -348,6 +406,9 @@ class Manager(QtWidgets.QMainWindow):
     def _on_scan(self, found: dict) -> None:
         self._scanning, self._scanned = False, True
         self._remote_error = found["remote_error"]
+        if found["here"] != self.outdated_here:
+            self.outdated_here = found["here"]
+            self.settings_page.show_outdated(self.outdated_here)
         units = found["services"]
         self._systemd = units is not None
         by_pid = {u["pid"]: u for u in units or () if u["pid"]}
@@ -360,30 +421,30 @@ class Manager(QtWidgets.QMainWindow):
                 s.forget_live_data()
             s.pid, s.started = info.get("pid"), info.get("started")
             s.addresses, s.declared = list(info.get("addresses", ())), list(info.get("devices", ()))
+            s.python = info["python"] if isinstance(info.get("python"), str) else None  # (another insthub's: none)
+            s.entry = info
             s.service = by_pid.get(s.pid)
             if s.service:
                 taken.add(s.service["name"])
             fresh[key] = s
             local_addresses.update(s.addresses)
+        self._local_ids = {registry.identity(info) for info in found["servers"]}
         for u in units or ():
             if u["name"] not in taken:
                 key = f"service:{u['name']}"
                 s = self.servers.get(key) or Server(key, u["name"], "service")
                 s.service = u
                 fresh[key] = s
-        grouped: dict[str, list] = {}
-        for name, address in found["remote"].items():
-            grouped.setdefault(address, []).append(name)
-        for address, names in grouped.items():
-            if address in local_addresses:
-                continue
+        for address, names in found["remote"].items():
+            if address in local_addresses or self._here.get(address) in self._local_ids:
+                continue  # a server of this computer, which has its card (devices.toml may name it by an IP of ours)
             key = f"remote:{address}"
             s = self.servers.get(key) or Server(key, address.partition("://")[2], "remote", [address])
             s.declared = sorted(names)
             fresh[key] = s
         for key, old in self.servers.items():
             if old.address and (key not in fresh or fresh[key].address != old.address):
-                self.submit(self.actions, lambda a=old.address: self.backend.forget(a), lambda _: None)
+                self._forget_address(old.address)
         self.servers = fresh
         self.add_service.setEnabled(self._systemd)
         self.add_sim.setEnabled(not any(s.name == "sim" for s in fresh.values() if s.origin == "local"))
@@ -393,13 +454,28 @@ class Manager(QtWidgets.QMainWindow):
             if s.address and not s.probing and s.origin != "service":
                 self._probe(s)
 
+    def _forget_address(self, address: str) -> None:
+        """Close the connection to an address no card shows any more, and forget its devices' UIs."""
+        self.submit(self.actions, lambda: self.backend.forget(address), lambda _: None)
+        self._uis.pop(address, None)
+
     def _probe(self, s: Server) -> None:
         s.probing = True
-        address = s.address
+        address, entry = s.address, s.entry
+
+        def ask():  # (on a worker) what it says, and why it runs older code than its folders hold, if it does
+            result = self.backend.probe(address)
+            return {**result, "outdated": extensions.outdated(entry, result["devices"])}
 
         def done(result):
             s.probing = False
             if self.servers.get(s.key) is not s:
+                return
+            if s.origin == "remote" and registry.identity(result["info"]) in self._local_ids:
+                self._here[address] = registry.identity(result["info"])  # a server of this computer after all
+                self.servers.pop(s.key)
+                self._forget_address(address)
+                self.render()
                 return
             if s.probe is not None and self.tray is not None:  # an agent that arrived since the last look
                 before = {c["pid"] for c in s.probe["clients"] or () if c["agent"]}
@@ -419,8 +495,7 @@ class Manager(QtWidgets.QMainWindow):
             s.probe, s.probed_at, s.error = result, now, None
             if s.origin == "remote":
                 s.name = result["info"].get("server") or s.name
-            for dev in result["devices"]:  # its UIs found out before a right-click on its tile asks for them
-                self.device_uis(s, dev)
+            self._look_up_uis(s)  # its devices' UIs found out before a right-click on a tile asks for them
             self._fetch_previews(s)
             self._changed(s)
 
@@ -431,15 +506,15 @@ class Manager(QtWidgets.QMainWindow):
             s.probe, s.error, s.rates = None, str(exc) or type(exc).__name__, {}
             self._changed(s)
 
-        self.submit(self.probes, lambda: self.backend.probe(address), done, failed)
+        self.submit(self.probes, ask, done, failed)
 
     def _fetch_previews(self, s: Server) -> None:
         """Fetch the last frame of each device's first stream, where a new one was published."""
         if not self.previews_on or not self.isVisible() or not s.address or not s.probe:
             return
-        limit = PREVIEW_LIMIT // 8 if s.address.startswith("tcp://") else PREVIEW_LIMIT
+        limit = _preview_limit(s)
         for name, d in s.probe["devices"].items():
-            stream = preview_stream(d)
+            stream = preview_stream(d, self.preview_choice(name), s.shown.get(name, (None,))[0])
             if stream is None:
                 s.previews.pop(name, None)
                 continue
@@ -498,7 +573,7 @@ class Manager(QtWidgets.QMainWindow):
                 return
             if self._detail and self._detail[1] == key and back != key:  # on show, under a new key (a service
                 self._detail = (self._detail[0], back, *self._detail[2:])  # started, a rename): it follows
-        self.sidebar.sync(servers, len(self.agents()), self._scanned)
+        self.sidebar.sync(servers, len(self.agents()), self._scanned, self.outdated_here)
         if page is self.devices_page:
             self.devices_page.sync(servers, self._scanned, self.previews_on)
         elif page is self.servers_page:
@@ -546,7 +621,8 @@ class Manager(QtWidgets.QMainWindow):
         if s is None:
             return
         self._follow = None
-        self._uis = {k: (v[0], -math.inf) if k[1] == name else v for k, v in self._uis.items()}  # ask again
+        if s.address in self._uis:  # its UIs looked up again (manifests and your list of extensions change)
+            self._uis[s.address] = -math.inf, *self._uis[s.address][1:]
         self._recipes_at = -math.inf
         from_server = self.pages.currentWidget() is self.server_page
         self._back = ("server", key) if from_server else "devices"
@@ -625,7 +701,9 @@ class Manager(QtWidgets.QMainWindow):
         open_ok, why = self.can_open(s)
         for ui_ in uis:
             item("window", f"Open {ui_.title}", lambda ui_=ui_: self.open_ui(s, name, ext, ui_), open_ok,
-                 why or f"Its extension's {'panel' if ui_.panel else 'app'}, in a window of its own")
+                 why or f"Its extension's {ui_.kind}, in a window of its own")
+        if self.previews_on and d and sum(n != "state" for n in d["streams"]) > 1:
+            self.add_preview_choices(menu.addMenu(ui.icon("live"), "Preview shows"), s, name)
         menu.addSeparator()
         can_pause, why = self.can_pause(d)
         if paused:
@@ -654,11 +732,13 @@ class Manager(QtWidgets.QMainWindow):
         if running and (u or self.started_here(s.pid)):  # a service, or a server this window started
             menu.addAction(ui.icon("refresh"), "Restart").triggered.connect(
                 lambda *_: self.restart_server(s, ask=True))
+        if self.update_plan(s):
+            menu.addAction(ui.icon("up"), "Update").triggered.connect(lambda *_: self.update_servers([s]))
         if u and running:
             menu.addAction(ui.icon("stop"), "Stop").triggered.connect(lambda *_: self.service_action(s, "stop"))
         elif running and s.pid and s.pid != os.getpid():
             menu.addAction(ui.icon("stop"), "Stop").triggered.connect(lambda *_: self.stop_server(s))
-        if u or (running and server_log(s.name).is_file()):
+        if self.log_source(s):
             menu.addAction(ui.icon("logs"), "Logs").triggered.connect(lambda *_: self.show_logs(s))
         config = server_file(s)
         if config is not None and config.suffix == ".toml":
@@ -756,28 +836,49 @@ class Manager(QtWidgets.QMainWindow):
     def live_view(self, s: Server, device: str) -> None:
         command = [sys.executable, "-m", "insthub", "-a", s.address, "view", device]
         self._start(f"the live view of {device}",
-                    lambda: spawn(command, ui_log(device, "view"), f"The live view of {device}"))
+                    lambda: spawn(command, ui_log(device), f"The live view of {device}"))
 
     def device_uis(self, s: Server, device: str) -> tuple | None:
         """What a device can open here, as extensions.device_uis() says: (its extension, its UIs, why
-        it has none); None until a worker has found out (it reads manifests, and may ask systemd),
-        after which the window renders again.  Asked again after UIS_FRESH seconds, and when the
-        device's page opens, since manifests and your list of extensions change."""
+        it has none); None until a worker has found out (see _look_up_uis)."""
         d = s.device(device)
-        if d is None or not d.get("extension") or not s.address:
+        wanted = extensions.named(d) if d else None
+        if wanted is None or not s.address:
             return None, [], None
-        key, address = (s.address, device, d["extension"]), s.address
-        known, asked = self._uis.get(key, (None, -math.inf))
-        if time.monotonic() - asked > UIS_FRESH:
-            self._uis[key] = known, time.monotonic()  # (what was known stays on show meanwhile)
+        self._look_up_uis(s)
+        _, extension_of, found = self._uis.get(s.address, (None, {}, {}))
+        return found.get(device) if extension_of.get(device) == wanted else None
 
-            def found(result):
-                self._uis[key] = result, self._uis.get(key, (None, 0.0))[1]
+    @staticmethod
+    def _with_extensions(s: Server) -> dict[str, dict]:
+        """The devices of a server that name an extension (name -> what it said about itself)."""
+        devices = s.probe["devices"] if s.probe else {}
+        return {name: d for name, d in devices.items() if extensions.named(d)}
+
+    def _look_up_uis(self, s: Server) -> None:
+        """Find out on a worker what the devices of a server that name an extension can open here
+        (extensions.server_uis: it reads manifests and the registry, and may ask systemd), for all of
+        them at once: unless that was found out for the same devices and extensions less than
+        UIS_FRESH seconds ago (manifests and your list of extensions change), or is under way.
+        What was known stays on show meanwhile; the window renders again if anything changed."""
+        address, devices = s.address, self._with_extensions(s)
+        extension_of = {name: d["extension"] for name, d in devices.items()}
+        asked, known, _ = self._uis.get(address, (-math.inf, None, {}))
+        if not devices or address in self._uis_asking or (
+                known == extension_of and time.monotonic() - asked <= UIS_FRESH):
+            return
+        self._uis_asking.add(address)
+        asked = time.monotonic()
+
+        def found(result):
+            self._uis_asking.discard(address)
+            before = self._uis.get(address)
+            self._uis[address] = asked, extension_of, result
+            if before is None or before[1:] != (extension_of, result):
                 self.render()
 
-            self.submit(self.actions, lambda: extensions.device_uis(d, address), found,
-                        lambda exc: found((None, [], pages.error_text(exc))))
-        return known
+        self.submit(self.probes, lambda: extensions.server_uis(devices, address), found,
+                    lambda exc: found(dict.fromkeys(devices, (None, [], ui.error_text(exc)))))
 
     def known_recipes(self) -> tuple | None:
         """Every recipe, as recipes.available() says: (recipes, the files that cannot be read); None
@@ -880,13 +981,28 @@ class Manager(QtWidgets.QMainWindow):
         self.act("Editing devices.toml", lambda: registry.edit_static_devices(remove=names),
                  lambda path: f"removed from {path}")
 
-    def show_logs(self, s: Server) -> None:
+    def log_source(self, s: Server) -> tuple | None:
+        """Where a server's log is, as (key, title, load: what reads it, on a worker thread): its
+        service's journal, else the output of a server this window started, else what the server
+        keeps of its own log (the server call "logs": for one started in a terminal, a program that
+        hosts its own, one on another computer).  None for a server whose insthub is too old for it."""
         if s.service:
             name = s.service["name"]
-            key, title, load = name, f"{service.PREFIX}{name}: log", lambda: service.journal(name, 500)
-        else:
-            path = server_log(s.name)
-            key, title, load = str(path), f"{s.name}: output", lambda: tail(path)
+            return name, f"{service.PREFIX}{name}: log", lambda: service.journal(name, 500)
+        path = server_log(s.name)
+        if s.origin == "local" and path.is_file():
+            return str(path), f"{s.name}: output", lambda: tail(path)
+        address = s.address
+        if address and "logs" in ((s.probe or {}).get("info") or {}).get("features", ()):
+            return (f"logs:{address}", f"{s.name}: log",
+                    lambda: log_text(self.backend.client(address).logs(500)))
+        return None
+
+    def show_logs(self, s: Server) -> None:
+        source = self.log_source(s)
+        if source is None:
+            return
+        key, title, load = source
         dialog = self._logs.get(key)
         if dialog is None:
             dialog = self._logs[key] = pages.LogDialog(self, title, load)
@@ -919,16 +1035,7 @@ class Manager(QtWidgets.QMainWindow):
         if ask and not self.confirm(f"Restart {s.name}?", f"Restart {s.name}?\n\nPrograms using it get an error "
                                     "for calls under way, then reconnect by themselves.", "Restart"):
             return
-        key = s.key
-        mark = {"key": key, "old": s.pid, "proc": None, "unit": (s.service or {}).get("name")}
-        self.restarting[key] = mark  # one restart at a time; the page comes back once it is over
-
-        def over():
-            if self.restarting.get(key) is mark:  # (not a later restart's)
-                del self.restarting[key]
-                self.render()
-
-        QtCore.QTimer.singleShot(30_000, over)  # it did not come back in time: stop waiting for it
+        mark, over = self._restarting(s)
         if s.service:
             name = s.service["name"]
             what = "restart" if s.origin == "local" else "start"
@@ -959,11 +1066,81 @@ class Manager(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(800, self.refresh)
 
         def failed(exc):
-            self.say(f"Cannot restart {name}: {pages.error_text(exc)}", 8000)
+            self.say(f"Cannot restart {name}: {ui.error_text(exc)}", 8000)
             over()
 
         self.say(f"Restarting {name}...", 0)
         self.submit(self.actions, stop_and_start, started, failed)
+
+    def _restarting(self, s: Server) -> tuple[dict, object]:
+        """Note that a server restarts: one restart at a time, and the page on show comes back once a
+        scan sees its new process (see render).  Returns (the mark, `over`: what forgets it, when the
+        restart failed); it is forgotten by itself after 30 s, if the server did not come back."""
+        key = s.key
+        mark = {"key": key, "old": s.pid, "proc": None, "unit": (s.service or {}).get("name")}
+        self.restarting[key] = mark
+
+        def over():
+            if self.restarting.get(key) is mark:  # (not a later restart's)
+                del self.restarting[key]
+                self.render()
+
+        QtCore.QTimer.singleShot(30_000, over)
+        return mark, over
+
+    def update_plan(self, s: Server) -> list[str]:
+        """What Update does for a server, as steps of service.plan: for a service, what that rule says
+        (its unit written anew when it is stale; a restart when it runs and its unit or its code
+        changed); for a server this window started that runs older code, a restart; else nothing (a
+        server started in a terminal is restarted there)."""
+        if s.service:
+            return service.plan(s.service, s.outdated)
+        return ["restart"] if s.outdated and s.origin == "local" and self.started_here(s.pid) else []
+
+    def update_servers(self, servers: list[Server]) -> None:
+        """Update on a server's page or card, and Update all on the Servers page: after one question
+        that lists what each server gets (what restarts, and what is old about a unit written anew), a
+        service is brought up to date by service.update on a worker (which looks again and decides by
+        the same rule), and a server this window started is restarted as Restart does."""
+        plans = [(s, steps) for s in servers if (steps := self.update_plan(s)) and s.key not in self.restarting]
+        if not plans:
+            return
+        title = f"Update {plans[0][0].name}?" if len(plans) == 1 else f"Update {len(plans)} servers?"
+
+        def told(s: Server, steps: list[str]) -> str:
+            stale = (s.service or {}).get("stale")
+            return f"{s.name}: {service.plan_text(steps)}" + (f" (its unit: {stale})" if stale else "")
+
+        text = "\n".join(told(s, steps) for s, steps in plans)
+        if any("restart" in steps for _, steps in plans):
+            text += "\n\nPrograms using a server that restarts get an error for calls under way, then reconnect by themselves."
+        if not self.confirm(title, text, "Update"):
+            return
+        for s, _ in plans:
+            if not s.service:
+                self.restart_server(s)  # (asked above)
+        names = [s.service["name"] for s, _ in plans if s.service]
+        if not names:
+            return
+        overs = {s.service["name"]: self._restarting(s)[1] for s, steps in plans if s.service and "restart" in steps}
+        records = []
+
+        def run():
+            records.extend(service.update(names))
+            if any(r.error for r in records):
+                raise BusError("\n\n".join(r.text() for r in records))
+            return records
+
+        def after():  # a restart that did not happen: its page need not wait for it
+            restarted = {r.name for r in records if "restart" in r.done}
+            for name, over in overs.items():
+                if name not in restarted:
+                    over()
+
+        units = ", ".join(f"{service.PREFIX}{name}" for name in names)
+        self.act(f"Updating {units}", run,
+                 lambda done: "; ".join(f"{service.PREFIX}{r.name}: {r.outcome or 'up to date'}" for r in done),
+                 after=after)
 
     def set_login(self, s: Server, on: bool) -> None:
         """Start a service at every login, or no longer."""

@@ -228,18 +228,39 @@ account made it or may write to it):
       rf.json                                                   ["synth", "sa"]
 ```
 
-The `.json` file also says two things that only programs on this computer
-need, so the server never sends them over the network: the Python it runs in,
-and for each device the folders its code comes from. From those folders, the
-window and `insthub ext list` find the device's
-[extension](design.md#how-a-device-finds-its-extension).
+The `.json` file also says three things that only programs on this computer
+need, so the server never sends them over the network:
+
+| Key | What it holds | Who reads it |
+|---|---|---|
+| `python` | the Python the server runs in | the window, to say when a device added to it needs another Python |
+| `folders` | for each device, the folders its code comes from | the window and `insthub ext list`, to find the device's [extension](design.md#how-a-device-finds-its-extension); the window and `insthub list`, to compare the version the device states with its extension's (see the `code` row) |
+| `code` | the files of the code the server loaded, each with its modification time (`st_mtime_ns`) when the server first listed it (again after `importlib.reload`): insthub's own modules, and those in its devices' folders but not in a Python environment there (a project's `.venv`) | the window and `insthub list`, to tell that the server runs older code than the disk holds (see [versions](design.md#versions)) |
+
+The other keys are those of the server's hello (see [what travels on a
+connection](#what-travels-on-a-connection)): its name, pid, start time,
+addresses, devices, protocol, version and features. The server writes the
+file when it starts, again when a device is added, and again within about a
+second when its process has loaded more modules (a helper that a driver
+imports inside a command), so that `code` lists them too.
 
 `insthub.device("synth")` looks, in this order:
 
 1. at servers inside the same program,
 2. through the `.json` files of that folder, for a server that lists `synth`,
 3. in a small table you write by hand for devices on other computers
-   (`~/.config/insthub/devices.toml`).
+   (`~/.config/insthub/devices.toml`),
+4. by asking the servers on other computers that this table names which
+   devices they have (each gets about a second to answer, on a connection
+   closed at once, and the answers are kept for a few seconds). A server that
+   two addresses reach, or a server of this computer named by its network
+   address, is one server: it is recognised by its name, pid and start time,
+   not by its addresses, since a server elsewhere may announce the very
+   addresses of one here (`tcp://127.0.0.1` and the same port). One
+   function, `registry.remote_addresses()`, lists those servers, for this
+   lookup and for everything else that looks beyond this computer
+   (`insthub list`, `insthub.states()`, the window, the agents'
+   `list_devices`).
 
 It then opens one connection to that server and keeps it. Asking for a second
 device of the same server reuses the connection.
@@ -302,6 +323,8 @@ of a long sweep.
 | The server program crashes or is restarted. | Nothing can be done from inside. | Calls under way raise `ConnectionLost`. The next call reconnects. Subscriptions resume by themselves when the server is back. |
 | Somebody pauses the device (Pause in the window, `insthub pause`, `dev.bus.pause()`). | Refuses every call from then on, lets the command already running finish, then closes the session. Runs none of its commands, properties or periodic tasks until it is resumed. | Calls raise `DevicePaused` (a `DeviceNotConnected`) at once. `pause()` itself returns once the running command has finished. |
 | The server is stopped (Ctrl-C, or its service is stopped). | Lets the running command finish, cancels the ones still waiting, closes every instrument. | Waiting calls raise an error. |
+| Something fails inside the server where no caller sees it (a periodic task, a lost instrument, a thread of the driver). | Logs it, and keeps the last 1000 log lines of its process in memory. | `insthub logs SERVER`, from any computer, or **Logs** in the window. |
+| A service's server crashes again and again. | systemd restarts it 5 s later each time, and gives up after 5 starts within 5 minutes. | The service is *failed*; `insthub service list` says how often it was restarted. |
 
 Two promises are worth spelling out:
 
@@ -334,7 +357,7 @@ survive the trip as what they were. The exact list is in the
 A connection starts with the bytes `INSTHUB1` from both sides, then the
 server's *hello*: its name, process id, devices, the protocol number, the
 insthub version it runs and its *features*, a list of what it can do beyond
-the first version of the protocol (`"pause"`, `"meta"`, `"dangerous"`, ...). A
+the first version of the protocol (`"pause"`, `"meta"`, `"dangerous"`, `"logs"`). A
 lab runs several insthub versions at once (servers started before a `git
 pull`, other computers), so:
 
@@ -372,6 +395,7 @@ four layers, each knowing only the ones below it (an arrow means "uses"):
 flowchart TB
     manager["<b>manager.py</b><br/>the window: refresh loop, navigation, actions, tray icon, main()"]
     pages["<b>pages.py</b><br/>what each page shows"]
+    controls["<b>controls.py</b><br/>a device's settings and commands<br/>(panels embed them too)"]
     forms["<b>forms.py</b><br/>the dialogs that set things up"]
     inventory["<b>inventory.py</b><br/>what is known of servers and devices,<br/>and how it is asked (no Qt)"]
     widgets["<b>widgets.py</b><br/>colours, icons, tiles<br/>(knows nothing of insthub)"]
@@ -379,6 +403,8 @@ flowchart TB
     manager --> forms
     manager --> inventory
     pages --> inventory
+    pages --> controls
+    controls --> widgets
     pages --> widgets
     forms --> widgets
     manager --> widgets
@@ -400,7 +426,8 @@ sequenceDiagram
         G->>W: probe()
         W->>S: info, devices, $state of each device
         S-->>W: answers
-        W-->>G: what it said, and how fast it answered
+        W->>W: its code on disk, its manifests: out of date?
+        W-->>G: what it said, how fast it answered, and whether it is out of date
     end
     opt a stream has a new frame (and the window is open)
         G->>W: latest()
@@ -417,7 +444,10 @@ sequenceDiagram
 - **Properties** are read only when a device's page opens, and **commands** run
   only when you ask. Both wait in the device's line like any other request.
   The control for each property, and the hints under a command, come from the
-  device's description (its metadata), not from reading the instrument.
+  device's description (its metadata), not from reading the instrument. These
+  two tabs are `insthub.controls`, which a panel can embed too: there they
+  call through the device's proxy, and in the window through its worker
+  threads.
 - **Live view** opens `insthub view` as a program of its own.
 - **Extensions** are read, never run: the New server dialog and the Settings
   page list the devices of the manifests that `extensions.discover()` finds,
@@ -425,10 +455,25 @@ sequenceDiagram
   extension's code; the server it starts does, in the extension's Python.
 - **Open** on a device's page starts a UI of the device's extension
   (`extensions.launch`) as a program of its own, with the extension's Python:
-  an app, or a panel that `insthub panel` puts in a window. Which UIs a device
-  has is found out on a worker thread (`extensions.device_uis`, from the
-  folders in its server's `.json` file when the server runs here) and looked
-  up again every 30 seconds and whenever the page opens.
+  an app, or a panel that `insthub panel` puts in a window (one button, or
+  one with a menu of them when there are several). Which UIs a server's
+  devices have is found out on a worker thread, for all of them at once
+  (`extensions.server_uis`, from the folders in its server's `.json` file
+  when the server runs here), after a probe or when the page opens, at most
+  every 30 seconds unless the devices or their extensions change.
+- **Out of date**: with each probe of a server on this computer, the worker
+  thread also compares the files in the server's `.json` file with the disk,
+  and the versions its devices state with their manifests, where a manifest
+  changed since the server started (`extensions.outdated`, the rule `insthub
+  list` follows too). A server that
+  runs older code than its folders hold gets an OUT OF DATE mark on its card
+  and above its devices, and its page says what changed and how to restart
+  it. **Update** on its page or card, and **Update all** on the Servers
+  page, bring servers up to date: a service through `service.update` on a
+  worker thread (the same function as `insthub service update`, which also
+  writes anew a unit an older insthub wrote), a server the window started by
+  restarting it. With each scan, the worker also asks whether the window's
+  own insthub code changed since it started (`extensions.outdated_here`).
 - **What the window starts** (servers, the live view, UIs) runs in a session
   of its own, so it outlives the window, and writes its output to a log file
   in the runtime folder (`inventory.spawn`). When one of them ends with an

@@ -1,10 +1,12 @@
 """The look of `insthub gui`: colours, the stylesheet, line icons and the custom
-widgets the manager window is made of.  Nothing here knows about servers or
-devices; manager.py fills these widgets in.
+widgets the manager window and the device controls (controls.py) are made of.
+Nothing here knows about servers or devices; manager.py fills these widgets in.
 
     Theme, theme(), use()   colour tokens for light and dark; one is current at a time
     stylesheet(), palette() the Qt stylesheet and palette made from the current theme
     icon(), draw_icon()     line icons on a 16 x 16 grid, drawn (no icon theme needed)
+    label(), button(), card(), table(), fill(), confirm(), esc(), short(), error_text()
+                            small widgets and the text they show
     Pill                    a status: a coloured dot and a word, on a tint of the colour
     Tag                     a word in a box beside a title, such as SIM
     Switch                  an on/off toggle
@@ -164,9 +166,29 @@ _MEDIUM = QtGui.QFont.Weight.Medium
 
 
 # ---------------------------------------------------------------- the stylesheet
+def role_stylesheet(t: Theme, pt: float) -> str:
+    """The look of the widgets that say what they are (`role`, `card`, `kind`): muted and small
+    text, an error in red, a card, the line between rows, code, the button of the main action
+    (whose icon is drawn for it).  Part of the window's stylesheet; alone, what widgets made from
+    these (controls.py) bring into a program of their own, whose other widgets keep their look.
+    `pt`: the base font size."""
+    return f"""
+QLabel[role="muted"] {{ color: {t.muted}; }}
+QLabel[role="small"] {{ color: {t.muted}; font-size: {pt * 0.9:.1f}pt; }}
+QLabel[role="error"] {{ color: {STATUS['bad']}; }}
+QFrame[card="true"] {{ background: {t.surface}; border: 1px solid {t.border}; border-radius: 12px; }}
+QFrame[role="rule"] {{ background: {t.border}; border: none; }}
+QPlainTextEdit[role="code"], QLineEdit[role="code"] {{ font-family: monospace; }}
+QPushButton[kind="primary"] {{ background: {t.accent}; border: 1px solid {t.accent}; border-radius: 8px;
+                               padding: 6px 14px; color: {t.on_accent}; font-weight: 600; }}
+QPushButton[kind="primary"]:hover {{ background: {t.accent_hover}; border-color: {t.accent_hover}; }}
+QPushButton[kind="primary"]:disabled {{ background: {t.window}; border-color: {t.border}; color: {t.muted}; }}
+"""
+
+
 def stylesheet(t: Theme, pt: float) -> str:
     """The stylesheet of the window (its dialogs inherit it).  `pt`: the base font size."""
-    small, h1, h2 = pt * 0.9, pt * 1.7, pt * 1.15
+    h1, h2, small = pt * 1.7, pt * 1.15, pt * 0.9
     return f"""
 QMainWindow, QDialog {{ background: {t.window}; }}
 QWidget {{ color: {t.ink}; }}
@@ -177,13 +199,9 @@ QLabel {{ background: transparent; }}
 QLabel[role="h1"] {{ font-size: {h1:.1f}pt; font-weight: 600; }}
 QLabel[role="h2"] {{ font-size: {h2:.1f}pt; font-weight: 600; }}
 QLabel[role="brand"] {{ font-size: {h2:.1f}pt; font-weight: 700; }}
-QLabel[role="muted"] {{ color: {t.muted}; }}
-QLabel[role="small"] {{ color: {t.muted}; font-size: {small:.1f}pt; }}
 QLabel[role="label"] {{ color: {t.ink2}; }}
-QLabel[role="error"] {{ color: {STATUS['bad']}; }}
 QLabel#toast {{ background: {t.ink}; color: {t.surface}; border-radius: 9px; padding: 9px 16px; }}
-QFrame[card="true"] {{ background: {t.surface}; border: 1px solid {t.border}; border-radius: 12px; }}
-QFrame[role="rule"] {{ background: {t.border}; border: none; }}
+{role_stylesheet(t, pt)}
 QPushButton {{ background: {t.surface}; border: 1px solid {t.strong}; border-radius: 8px; padding: 6px 14px; }}
 QPushButton:hover {{ background: {t.hover}; }}
 QPushButton:pressed {{ background: {t.border}; }}
@@ -477,6 +495,7 @@ def button(text: str, icon_name: str | None = None, kind: str | None = None, tip
     if slot is not None:
         widget.clicked.connect(lambda *_: slot())
     widget.setCursor(Qt.CursorShape.PointingHandCursor)
+    widget.setFocusPolicy(Qt.FocusPolicy.TabFocus)  # a click leaves no accent ring on it: only Tab does, as on tiles
     return widget
 
 
@@ -503,6 +522,78 @@ def scroll_page(margins=(28, 4, 28, 28), spacing: int = 18):
     layout.setSpacing(spacing)
     area.setWidget(content)
     return area, layout
+
+
+def table(*headers: str) -> QtWidgets.QTableWidget:
+    """A table of text to read and pick a row from, not to edit: no grid, no row numbers."""
+    widget = QtWidgets.QTableWidget(0, len(headers))
+    widget.setHorizontalHeaderLabels(headers)
+    widget.verticalHeader().setVisible(False)
+    widget.verticalHeader().setDefaultSectionSize(34)
+    widget.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+    widget.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+    widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+    widget.setWordWrap(False)
+    widget.setShowGrid(False)
+    widget.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+    header = widget.horizontalHeader()
+    header.setStretchLastSection(True)
+    header.setHighlightSections(False)
+    header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+    header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    return widget
+
+
+def fill(widget: QtWidgets.QTableWidget, rows: list) -> None:
+    """Show rows of text in a table, reusing the cells so that selection and scrolling survive a refresh."""
+    blocked = widget.blockSignals(True)
+    widget.setRowCount(len(rows))
+    for r, row in enumerate(rows):
+        for c, value in enumerate(row):
+            item = widget.item(r, c)
+            if item is None:
+                item = QtWidgets.QTableWidgetItem()
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                widget.setItem(r, c, item)
+            text = "" if value is None else str(value)
+            if item.text() != text:
+                item.setText(text)
+                item.setToolTip(text if len(text) > 40 else "")
+    widget.blockSignals(blocked)
+
+
+def boxed(widget: QtWidgets.QWidget, margins=(0, 4, 0, 4)) -> QtWidgets.QFrame:
+    """A widget (a table) on a card of its own."""
+    frame, layout = card(margins=margins, spacing=0)
+    layout.addWidget(widget)
+    return frame
+
+
+def confirm(parent: QtWidgets.QWidget | None, title: str, text: str, action: str) -> bool:
+    """Ask before doing something: True only if `action` (the button's word, such as "Set") is clicked."""
+    box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Icon.Question, title, text,
+                                QtWidgets.QMessageBox.StandardButton.Cancel, parent)
+    yes = box.addButton(action, QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+    box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+    box.exec()
+    return box.clickedButton() is yes
+
+
+def esc(text) -> str:
+    """Text to show as itself in a label that takes rich text."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def error_text(exc: BaseException) -> str:
+    """An exception as people know it: 'ValueError: ...', also when it was raised in another program
+    (it keeps the name of its own type there: remote_type)."""
+    return f"{getattr(exc, 'remote_type', '') or type(exc).__name__}: {exc}"
+
+
+def short(value) -> str:
+    """A value in a line of text: its repr (text as it is), cut at 80 characters."""
+    text = repr(value) if not isinstance(value, str) else value
+    return text if len(text) <= 80 else text[:77] + "..."
 
 
 def pill_width(font: QtGui.QFont, text: str) -> float:

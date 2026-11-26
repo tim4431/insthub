@@ -2,8 +2,11 @@
 says its devices come from, and `insthub ext` / `insthub check` (see docs/design.md#extensions)."""
 import json
 import os
+import shlex
+import stat
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -39,6 +42,9 @@ panel = "hpdrv_ui:make"
 """
 
 
+HP_UI = "def make(device, parent=None):\n    raise RuntimeError('never made')\n"  #: hpdrv_ui.py: what HP's UIs load
+
+
 def extension(folder, manifest=HP, python=True, **files):
     """An extension's folder: its manifest, a virtualenv's python (a stand-in) and other files."""
     folder.mkdir(parents=True, exist_ok=True)
@@ -51,10 +57,28 @@ def extension(folder, manifest=HP, python=True, **files):
     return folder
 
 
+def own_python(folder) -> Path:
+    """A virtualenv's python for an extension (FOLDER/.venv/bin/python) that is not the Python running
+    the tests, as a real one is not: a stand-in that runs this Python with a library of its own,
+    vendorlib (in FOLDER/vendor), which only it can import."""
+    if os.name == "nt":
+        pytest.skip("the stand-in python is a shell script")
+    vendor = folder / "vendor"
+    vendor.mkdir(parents=True, exist_ok=True)
+    (vendor / "vendorlib.py").write_text("WHERE = 'the extension s own Python'\n")
+    python = folder / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text(f"#!/bin/sh\nPYTHONPATH=${{PYTHONPATH:+$PYTHONPATH:}}{shlex.quote(str(vendor))} "
+                      f'exec {shlex.quote(sys.executable)} "$@"\n')  # (last: what insthub puts first stays so)
+    python.chmod(0o755)
+    return python
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """A home of its own (your list of extensions), and the places discover() looks in, all empty."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # (else your list would be there)
     monkeypatch.delenv(extensions.ENV)
     monkeypatch.setattr(service, "units", list)
     return tmp_path / "home"
@@ -113,13 +137,16 @@ def test_a_manifest_is_read_as_data(tmp_path):
     (("[devices.analyzer]", "[devices.'my analyzer']"), "bad [devices.NAME] name 'my analyzer'"),
     (('panel = "hpdrv_ui:make"', ""), "[ui.quick] needs one of run = [...] (an app) and panel ="),
     (('title = "Spectrum analyzer"', 'panel = "x:y"'), "[ui.analyzer] needs one of run"),
-    (('run = ["-m"', 'run = [1, "-m"'), "[ui.analyzer] run: should be a list of arguments"),
+    (('run = ["-m"', 'run = [1, "-m"'), "[ui.analyzer] run: should be a list of one or more arguments"),
+    (('run = ["-m", "hpdrv_ui", "--address", "{address}", "--name", "{device}"]', "run = []"),
+     '[ui.analyzer] run: should be a list of one or more arguments, as ["-m", "mypackage.ui"], not []'),
 ])
 @pytest.mark.filterwarnings("ignore::insthub.config.ConfigWarning")  # (what it does not read: tested below)
 def test_what_makes_a_manifest_unusable_is_its_error(tmp_path, change, error):
     folder = extension(tmp_path / "hp", HP.replace(*change))
     ext = extensions.load(folder / extensions.MANIFEST)  # never raises
     assert not ext.usable and error in ext.error, ext.error
+    assert all(ui.run or ui.panel for ui in ext.ui.values())  # a UI that names nothing to start is none
     problems = extensions.check(folder)
     assert problems and all(p.startswith(f"{folder / extensions.MANIFEST}: ") for p in problems)
     assert any(error in p for p in problems)
@@ -306,6 +333,222 @@ def test_a_server_says_where_its_devices_code_is_on_this_computer_only(tmp_path)
     assert found.id == "hp8562a" and found.source == "device" and found.folder == folder
 
 
+def edited(path):
+    """Make a file look edited: a modification time one second later."""
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+
+def entry_of(name: str) -> dict:
+    """A server's registry entry, as its file has it (what another program on this computer reads)."""
+    return json.loads((insthub.registry.runtime_dir() / f"{name}.json").read_text())
+
+
+def test_a_server_lists_the_files_of_its_code_on_this_computer_only(tmp_path, monkeypatch):
+    """insthub's own modules and those in its devices' folders, with their times; not the libraries of a
+    Python environment inside such a folder (a project's .venv), and nothing the network hears."""
+    folder = tmp_path / "proj"
+    for lib, name in ((folder / ".venv" / "lib" / "python3" / "site-packages", "codevenvlib"),
+                      (folder / "vendor" / "dist-packages", "codedistlib")):
+        lib.mkdir(parents=True)
+        (lib / f"{name}.py").write_text("X = 1\n")
+        monkeypatch.syspath_prepend(str(lib))
+    extension(folder, HP, python=False, codedev="import insthub, codevenvlib, codedistlib\n\n"
+                                                "class Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("codedev:Dev", str(folder))
+    with insthub.Server("coded", [dev("dev")], tcp=0) as server:
+        code = entry_of("coded")["code"]
+        assert code[str(folder / "codedev.py")] == (folder / "codedev.py").stat().st_mtime_ns
+        assert code[insthub.server.__file__] == os.stat(insthub.server.__file__).st_mtime_ns  # insthub's own
+        assert not any("codevenvlib" in path or "codedistlib" in path or "numpy" in path for path in code)
+        with insthub.connect(server.addresses[-1]) as c:
+            assert "code" not in c.info()
+    assert extensions.outdated({"code": code}) == []
+
+
+def test_a_server_whose_code_changed_since_it_started_is_out_of_date(tmp_path):
+    folder = extension(tmp_path / "proj", HP, python=False, chghelper="X = 1\n", chggone="Y = 1\n",
+                       chgdev="import insthub, chghelper, chggone\n\nclass Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("chgdev:Dev", str(folder))
+    with insthub.Server("chg", [dev("dev")]) as server:
+        assert extensions.outdated(entry_of("chg")) == []                    # up to date
+        edited(folder / "chgdev.py")                                       # a driver edited, its helper not
+        assert extensions.outdated(entry_of("chg")) == ["proj/chgdev.py changed since it started"]
+        (folder / "chggone.py").unlink()
+        changed = ["proj/chgdev.py changed since it started", "proj/chggone.py was deleted since it started"]
+        assert extensions.outdated(entry_of("chg")) == changed
+        server.add(sim.Loopback())                                         # its entry written again ...
+        assert "loopback" in entry_of("chg")["devices"] and extensions.outdated(entry_of("chg")) == changed  # ... still
+        here = next(s for s in insthub.discover() if s["server"] == "chg")  # in this process: the same
+        assert extensions.outdated(here) == changed
+    own = {insthub.server.__file__: 0, insthub.client.__file__: 0}           # insthub updated (a git pull)
+    assert extensions.outdated({"code": own}) == ["insthub/client.py and insthub/server.py changed since it started"]
+    many = {str(tmp_path / "proj" / f"f{n}.py"): 0 for n in range(5)}
+    said = "proj/f0.py, proj/f1.py, proj/f2.py and 2 more were deleted since it started"  # (the first few)
+    assert extensions.outdated({"code": many}) == [said]
+
+
+def test_a_file_loaded_twice_stays_changed(tmp_path, monkeypatch):
+    """A script run as __main__ that is also imported by name is two modules of one file: an edit shows,
+    however often the entry is written."""
+    import importlib.util
+
+    folder = extension(tmp_path / "proj", HP, python=False,
+                       twicedev="import insthub\n\nclass Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("twicedev:Dev", str(folder))
+    spec = importlib.util.spec_from_file_location("twicedev_again", folder / "twicedev.py")
+    again = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(again)
+    monkeypatch.setitem(sys.modules, "twicedev_again", again)
+    with insthub.Server("twice", [dev("dev")]) as server:
+        edited(folder / "twicedev.py")
+        server.add(sim.Loopback())                                         # its entry written again
+        assert extensions.outdated(entry_of("twice")) == ["proj/twicedev.py changed since it started"]
+
+
+def test_a_module_reloaded_is_code_loaded_anew(tmp_path):
+    """importlib.reload (IPython's %autoreload) runs a module's code again, in the same module: a server started after
+    it runs the edited code, so it is not out of date.  Without it, the module still has the code loaded before."""
+    import importlib
+
+    folder = extension(tmp_path / "proj", HP, python=False, reldev="import insthub\n\nclass Dev(insthub.Device):\n"
+                                                                   "    pass\n")
+    module = sys.modules[config.load_object("reldev:Dev", str(folder)).__module__]
+    changed = ["proj/reldev.py changed since it started"]
+    with insthub.Server("rel", [module.Dev("dev")]):
+        edited(folder / "reldev.py")
+        assert extensions.outdated(entry_of("rel")) == changed
+    with insthub.Server("rel", [module.Dev("dev")]):                       # started again in this process: ...
+        assert extensions.outdated(entry_of("rel")) == changed               # ... the code loaded before, still
+    importlib.reload(module)
+    with insthub.Server("rel", [module.Dev("dev")]):
+        assert extensions.outdated(entry_of("rel")) == []
+
+
+def until(seconds, done):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end and not done():
+        time.sleep(0.02)
+    return done()
+
+
+def test_a_module_imported_after_it_started_is_listed_too(tmp_path):
+    """A helper that a driver imports inside a command (or when it connects): its server writes its entry again within
+    about a second, so an edit of the helper shows too."""
+    folder = extension(tmp_path / "proj", HP, python=False, latehelper="X = 'hi'\n",
+                       latedev="import insthub\n\nclass Dev(insthub.Device):\n    @insthub.command\n"
+                               "    def hello(self):\n        from latehelper import X\n        return X\n")
+    dev = config.load_object("latedev:Dev", str(folder))
+    helper = str(folder / "latehelper.py")
+    with insthub.Server("late", [dev("box")]) as server:
+        assert helper not in entry_of("late")["code"]
+        assert server.device("box").hello() == "hi"                         # imports it
+        assert until(5, lambda: helper in entry_of("late")["code"])
+        edited(folder / "latehelper.py")
+        assert extensions.outdated(entry_of("late")) == ["proj/latehelper.py changed since it started"]
+
+
+def test_listing_its_code_never_stops_a_server(tmp_path, monkeypatch):
+    """A module that importlib.util.LazyLoader put in sys.modules loads when one of its attributes is read, and may fail
+    to (an optional dependency missing): listing the code reads none, so the server starts and the module stays as it
+    was.  A list that cannot be made is left out of the entry: a notice is never a reason not to start."""
+    import importlib.util
+    import types
+
+    folder = extension(tmp_path / "proj", HP, python=False, lazyopt="raise ImportError('a dependency is missing')\n",
+                       lazydev="import insthub\n\nclass Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("lazydev:Dev", str(folder))
+    spec = importlib.util.spec_from_file_location("lazyopt", folder / "lazyopt.py")
+    spec.loader = importlib.util.LazyLoader(spec.loader)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setitem(sys.modules, "lazyopt", module)
+    with insthub.Server("lazy", [dev("dev")]):
+        assert str(folder / "lazyopt.py") in entry_of("lazy")["code"]       # listed (in its device's folder) ...
+        assert type(module) is not types.ModuleType                         # ... and not loaded
+
+    def broken(folders):
+        raise RuntimeError("cannot be listed")
+
+    monkeypatch.setattr(insthub.server, "_code", broken)
+    with insthub.Server("nocode", [dev("dev")]):
+        entry = entry_of("nocode")
+        assert "code" not in entry and extensions.outdated(entry) == []
+        assert any(s["server"] == "nocode" for s in insthub.discover())
+
+
+def test_insthub_list_says_which_server_is_out_of_date(tmp_path, capsys):
+    folder = extension(tmp_path / "proj", HP, python=False,
+                       lstdev="import insthub\n\nclass Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("lstdev:Dev", str(folder))
+    with insthub.Server("lst", [dev("box")]):
+        assert cli.main(["list"]) == 0
+        assert "out of date" not in capsys.readouterr().out                 # nothing while it is up to date
+        edited(folder / "lstdev.py")
+        assert cli.main(["list"]) == 0
+        lines = capsys.readouterr().out.splitlines()                       # under the server, above its devices
+        assert lines[0].startswith("lst  (pid ") and lines[2].split()[:2] == ["box", "Dev"]
+        assert lines[1] == "    out of date: proj/lstdev.py changed since it started; a restart loads the new code"
+        assert cli.main(["list", "--json"]) == 0                           # for programs: the same, as JSON
+        [listed] = json.loads(capsys.readouterr().out)
+        assert listed["server"] == "lst" and listed["outdated"] == ["proj/lstdev.py changed since it started"]
+        assert listed["devices"]["box"]["type"] == "Dev" and "connected" in listed["devices"]["box"]["status"]
+
+
+def test_a_program_knows_when_its_own_insthub_code_changed(tmp_path, monkeypatch):
+    """outdated_here: the files of insthub's own modules in this process, as a server lists its own (here
+    a folder that stands in for insthub's, with a module of it loaded)."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "selfmod.py").write_text("X = 1\n")
+    monkeypatch.setattr(insthub.server, "_PACKAGE", str(package))
+    monkeypatch.syspath_prepend(str(package))
+    import selfmod  # noqa: F401
+
+    assert extensions.outdated_here() == []                                # at the start: what it loaded
+    edited(package / "selfmod.py")
+    assert extensions.outdated_here() == ["pkg/selfmod.py changed since it started"]
+    monkeypatch.delitem(sys.modules, "selfmod")
+
+
+def test_what_cannot_be_judged_is_never_out_of_date(tmp_path):
+    """A server on another computer (no registry entry here), one of an older insthub (no "code"), and an
+    entry whose code is not what insthub writes."""
+    file = tmp_path / "gone.py"
+    folders = {"sa": [str(extension(tmp_path / "hp", HP))]}
+    versioned = {"sa": {"type": "Analyzer", "extension": "hp8562a", "extension_version": "0.1"}}
+    assert extensions.outdated(None, versioned) == []                         # elsewhere: never judged
+    assert extensions.outdated({"server": "old", "pid": 1}) == []           # an older insthub's entry
+    assert extensions.outdated({"server": "odd", "code": [str(file)]}) == []
+    assert extensions.outdated({"server": "odd", "code": {"gone.py": 0, str(file): "0", str(tmp_path): None}}) == []
+    assert extensions.outdated({"server": "old", "started": 0, "folders": folders}, versioned) == [  # versions: told
+        "the folder has hp8562a 0.3, it runs 0.1"]
+    assert extensions.outdated({"server": "old", "folders": folders}, versioned) == []  # (without its start time: not)
+
+
+def test_a_device_that_runs_another_version_than_its_folder_holds(home, tmp_path):
+    """Its manifest's version raised since the server started (a git pull): a restart loads the new code.  A class and
+    its manifest that disagree on disk already when it starts are `insthub check`'s business: a restart would not make
+    them agree, so it is never told to."""
+    folder = extension(tmp_path / "hp", HP, verdev="import insthub\n\nclass Analyzer(insthub.Device):\n"
+                                                   "    extension = 'hp8562a'\n    extension_version = '0.2'\n")
+    dev = config.load_object("verdev:Analyzer", str(folder))
+    with insthub.Server("ver", [dev("sa"), sim.Loopback()]) as server:
+        entry = entry_of("ver")
+        devices = {name: d._rt.describe() for name, d in server.devices.items()}
+        assert extensions.outdated(entry, devices) == []                     # 0.2 and 0.3 from the start: not older code
+        later = int(entry["started"] * 1e9) + 1000                          # the manifest changed after it started
+        os.utime(folder / extensions.MANIFEST, ns=(later, later))
+        assert extensions.outdated(entry, devices) == ["the folder has hp8562a 0.3, it runs 0.2"]
+        assert extensions.outdated(entry) == []                              # its devices are not known
+        assert extensions.outdated(entry, {"sa": {**devices["sa"], "extension_version": "0.3"}}) == []
+        extensions.add_folder(extension(tmp_path / "copy", HP))              # another copy, which it does not run
+        assert extensions.outdated({**entry, "folders": {"sa": [str(tmp_path)]}}, devices) == []
+    with insthub.Server("ver", [dev("sa")]) as server:                       # restarted: its class still says 0.2, ...
+        entry, devices = entry_of("ver"), {"sa": server.devices["sa"]._rt.describe()}
+        assert devices["sa"]["extension_version"] == "0.2" and extensions.outdated(entry, devices) == []  # ... no notice
+
+
 def test_a_device_s_extension(home, tmp_path):
     mine = extension(tmp_path / "mine")
     listed = extension(tmp_path / "listed")
@@ -326,7 +569,7 @@ def test_check_an_extension_and_import_its_drivers(tmp_path):
                        class Analyzer(insthub.Device):
                            extension = "hp8562a"
                            extension_version = "0.2"
-                       """)
+                       """, hpdrv_ui=HP_UI)
     with pytest.warns(ConfigWarning, match=r"says extension_version = \"0.2\", but the manifest's version is "
                                            r"\"0.3\""):
         assert extensions.check(folder, import_=True) == []
@@ -353,8 +596,8 @@ def test_check_import_loads_what_link_errors_names(tmp_path):
                            pass
 
                        class Analyzer:
-                           pass
-                       """)
+                           extension = ".csv"  # a plain class's own: insthub reads it only from a Device
+                       """, hpdrv_ui=HP_UI)
     assert extensions.check(folder) == []  # what they name is known only once imported
     where = f"{folder / extensions.MANIFEST}: [devices.analyzer] link_errors:"
     assert extensions.check(folder, import_=True) == [
@@ -385,7 +628,7 @@ def test_check_a_server_file(tmp_path, capsys):
     assert cli.main(["check", str(lab), "--import"]) == 1
     assert "pda: not a parameter" in capsys.readouterr().out
     assert cli.main(["check", str(folder)]) == 0
-    assert f"{folder}: no problems found (--import also imports the drivers)" in capsys.readouterr().out
+    assert f"{folder}: no problems found (--import also imports the drivers and the UIs)" in capsys.readouterr().out
 
 
 def test_check_a_server_file_next_to_its_drivers(tmp_path):
@@ -452,20 +695,25 @@ sys.exit(int(os.environ.get("APP_EXIT", "0")))
 
 def test_launch_starts_an_app_or_a_panel_with_the_extension_s_python(tmp_path, monkeypatch):
     run = '["app.py", "--address", "{address}", "--name", "{device}", "{other}", "{\\"a\\": 1}"]'
-    folder = extension(tmp_path / "hp", HP.replace("api = 1", f'api = 1\npython = "{sys.executable}"').replace(
-        'run = ["-m", "hpdrv_ui", "--address", "{address}", "--name", "{device}"]', f"run = {run}"), app=APP)
+    folder = extension(tmp_path / "hp", HP.replace(
+        'run = ["-m", "hpdrv_ui", "--address", "{address}", "--name", "{device}"]', f"run = {run}"), python=False,
+        app="import vendorlib\nprint('vendorlib', vendorlib.WHERE)\n" + APP)  # (only its own Python has vendorlib)
+    python = own_python(folder)
     ext = extensions.load(folder / extensions.MANIFEST)
+    assert ext.python == str(python)
     app = extensions.launch(ext, "analyzer", "sa", "tcp://labpc:8700")
     assert app.failure(wait=20) is None and not app.running and app.title == "Spectrum analyzer for sa"
-    said = app.log.read_text().splitlines()
-    assert app.log == insthub.registry.runtime_dir() / "ui" / "sa-analyzer.log"
-    assert said == ["args ['--address', 'tcp://labpc:8700', '--name', 'sa', '{other}', '{\"a\": 1}']",
+    started, *said = app.log.read_text().splitlines()
+    assert app.log == insthub.registry.runtime_dir() / "ui" / "sa" / "analyzer.log"
+    assert started.startswith("--- ") and started.endswith(f": {shlex.join(app.process.args)}")  # when, and what ran
+    assert said == ["vendorlib the extension s own Python",  # run by its Python, which has its libraries
+                    "args ['--address', 'tcp://labpc:8700', '--name', 'sa', '{other}', '{\"a\": 1}']",
                     f"cwd {folder}", f"path {folder}"]  # in its folder, which is first on its PYTHONPATH
     monkeypatch.setenv("APP_EXIT", "3")
     assert extensions.launch(ext, "analyzer", "sa", "tcp://labpc:8700").failure(wait=20).endswith(f"path {folder}")
 
     panel = extensions.launch(ext, "quick", "sa", "tcp://127.0.0.1:9")  # nothing listens there
-    assert panel.process.args == [sys.executable, "-m", "insthub", "-a", "tcp://127.0.0.1:9", "panel", "sa",
+    assert panel.process.args == [str(python), "-m", "insthub", "-a", "tcp://127.0.0.1:9", "panel", "sa",
                                   "hpdrv_ui:make", "--title=quick"]
     assert "error: cannot load the panel 'hpdrv_ui:make': No module named 'hpdrv_ui'" in panel.failure(wait=30)
     for device, address in (("../sa", "tcp://labpc:8700"), ("sa --x", "tcp://labpc:8700"), ("sa", "labpc:8700"),
@@ -494,7 +742,85 @@ def test_a_program_started_in_the_background_says_why_it_failed(tmp_path):
     assert slow.failure(wait=0.2) is None and slow.running               # it runs
     slow.process.kill()
     slow.process.wait(10)
-    assert slow.failure() is None and not slow.running                   # ended by a signal: by whoever sent it
+    assert slow.failure() is None and not slow.running                   # killed: by whoever sent it, on purpose
+    stopped = started("import os, signal; os.kill(os.getpid(), signal.SIGTERM)", "terminated")
+    assert stopped.failure(wait=20) is None                              # asked to stop (Stop): no news either
+    crashed = started("import os, sys; print('qt.qpa.plugin: Could not load the Qt platform plugin', flush=True); "
+                      "os.abort()", "crashed")                           # as Qt does when it cannot show a window
+    assert crashed.failure(wait=20) == "qt.qpa.plugin: Could not load the Qt platform plugin"
+    assert started("import os; os.abort()", "aborted").failure(wait=20) == "ended by SIGABRT"  # it said nothing
+
+
+def test_what_a_program_said_is_its_own_not_an_earlier_run_s():
+    from insthub import inventory
+
+    log = inventory.ui_log("sa", "quick")                                # a log keeps every run of what writes to it
+    first = inventory.spawn([sys.executable, "-c", "import sys; sys.exit('No module named PyQt6')"], log, "a")
+    assert first.failure(wait=20) == "No module named PyQt6"
+    again = inventory.spawn([sys.executable, "-c", "import sys; sys.exit(3)"], log, "b")
+    assert again.failure(wait=20) == "exit code 3"                      # it said nothing: not what the first said
+    runs = [line for line in log.read_text().splitlines() if line.startswith("--- ")]
+    assert len(runs) == 2 and runs[1].endswith("sys.exit(3)'")           # each run says when it started, and what
+
+
+def test_the_logs_of_a_device_s_windows_are_in_a_folder_of_its_own():
+    from insthub import inventory
+
+    ui = insthub.registry.runtime_dir() / "ui"
+    assert inventory.ui_log("a-b", "c") == ui / "a-b" / "c.log" != inventory.ui_log("a", "b-c")
+    assert inventory.ui_log("scope") == ui / "scope" / "_view.log" != inventory.ui_log("scope", "view")  # live view
+    for device, name in (("../x", None), ("sa", "../x"), ("sa/x", "q"), ("", None), ("sa", "_view")):
+        with pytest.raises(ValueError, match="bad (device|UI) name"):  # a device's name came over the network
+            inventory.ui_log(device, name)
+
+
+def test_the_uis_of_a_server_s_devices_are_found_all_at_once(home, tmp_path, monkeypatch):
+    listed = extension(tmp_path / "listed")
+    extensions.add_folder(listed)
+    calls = []
+    real = extensions.discover
+    monkeypatch.setattr(extensions, "discover", lambda: calls.append(1) or real())
+    devices = {f"sa{i}": {"name": f"sa{i}", "type": "Analyzer", "extension": "hp8562a"} for i in range(5)}
+    found = extensions.server_uis({**devices, "box": {"type": "Box", "extension": ["a", "list"]}}, "tcp://labpc:8700")
+    assert len(calls) == 1                                               # a server elsewhere: one discovery for all
+    assert all(found[name][0].folder == listed and len(found[name][1]) == 2 for name in devices)
+    assert found["box"] == (None, [], None)                              # what came over the network is only compared
+    mine = extension(tmp_path / "mine")
+    registered("here", {name: [str(mine)] for name in devices})
+    calls.clear()
+    found = extensions.server_uis(devices, "ipc:///nowhere.sock")         # a server here: its devices' own folders ...
+    assert {found[name][0].folder for name in devices} == {mine} and calls == []  # ... and no discovery at all
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="Unix permissions")
+def test_an_extension_that_other_users_may_change_runs_nothing(tmp_path, monkeypatch):
+    import grp
+
+    folder = extension(tmp_path / "hp", HP.replace("api = 1", f'api = 1\npython = "{sys.executable}"'))
+    manifest = folder / extensions.MANIFEST
+    assert extensions.load(manifest).usable                              # yours (also with a umask of 002): fine
+    manifest.chmod(manifest.stat().st_mode | stat.S_IWOTH)
+    ext = extensions.load(manifest)
+    assert ext.error.startswith(f"every user may change {manifest} (chmod o-w {manifest}): insthub runs nothing it "
+                                "names") and ext.python is None
+    with pytest.raises(ValueError, match="cannot be used"):
+        extensions.launch(ext, "analyzer", "sa", "tcp://labpc:8700")
+    assert any("every user may change" in p for p in extensions.check(folder, import_=True))  # nor imports anything
+    manifest.chmod(0o644)
+    folder.chmod(folder.stat().st_mode | stat.S_IWOTH)                   # its folder, as /tmp: anyone may put a
+    assert f"every user may change {folder} " in extensions.load(manifest).error  # module, or a manifest, in it
+    folder.chmod(folder.stat().st_mode & ~stat.S_IWOTH | stat.S_IWGRP)
+    with monkeypatch.context() as m:
+        m.setattr(extensions, "_shared_group", lambda gid: "lab")       # a group with others in it
+        assert f"the users of group lab may change {folder} (chmod g-w {folder})" in extensions.load(manifest).error
+        m.setattr(extensions, "_shared_group", lambda gid: None)        # a group of your own alone (a umask of 002
+        assert extensions.load(manifest).usable                          # makes files writable for it): fine
+    uid = os.getuid()
+    if uid != 0:
+        assert extensions._shared_group(0) == grp.getgrgid(0).gr_name    # root's group is not this user's alone
+        with monkeypatch.context() as m:
+            m.setattr(extensions.os, "getuid", lambda: uid + 1)          # as another user sees it
+            assert extensions.load(manifest).error.startswith(f"{manifest} belongs to another user: insthub runs")
 
 
 def test_insthub_open_opens_the_ui_of_a_device(home, tmp_path, monkeypatch, capsys):
@@ -519,3 +845,177 @@ def test_insthub_open_opens_the_ui_of_a_device(home, tmp_path, monkeypatch, caps
         assert cli.main(["-a", address, "open", "loopback"]) == 1
         assert "error: loopback: its extension, Simulated instruments, has no UI for it (insthub view loopback" in \
             capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- which Python runs what
+def test_what_runs_in_the_extension_s_python_is_run_there(tmp_path):
+    """Its driver is imported, and a server file of its devices checked, in the extension's own Python,
+    which has its libraries (vendorlib), not in the one that runs insthub."""
+    folder = extension(tmp_path / "hp", python=False, hpdrv="import vendorlib\n\nclass Analyzer:\n    pass\n",
+                       hpdrv_ui=HP_UI)
+    python = own_python(folder)
+    assert extensions.check(folder, import_=True) == []
+    lab = tmp_path / "servers" / "lab.toml"  # (no virtualenv next to it: its devices' extension says)
+    lab.parent.mkdir()
+    lab.write_text(f'[devices.a]\ndriver = "hpdrv:Analyzer"\npath = "{folder}"\n')
+    assert extensions.python_for(lab) == str(python)
+    assert extensions.check(lab, import_=True) == []  # as `insthub service install` checks it, in that Python
+    report = service.check_report(lab, sys.executable)  # (in this one, it would not load)
+    assert "No module named 'vendorlib'" in report["problem"]
+
+
+def test_the_python_a_server_file_is_served_with(tmp_path):
+    rig = tmp_path / "rig"
+    (rig / "servers").mkdir(parents=True)
+    lab = rig / "servers" / "lab.toml"
+    lab.write_text('[devices.echo]\ndriver = "insthub.sim:Loopback"\n')
+    assert extensions.python_for(lab) == sys.executable                  # nothing says: this one
+    (rig / ".venv" / "bin").mkdir(parents=True)
+    venv = rig / ".venv" / "bin" / "python"
+    venv.write_text("")
+    assert extensions.python_for(lab) == str(venv)                       # a virtualenv in its folder or the one above
+    assert extensions.python_for(rig / "srv.py") == str(venv)            # (a .py server's too)
+    drv = tmp_path / "drv"
+    (drv / ".venv" / "bin").mkdir(parents=True)
+    (drv / ".venv" / "bin" / "python").write_text("")
+    elsewhere = tmp_path / "elsewhere" / "lab.toml"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text(f'[devices.box]\ndriver = "box:Box"\npath = "{drv}"\n')
+    assert extensions.python_for(elsewhere) == str(drv / ".venv" / "bin" / "python")  # next to a device's code
+    assert extensions.device_python({"driver": "box:Box", "path": str(drv)}, None) == str(drv / ".venv" / "bin" /
+                                                                                          "python")
+    hp = extension(tmp_path / "hp")
+    lab.write_text(f'[devices.a]\ndriver = "hpdrv:Analyzer"\npath = "{hp}"\n'
+                   '[devices.s]\ndriver = "insthub.sim:SimScope"\n')         # (insthub's own has no say)
+    assert extensions.python_for(lab) == str(hp / ".venv" / "bin" / "python")  # its extension's, not the one by it
+    assert extensions.device_python({"driver": "hpdrv:Analyzer", "path": "hp"}, tmp_path) == \
+        str(hp / ".venv" / "bin" / "python")
+    assert extensions.device_python({"driver": "insthub.sim:SimScope"}, tmp_path) is None  # installed: no folder
+    assert extensions.device_python({"driver": "insthub.sim:SimScope", "path": str(extensions.OWN.parent)},
+                                    None) is None                        # insthub's own: any Python with insthub
+    other = extension(tmp_path / "other", HP.replace("hp8562a", "other"))
+    lab.write_text(f'[devices.a]\ndriver = "hpdrv:Analyzer"\npath = "{hp}"\n'
+                   f'[devices.b]\ndriver = "hpdrv:Analyzer"\npath = "{other}"\n')
+    assert extensions.python_for(lab) == str(venv)                       # they disagree: the one next to it
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="Unix permissions")
+def test_a_python_that_other_users_may_change_is_not_run(tmp_path, monkeypatch):
+    """The folder above an extension may be anyone's (/tmp): a virtualenv another user put there is not
+    run, nor one that another user may change, as for its manifest."""
+    shared = tmp_path / "shared"
+    folder = extension(shared / "mine", python=False)
+    folder.chmod(0o755)
+    (folder / extensions.MANIFEST).chmod(0o644)
+    planted = shared / ".venv" / "bin" / "python"
+    planted.parent.mkdir(parents=True)
+    planted.write_text("#!/bin/sh\n")
+    for path, mode in ((shared / ".venv", 0o755), (planted.parent, 0o755), (planted, 0o755), (shared, 0o1777)):
+        path.chmod(mode)
+    manifest = folder / extensions.MANIFEST
+    try:
+        ext = extensions.load(manifest)
+        assert ext.python is None and (f"its Python, {planted}: every user may change {shared} (chmod o-w {shared}); "
+                                       "insthub runs no Python that another user may change") in ext.error
+        with pytest.raises(ValueError, match="cannot be used"):
+            extensions.launch(ext, "analyzer", "sa", "tcp://labpc:8700")
+        assert any("every user may change" in p for p in extensions.check(folder, import_=True))  # nor imports
+        assert extensions.venv_python(folder) is None                    # nor serves a server file with it
+        assert extensions.python_for(folder / "lab.toml") == sys.executable
+        shared.chmod(0o755)                                              # the folder above is yours alone: it is
+        assert extensions.load(manifest).python == str(planted)
+        planted.parent.chmod(0o777)                                      # but not if anyone may change it inside
+        assert f"every user may change {planted.parent}" in extensions.load(manifest).error
+        planted.parent.chmod(0o755)
+        planted.chmod(0o775)
+        with monkeypatch.context() as m:
+            m.setattr(extensions, "_shared_group", lambda gid: "lab")    # a group with others in it
+            assert f"the users of group lab may change {planted} (chmod g-w {planted})" in \
+                extensions.load(manifest).error
+        planted.unlink()
+        planted.symlink_to(sys.executable)                               # a link, as in a virtualenv: only its owner
+        assert extensions.load(manifest).usable                          # may change it, whatever its mode says
+        declared = extension(tmp_path / "declared", HP.replace("api = 1", f'api = 1\npython = "{planted}"'),
+                             python=False)                               # named in a manifest: the same holds
+        assert extensions.load(declared / extensions.MANIFEST).python == str(planted)
+        shared.chmod(0o1777)
+        assert f"every user may change {shared}" in extensions.load(declared / extensions.MANIFEST).error
+        uid = os.getuid()
+        if uid != 0:
+            shared.chmod(0o755)
+            with monkeypatch.context() as m:
+                real = os.lstat
+
+                def lstat(path, *a, **k):  # as if another user had made the link
+                    st = real(path, *a, **k)
+                    return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, uid + 1, *st[5:])) \
+                        if Path(path) == planted else st
+
+                m.setattr(extensions.os, "lstat", lstat)
+                assert f"{planted} belongs to another user" in extensions.load(manifest).error
+    finally:
+        shared.chmod(0o755)
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid") or os.getuid() == 0, reason="Unix permissions (root writes anything)")
+def test_a_list_of_extensions_that_cannot_be_changed_says_so(home, tmp_path, capsys):
+    hp = extension(tmp_path / "hp")
+    extensions.add_folder(hp)
+    listed = extensions.user_file()
+    listed.chmod(0o444)
+    other = extension(tmp_path / "other", HP.replace("hp8562a", "other"))
+    try:
+        with pytest.raises(ValueError, match=f"^{listed}: "):           # what add_folder promises, not an OSError
+            extensions.add_folder(other)
+        with pytest.raises(ValueError, match=f"^{listed}: "):
+            extensions.remove_folder(hp)
+        assert cli.main(["ext", "add", str(other)]) == 1                 # said, without a traceback
+        assert capsys.readouterr().err.startswith(f"error: {listed}: ")
+        assert extensions.listed_folders() == [str(hp)]
+    finally:
+        listed.chmod(0o644)
+
+
+def test_check_import_loads_what_the_uis_name_and_what_the_classes_say(tmp_path):
+    text = HP.replace("api = 1", f'api = 1\npython = "{sys.executable}"')
+    folder = extension(tmp_path / "ui", text + textwrap.dedent(
+        """
+        [ui.broken]
+        panel = "hpdrv_ui:nope"
+
+        [ui.gone]
+        run = ["-m", "no_such_module_here", "--name", "{device}"]
+
+        [ui.script]
+        run = ["app.py"]
+        """), hpdrv="""\
+        import insthub
+
+        EXTENSION, VERSION = "hp8562b", "0.2"  # names, not literals: only importing tells what they are
+
+        class Analyzer(insthub.Device):
+            extension = EXTENSION
+            extension_version = VERSION
+        """, hpdrv_ui=HP_UI)
+    manifest = folder / extensions.MANIFEST
+    assert extensions.check(folder) == []                                # without importing, nothing runs
+    with pytest.warns(ConfigWarning, match=r"hpdrv:Analyzer says extension_version = \"0.2\", but the manifest's "
+                                           r"version is \"0.3\""):
+        problems = extensions.check(folder, import_=True)
+    said = ("hpdrv:Analyzer says extension = \"hp8562b\", but the manifest's id is \"hp8562a\": its devices would "
+            "announce an extension that has no UI here")
+    assert problems == [
+        f"{manifest}: [devices.analyzer] {said}", f"{manifest}: [devices.analyzer-sim] {said}",
+        (f"{manifest}: [ui.broken] cannot load the panel hpdrv_ui:nope with {sys.executable}: AttributeError: "
+         "module 'hpdrv_ui' has no attribute 'nope'"),
+        (f"{manifest}: [ui.gone] cannot find the module no_such_module_here with {sys.executable}: "
+         "ModuleNotFoundError: No module named 'no_such_module_here'")]  # (the panel and -m hpdrv_ui load: fine)
+    registered("here", {"sa": [str(folder)]})                            # a device of it: why it has no UI
+    ext, uis, why = extensions.device_uis({"name": "sa", "type": "Analyzer", "extension": "hp8562b"},
+                                          "ipc:///nowhere.sock")
+    assert (ext, uis) == (None, []) and why == (
+        f"it announces extension hp8562b, but the manifest of its folder, {manifest}, has id hp8562a: is the "
+        "`extension` of its class out of date? (insthub check FOLDER --import)")  # not "insthub ext add"
+    assert extensions.named({"extension": "hp8562b"}) == "hp8562b"
+    assert extensions.named({"extension": ""}) is extensions.named({"extension": ["x"]}) is extensions.named({}) \
+        is None

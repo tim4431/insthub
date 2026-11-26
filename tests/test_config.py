@@ -5,6 +5,7 @@ import re
 import sys
 import tomllib
 import warnings
+from pathlib import Path
 
 import pytest
 
@@ -265,6 +266,28 @@ def test_a_drivers_own_error_is_not_one_of_the_file(tmp_path, imports):
         config.check(cfg)
 
 
+def test_a_relative_path_counts_from_the_files_folder(tmp_path, imports, monkeypatch):
+    """Wherever `insthub serve` runs, as a service and the window run it (in the file's folder)."""
+    lab = tmp_path / "lab"
+    module(lab / "drivers", "reldrv")
+    module(tmp_path / "home" / "code", "homedrv")
+    for home in ("HOME", "USERPROFILE"):  # (where ~ is, on POSIX and on Windows)
+        monkeypatch.setenv(home, str(tmp_path / "home"))
+    (lab / "lab.toml").write_text('[devices.a]\ndriver = "reldrv:PowerSupply"\npath = "drivers"\nport = 1\n\n'
+                                  '[devices.b]\ndriver = "reldrv:PowerSupply"\npath = "./drivers/../drivers"\n'
+                                  'port = 2\n\n'
+                                  '[devices.c]\ndriver = "homedrv:PowerSupply"\npath = "~/code"\nport = 3\n\n'
+                                  f'[devices.d]\ndriver = "reldrv:PowerSupply"\npath = "{lab / "drivers"}"\n'
+                                  'port = 4\n')
+    (tmp_path / "elsewhere" / "drivers").mkdir(parents=True)  # (no reldrv here: it would not be found)
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    config.check("../lab/lab.toml")
+    _, devices = config.load("../lab/lab.toml")
+    assert [d._kwargs["port"] for d in devices] == [1, 2, 3, 4]
+    assert Path(sys.modules["reldrv"].__file__) == (lab / "drivers" / "reldrv.py").resolve()
+    assert Path(sys.modules["homedrv"].__file__) == (tmp_path / "home" / "code" / "homedrv.py").resolve()
+
+
 def test_a_file_that_is_no_toml_is_named(tmp_path):
     cfg = tmp_path / "lab.toml"
     cfg.write_text("[devices.x]\ndriver = \n")
@@ -272,6 +295,32 @@ def test_a_file_that_is_no_toml_is_named(tmp_path):
         config.load(cfg)
     with pytest.raises(config.ConfigError, match=rf"^cannot read {re.escape(str(tmp_path))}/missing.toml: No such"):
         config.check(tmp_path / "missing.toml")
+
+
+def test_a_table_that_is_not_one_is_a_problem_of_the_file(tmp_path, capsys):
+    """`devices = 3`, `a = 3` under [devices] or `server = "lab"`: said with the file's other problems, by
+    each command that reads the file, not an AttributeError."""
+    from insthub import cli, service
+
+    cfg = tmp_path / "lab.toml"
+    for text, said in (
+            ("devices = 3\n", ["devices: should be a table, as [devices.NAME], not 3"]),
+            ('server = "lab"\n\n[devices.echo]\ndriver = "insthub.sim:Loopback"\n',
+             ['server: should be a table, as [server], not "lab"']),
+            ('[devices]\na = 3\n\n[devices.b]\ndriver = "insthub.sim:Loopback"\nlazy = "yes"\n',
+             ['[devices] a: should be a table, as [devices.a] with its driver = "module:Class", not 3',
+              '[devices.b] lazy: should be true or false, not "yes"'])):
+        cfg.write_text(text)
+        for do in (config.check, config.load):
+            with pytest.raises(config.ConfigError) as e:
+                do(cfg)
+            assert str(e.value).splitlines() == said
+    assert cli.main(["serve", str(cfg)]) == 1                                   # insthub serve
+    assert capsys.readouterr().err.splitlines() == [f"error: {said[0]}", said[1]]
+    assert cli.main(["check", str(cfg), "--import"]) == 1                     # insthub check
+    assert capsys.readouterr().out.splitlines() == [f"{cfg}: {line}" for line in said]
+    report = service.check_report(cfg, sys.executable)                        # what insthub service install asks
+    assert report["problem"].splitlines() == said and report["fixes"] == ["file"]
 
 
 def test_two_folders_with_a_module_of_one_name(tmp_path, imports):

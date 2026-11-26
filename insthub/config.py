@@ -7,7 +7,8 @@
     [devices.psu]                # the section name is the device name on the bus
     driver = "mydriver:PowerSupply"   # "module:Class".  A Device subclass is used as is;
                                  # any other class is hosted with insthub.wrap().
-    path = "~/Code/mydriver"     # optional: where the module lives
+    path = "~/Code/mydriver"     # optional: where the module lives (a relative
+                                 # folder counts from this file's)
     lazy = true                  # optional: open on first use, not at start
     port = "/dev/ttyUSB0"        # every other key is a constructor argument
 
@@ -488,6 +489,10 @@ def _tables(devices: dict, advise: bool = False, problems: list[str] | None = No
     the rest of the file."""
     problems, unloadable, tables = list(problems or ()), [], []
     for name, spec in devices.items():
+        if not isinstance(spec, dict):  # (`a = 3` under [devices]): nothing in it to check
+            problems.append(f"[devices] {name}: should be a table, as [devices.{name}] with its driver = "
+                            f'"module:Class", not {_shown(spec)}')
+            continue
         try:
             cls, found = validate(name, spec, advise)
         except ImportError as e:  # said with what else is wrong with this table and the next ones
@@ -520,7 +525,8 @@ def _raise(problems: list[str], unloadable: list[ImportError]) -> None:
 
 
 def build_device(name: str, spec: dict) -> Device:
-    """The device of the table [devices.NAME].  Raises ImportError if its driver cannot be
+    """The device of the table [devices.NAME] (with no file around it, a relative `path` counts
+    from the working folder).  Raises ImportError if its driver cannot be
     loaded, ConfigError listing every problem of the table (see validate), or naming what
     meta, poll or dangerous names that the device does not have, and DriverError if the
     constructor of a Device subclass fails."""
@@ -545,10 +551,35 @@ def _checked(path: str | Path, advise: bool = False) -> tuple[dict, list[tuple[s
     file."""
     path = Path(path).expanduser()
     config = _read(path)
-    server = {"name": path.stem, **config.get("server", {})}
-    problems = [f"[server] {key}: not one of {', '.join(_SERVER_KEYS)}" + did_you_mean(key, _SERVER_KEYS)
-                for key in server if key not in _SERVER_KEYS]
-    return server, _tables(config.get("devices", {}), advise, problems)
+    tables = {key: config.get(key, {}) for key in ("server", "devices")}
+    problems = [f"{key}: should be a table, as [{key}{'.NAME' if key == 'devices' else ''}], not {_shown(table)}"
+                for key, table in tables.items() if not isinstance(table, dict)]  # (`devices = 3`)
+    tables = {key: table if isinstance(table, dict) else {} for key, table in tables.items()}
+    server = {"name": path.stem, **tables["server"]}
+    problems += [f"[server] {key}: not one of {', '.join(_SERVER_KEYS)}" + did_you_mean(key, _SERVER_KEYS)
+                 for key in server if key not in _SERVER_KEYS]
+    return server, _tables(_counted_from(tables["devices"], path.resolve().parent), advise, problems)
+
+
+def device_folder(spec, base: str | Path | None) -> Path | None:
+    """The folder a [devices.NAME] table (`spec`) names as its `path`, the one rule for it: a
+    relative one counts from `base`, the folder of the server file (where the server runs), so a
+    server file means the same wherever `insthub serve` runs, as it does to a service and to the
+    window (which run it in that folder), to `insthub check` and to the New server dialog.  None
+    if it names none (no `path`, or not text, or empty)."""
+    path = spec.get("path") if isinstance(spec, dict) else None
+    if not isinstance(path, str) or not path.strip():
+        return None
+    return (Path(base or ".") / Path(path).expanduser()).resolve()
+
+
+def _counted_from(devices, folder: Path):
+    """The [devices] tables of a file in `folder`, with each relative `path` counted from there
+    (device_folder)."""
+    if not isinstance(devices, dict):
+        return devices
+    return {name: {**spec, "path": str(found)} if (found := device_folder(spec, folder)) is not None else spec
+            for name, spec in devices.items()}
 
 
 def check(path: str | Path) -> None:

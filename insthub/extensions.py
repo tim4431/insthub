@@ -25,9 +25,15 @@ module; the command line and the window do.
 
     load(manifest)                  an Extension; never raises: what makes it unusable is in .error
     find_manifest(folder)           the nearest manifest in a folder or above it
+    venv_python(folder)             the Python of a virtualenv there, unless another user may change it
+    python_for(path)                the Python to serve a server file with
     discover()                      the extensions this computer knows of; of one id, the first usable
+    named(described)                the id of the extension a device announces, if it names one
     for_device(described, folders)  the extension of a device, from its describe()
     device_uis(described, address)  the UIs a device can open here, or why it has none
+    server_uis(devices, address)    the same for each device of a server, all at once
+    outdated(entry, devices)        why a server here runs older code than its folders hold, if it does
+    outdated_here()                 the same for this program's own insthub code (the window, `insthub mcp`)
     launch(ext, ui, device, address)  start one, in a program of its own, with the extension's Python
     add_folder(), remove_folder()   your list of extension folders (extensions.toml)
     check(path, import_=False)      what is wrong with an extension, or with a server file's
@@ -36,22 +42,24 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import functools
 import json
 import os
 import re
+import stat
 import sys
 import tomllib
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import config, registry, tomlfile
+from . import config, inventory, registry, service, tomlfile, wire
 from ._version import __version__
 from .config import ConfigWarning, _Kind
 from .errors import BusError, did_you_mean
 
 if TYPE_CHECKING:
-    from .inventory import Launched
+    from collections.abc import Callable
 
 API = 1  #: the newest manifest format this insthub reads
 MANIFEST = "insthub-extension.toml"
@@ -70,6 +78,13 @@ class DeviceOffer:
     doc: str = ""
     keys: dict = dataclasses.field(default_factory=dict)  #: every other key, for the server file as it is
 
+    def loads(self) -> list[tuple[str, str]]:
+        """What a server loads for it, as (key, "module:Name"): its driver, and the exception classes
+        its link_errors name (check(import_=True) loads them in the extension's Python)."""
+        errors = self.keys.get("link_errors")
+        return [("driver", self.driver), *(("link_errors", name) for name in
+                                           (errors if config._CLASSES.test(errors) else ()))]
+
 
 @dataclasses.dataclass(frozen=True)
 class UI:
@@ -83,9 +98,22 @@ class UI:
     panel: str | None = None
     types: tuple = ()
 
+    @property
+    def kind(self) -> str:
+        """What it is: an "app" (it has `run`) or a "panel"."""
+        return "app" if self.run is not None else "panel"
+
     def fits(self, described: dict) -> bool:
         """Whether it is for that device (its describe())."""
         return not self.types or described.get("type") in self.types
+
+    def loads(self) -> list[tuple[str, str]]:
+        """What starting it loads, as (key, name): a panel's function ("module:make"); an app's module
+        when it runs one (`run = ["-m", "module", ...]`), as "module" alone, which is only looked for
+        (check(import_=True) does both in the extension's Python, and runs no app)."""
+        if self.panel is not None:
+            return [("panel", self.panel)]
+        return [("run", self.run[1])] if self.run[:1] == ("-m",) and len(self.run) > 1 else []
 
 
 @dataclasses.dataclass
@@ -146,8 +174,8 @@ class Extension:
 
 # ---------------------------------------------------------------- reading a manifest
 _WHOLE = _Kind("a whole number", lambda v: isinstance(v, int) and not isinstance(v, bool))
-_ARGS = _Kind('a list of arguments, as ["-m", "mypackage.ui"]',
-              lambda v: isinstance(v, list) and all(isinstance(a, str) for a in v))
+_ARGS = _Kind('a list of one or more arguments, as ["-m", "mypackage.ui"]',
+              lambda v: isinstance(v, list) and len(v) > 0 and all(isinstance(a, str) for a in v))
 _FUNCTION = _Kind('text as "module:function"', config._DRIVER.test)
 
 #: The keys of [extension] and of a [ui.NAME] that insthub reads, with the kind of value each
@@ -196,13 +224,15 @@ def _offer(name: str, table: dict, problems: list, notes: list) -> DeviceOffer |
     return DeviceOffer(name, table["driver"], doc, {k: v for k, v in table.items() if k not in ("driver", "doc")})
 
 
-def _ui(name: str, table: dict, problems: list, notes: list) -> UI:
-    """A [ui.NAME] table: an app or a panel."""
+def _ui(name: str, table: dict, problems: list, notes: list) -> UI | None:
+    """A [ui.NAME] table: an app or a panel; None if it names neither (a problem says so)."""
     where = f"[ui.{name}]"
     found = _fields(table, _UI, where, problems)
     notes += _unread(table, _UI, where)
     if ("run" in table) == ("panel" in table):
         problems.append(f'{where} needs one of run = [...] (an app) and panel = "module:make" (a panel)')
+    if "run" not in found and "panel" not in found:  # (one of the wrong kind, such as run = [], is a problem)
+        return None
     run = found.get("run")
     return UI(name, found.get("title", name), None if run is None else tuple(run), found.get("panel"),
               tuple(found.get("types", ())))
@@ -210,7 +240,8 @@ def _ui(name: str, table: dict, problems: list, notes: list) -> UI:
 
 #: What a manifest adds to insthub, by kind: each a table of tables [KIND.NAME], whose tables its
 #: function reads (name, table, problems, notes) -> the item, or None, into the Extension attribute
-#: of that name.  A new kind is one more entry here, and its attribute.
+#: of that name.  A new kind is one more entry here, its attribute, and its item's loads() (what
+#: check(import_=True) loads of it).
 _ADDS = {"devices": _offer, "ui": _ui}
 
 
@@ -252,14 +283,19 @@ def _read(manifest: str | Path, source: str = "") -> tuple[Extension, list[str],
                         f"api = {API}): update insthub")
     elif api < 1:
         problems.append(f"[extension] api: should be 1 or more, not {api}")
+    shared = None if manifest == OWN else _shared(manifest)
+    if shared:
+        problems.append(f"{shared}: insthub runs nothing it names, since its manifest and its folder must be yours (or "
+                        "root's), and no one else's to change")
     if _own(manifest):  # its code comes with (that copy of) insthub, whose version it has
-        python = sys.executable
+        python = None if shared else sys.executable
         version = about.get("version") or _assigned(manifest.with_name("_version.py"), "__version__") or ""
     elif not doc.get("devices") and not doc.get("ui") and not about.get("python"):
         # recipes only: they run in its folder's virtualenv if it has one, else in insthub's Python
-        python, version = venv_python(manifest.parent), about.get("version", "")
+        python, version = None if shared else venv_python(manifest.parent), about.get("version", "")
     else:
-        python, version = _python(about.get("python"), manifest.parent, problems), about.get("version", "")
+        python = None if shared else _python(about.get("python"), manifest.parent, problems)
+        version = about.get("version", "")
     adds = {}
     for kind, read in _ADDS.items():
         tables = doc.get(kind, {})
@@ -296,37 +332,116 @@ def _recipe_files(named: list, folder: Path, notes: list) -> tuple:
 def load(manifest: str | Path, source: str = "") -> Extension:
     """The extension of a manifest file.  Never raises: one that cannot be used (it is not valid
     TOML, its api is too new, its id is not a valid name, an entry lacks what it needs, it has no
-    Python) says why in its `error`.  Keys that this insthub does not read are left alone, so
-    that a manifest written for a newer insthub still works (check() warns about them)."""
+    Python, another user may change it: see _shared) says why in its `error`.  Keys that this
+    insthub does not read are left alone, so that a manifest written for a newer insthub still
+    works (check() warns about them)."""
     return _read(manifest, source)[0]
+
+
+def _shared(manifest: Path) -> str | None:
+    """Who other than this user may change an extension's manifest (what it says is run) or its
+    folder (where a manifest may be put, and whose modules its UIs and checks import first), as
+    _others() says it; None if no one but this user (or root) may.  A manifest found in a folder
+    above a device's code, such as /tmp, may have been put there by anyone."""
+    return next((who for path in (manifest, manifest.parent) if (who := _others(path))), None)
+
+
+def _others(path: Path, link: bool = False) -> str | None:
+    """Who other than this user (or root) may change `path`: the user who owns it, every user, or a
+    group with others in it (_shared_group), with the chmod that stops it when it is this user's;
+    or why that cannot be told.  None if no one may, and on Windows, whose folders are their
+    user's.  `link`: a symbolic link is looked at itself, not what it leads to (as a virtualenv's
+    python): only its owner may change it, whatever its own mode says."""
+    if not hasattr(os, "getuid"):
+        return None
+    try:
+        st = os.lstat(path) if link else os.stat(path)
+    except OSError as e:
+        return f"cannot tell who may change {path}: {e.strerror}"
+    if st.st_uid not in (os.getuid(), 0):
+        return f"{path} belongs to another user"
+    if stat.S_ISLNK(st.st_mode):
+        return None
+    mine = st.st_uid == os.getuid()  # (root's /tmp: no chmod of this user's helps)
+    if st.st_mode & 0o002:
+        return f"every user may change {path}" + (f" (chmod o-w {path})" if mine else "")
+    group = _shared_group(st.st_gid) if st.st_mode & 0o020 else None
+    if group is not None:
+        return f"the users of group {group} may change {path}" + (f" (chmod g-w {path})" if mine else "")
+    return None
+
+
+def _shared_group(gid: int) -> str | None:
+    """The name of a group that users other than this one may be in: any but this user's primary
+    group with no one else listed in it (a user private group, which a umask of 002 makes files
+    writable for); None for that one."""
+    import grp
+    import pwd
+
+    try:
+        group = grp.getgrgid(gid)
+    except KeyError:
+        return str(gid)
+    try:
+        me = pwd.getpwuid(os.getuid())
+    except KeyError:
+        return group.gr_name
+    alone = gid == me.pw_gid and all(member == me.pw_name for member in group.gr_mem)
+    return None if alone else group.gr_name
+
+
+def _python_shared(python: Path) -> str | None:
+    """Who other than this user may change an interpreter, which insthub would then run for them
+    (_others): the folder that holds its virtualenv (as the folder above an extension, which may
+    be /tmp), the virtualenv, its bin folder, and the python itself (a link, as in a virtualenv:
+    the link, not the Python it leads to); None if no one may."""
+    python = python.parent.resolve() / python.name  # (the python itself stays a link, if it is one)
+    folders = list(python.parents)[2::-1]  # <holder>/<venv>/bin/python: holder, venv, bin
+    return next((who for folder in folders if (who := _others(folder))), None) or _others(python, link=True)
 
 
 def _python(declared: str | None, folder: Path, problems: list) -> str | None:
     """The Python an extension's code runs in: the one its manifest names (relative to its
-    folder), else a virtualenv's in its folder or the one above; None and a problem if there is none."""
+    folder), else a virtualenv's in its folder or the one above; None and a problem if there is
+    none, or if another user may change it (_python_shared)."""
     if declared:
         python = folder / Path(declared).expanduser()
-        if python.is_file():
-            return str(python)
-        problems.append(f"[extension] python: {python} does not exist")
+        if not python.is_file():
+            problems.append(f"[extension] python: {python} does not exist")
+            return None
+        who = _python_shared(python)
+    else:
+        found, who = _venv(folder)
+        if found is None:
+            problems.append(f"it has no Python: make a virtualenv (.venv) in {folder} or the folder above, or name "
+                            'one in [extension] as python = "..."')
+            return None
+        python = Path(found)
+    if who:
+        problems.append(f"its Python, {python}: {who}; insthub runs no Python that another user may change")
         return None
-    python = venv_python(folder)
-    if python is None:
-        problems.append(f"it has no Python: make a virtualenv (.venv) in {folder} or the folder above, or name "
-                        'one in [extension] as python = "..."')
-    return python
+    return str(python)
 
 
-def venv_python(folder: str | Path) -> str | None:
-    """The Python of a virtualenv (.venv, venv or env) in `folder` or the folder above, if there is one."""
+def _venv(folder: str | Path) -> tuple[str | None, str | None]:
+    """(the Python of a virtualenv (.venv, venv or env) in `folder` or the folder above, if there is
+    one; who other than this user may change it (_python_shared), if anyone)."""
     folder = Path(folder)
     inside = ("Scripts", "python.exe") if os.name == "nt" else ("bin", "python")
     for base in (folder, folder.parent):
         for venv in (".venv", "venv", "env"):
             python = base.joinpath(venv, *inside)
             if python.is_file():
-                return str(python)
-    return None
+                return str(python), _python_shared(python)
+    return None, None
+
+
+def venv_python(folder: str | Path) -> str | None:
+    """The Python of a virtualenv (.venv, venv or env) in `folder` or the folder above, if there is
+    one that no other user may change (another user could put one in a folder above that is
+    theirs, or /tmp, for insthub to run: see _python_shared)."""
+    python, who = _venv(folder)
+    return None if who else python
 
 
 def find_manifest(folder: str | Path) -> Path | None:
@@ -354,7 +469,7 @@ def module_file(module: str, folder: str | Path) -> Path | None:
 # ---------------------------------------------------------------- finding extensions
 def user_file() -> Path:
     """Your list of extension folders: `paths = ["/home/me/Code/hp8562a", ...]`."""
-    return Path.home() / ".config" / "insthub" / "extensions.toml"
+    return registry.config_dir() / "extensions.toml"
 
 
 def listed_folders() -> list[str]:
@@ -384,17 +499,14 @@ def _places() -> list[tuple[str, Path, str | None]]:
 
 def _service_folders() -> list[tuple[str, Path, None]]:
     """The folders of the code of the installed services' servers (see _code_folders)."""
-    from . import inventory, service  # (the window and the command line have them loaded anyway)
-
     try:
         units = service.units()
     except BusError:  # no systemd user services here
         return []
     found = []
     for unit in units:
-        source = f"service:{unit['name']}"
-        path = inventory.server_file(inventory.Server(source, unit["name"], "service", service=unit))
-        found += [(source, folder, None) for folder in (_code_folders(path) if path else ())]
+        path = service.target(unit)
+        found += [(f"service:{unit['name']}", folder, None) for folder in (_code_folders(path) if path else ())]
     return found
 
 
@@ -413,11 +525,11 @@ def _entry_folders(entry: dict) -> dict[str, list[str]]:
             for name, listed in (folders.items() if isinstance(folders, dict) else ()) if isinstance(listed, list)}
 
 
-def device_folders(device: str, address: str) -> list[str] | None:
-    """The folders of a device's code, from the registry file of its server if that runs on this
-    computer (as one of its addresses says); None for a device on another computer."""
-    return next((_entry_folders(entry).get(device, []) for entry in registry.find(device)
-                 if address in entry.get("addresses", ())), None)
+def server_folders(address: str) -> dict[str, list[str]] | None:
+    """The folders of the code of each device of the server at `address`, from its registry file
+    if it runs on this computer (as one of its addresses says); None for one on another computer."""
+    return next((_entry_folders(entry) for entry in registry.servers() if address in entry.get("addresses", ())),
+                None)
 
 
 def _code_folders(path: Path) -> list[Path]:
@@ -439,13 +551,42 @@ def _device_folders(devices, base: Path) -> dict[str, Path]:
     comes from elsewhere (an installed package, such as insthub's simulated instruments) has none."""
     found = {}
     for name, table in (devices.items() if isinstance(devices, dict) else ()):
-        path, driver = (table.get("path"), table.get("driver")) if isinstance(table, dict) else (None, None)
+        driver = table.get("driver") if isinstance(table, dict) else None
         module = driver.partition(":")[0] if isinstance(driver, str) else ""
-        if isinstance(path, str) and path.strip():
-            found[name] = (base / Path(path).expanduser()).resolve()
+        if (folder := config.device_folder(table, base)) is not None:
+            found[name] = folder
         elif module and module_file(module, base) is not None:
             found[name] = base
     return found
+
+
+def python_for(path: str | Path) -> str:
+    """The Python to serve a server file (a .toml config or a .py script) with: the one rule that
+    `insthub check --import`, `insthub service install`, the window's Keep a server running dialog
+    and its New server dialog (for one device: device_python) follow.  It is that of its devices'
+    extensions (found from their folders: _code_folders), if they agree on one (insthub's own runs
+    in any Python that has insthub, so it has no say); else a virtualenv's next to the file (in its
+    folder or the one above), else next to a device's code (venv_python); else this one."""
+    path = Path(path).expanduser().resolve()
+    folders = _code_folders(path)
+    manifests = dict.fromkeys(m for folder in folders if (m := find_manifest(folder)) is not None and not _own(m))
+    pythons = sorted({ext.python for manifest in manifests if (ext := load(manifest)).python})
+    if len(pythons) == 1:
+        return pythons[0]
+    return next((python for folder in (path.parent, *folders) if (python := venv_python(folder))), sys.executable)
+
+
+def device_python(table: dict, base: str | Path | None) -> str | None:
+    """The Python the code of one device (its [devices.NAME] `table`, in a server file in the folder
+    `base`; None: one not written yet, whose device has only the folder its `path` names) is to
+    run in, if it says: that of the extension of its folder (none for insthub's own), else a
+    virtualenv's in its folder or the one above (as python_for finds them for a whole file)."""
+    folder = config.device_folder(table, None) if base is None else \
+        _device_folders({"device": table}, Path(base).resolve()).get("device")
+    manifest = find_manifest(folder) if folder is not None else None
+    if manifest is not None:
+        return None if _own(manifest) else load(manifest).python
+    return venv_python(folder) if folder is not None else None
 
 
 def discover() -> list[Extension]:
@@ -478,7 +619,15 @@ def discover() -> list[Extension]:
     return found
 
 
-def for_device(described: dict, folders: list[str] | None = None) -> Extension | None:
+def named(described: dict) -> str | None:
+    """The id of the extension a device (its describe()) announces, if it names one: a text that is
+    not empty, since it came over the network."""
+    wanted = described.get("extension") if isinstance(described, dict) else None
+    return wanted if isinstance(wanted, str) and wanted else None
+
+
+def for_device(described: dict, folders: list[str] | None = None,
+               discovered: Callable[[], list[Extension]] | None = None) -> Extension | None:
     """The extension of a device, from its describe(): the manifest found from the device's own
     folders (`folders`, from the registry file of its server on this computer) whose id is the
     one the device announces, so that the very copy its server runs is the one used; else the
@@ -486,19 +635,30 @@ def for_device(described: dict, folders: list[str] | None = None) -> Extension |
     says why).  A device of insthub's own extension gets this insthub's, whichever copy of
     insthub its server runs (see _own): its code comes with insthub, and runs where insthub
     does.  None if the device names no extension, or none here has its id.  Only the id is
-    compared: a name that came over the network runs nothing."""
-    wanted = described.get("extension")
-    if not isinstance(wanted, str) or not wanted:
-        return None
+    compared: a name that came over the network runs nothing.  `discovered`: what gives the
+    discovered extensions (default: discover), for looking up several devices with one."""
+    return _for_device(described, folders, discovered)[0]
+
+
+def _for_device(described: dict, folders, discovered) -> tuple[Extension | None, Extension | None]:
+    """(for_device()'s answer; when that is None, the extension of a manifest found from the
+    device's own folders whose id is another than the one it announces, if there is one: the
+    mistake of a class whose `extension` is not its manifest's id)."""
+    wanted = named(described)
+    if wanted is None:
+        return None, None
+    other = None
     for folder in folders or ():
         manifest = find_manifest(folder)
         if manifest is None:
             continue
         ext = load(OWN, "insthub") if _own(manifest) else load(manifest, "device")
         if ext.id == wanted:
-            return ext
-    same = [ext for ext in discover() if ext.id == wanted]
-    return next((ext for ext in same if ext.usable), same[0] if same else None)
+            return ext, None
+        other = other or (ext if ext.id and not ext.builtin else None)
+    same = [ext for ext in (discovered or discover)() if ext.id == wanted]
+    found = next((ext for ext in same if ext.usable), same[0] if same else None)
+    return found, None if found is not None else other
 
 
 def device_uis(described: dict, address: str) -> tuple[Extension | None, list[UI], str | None]:
@@ -506,14 +666,114 @@ def device_uis(described: dict, address: str) -> tuple[Extension | None, list[UI
     extension, as for_device() finds it from the device's own folders when its server runs here;
     the UIs of it that are for this device; why there are none when that is not up to the
     extension: it is not on this computer, or cannot be used)."""
-    wanted = described.get("extension")
-    ext = for_device(described, device_folders(described.get("name", ""), address))
-    if ext is None:
-        why = f"extension {wanted} is not installed on this computer: insthub ext add FOLDER" if wanted else None
-        return None, [], why
-    if ext.error:
-        return ext, [], f"extension {wanted} cannot be used: {ext.error}"
-    return ext, [ui for ui in ext.ui.values() if ui.fits(described)], None
+    name = described.get("name", "")
+    return server_uis({name: described}, address)[name]
+
+
+def server_uis(devices: dict[str, dict], address: str) -> dict[str, tuple[Extension | None, list[UI], str | None]]:
+    """device_uis() of each of a server's devices (`devices`: name -> its describe(); `address`: the
+    server's), by name.  It reads the server's registry file once, and discovers the extensions of
+    this computer once at most, when a device's own folders do not give its extension."""
+    folders = server_folders(address)
+    discovered = functools.cache(discover)
+    found = {}
+    for name, described in devices.items():
+        wanted = named(described)
+        ext, other = _for_device(described, None if folders is None else folders.get(name, []), discovered)
+        if other is not None:  # (`insthub ext add` would not help: its folder is found already)
+            found[name] = None, [], (f"it announces extension {wanted}, but the manifest of its folder, "
+                                     f"{other.manifest}, has id {other.id}: is the `extension` of its class "
+                                     "out of date? (insthub check FOLDER --import)")
+        elif ext is None:
+            found[name] = None, [], (f"extension {wanted} is not installed on this computer: insthub ext add FOLDER"
+                                     if wanted else None)
+        elif ext.error:
+            found[name] = ext, [], f"extension {wanted} cannot be used: {ext.error}"
+        else:
+            found[name] = ext, [ui for ui in ext.ui.values() if ui.fits(described)], None
+    return found
+
+
+NAMED = 3  #: how many files outdated() names before "and N more"
+
+
+def outdated(entry: dict | None, devices: dict[str, dict] | None = None) -> list[str]:
+    """Why a server on this computer runs older code than its folders hold, one reason each, for
+    people ("demolaser_insthub/device.py changed since it started", "the folder has demo-laser
+    0.2, it runs 0.1"); none when it runs what they hold, or when that cannot be told.  The one
+    rule for this, which the window and `insthub list` show.  `entry`: the server's registry entry
+    (as discover() gives it; None for a server on another computer, which is never judged);
+    `devices`: name -> describe() of its devices, if known.  Two signals:
+
+    - a file of its code ("code" in its entry: see server._code) whose modification time is not
+      the one it had when the server loaded it, or that is gone.  An entry without "code" (from an
+      older insthub) gives none of these;
+    - a device that states its extension_version, whose extension (found from the device's own
+      folders, as for_device finds it, but nowhere else: another copy says nothing of what this
+      server runs) has another version in its manifest, a manifest changed since the server
+      started ("started" in its entry).  Versions that disagreed already then (a class and its
+      manifest that disagree on disk, which `insthub check` warns about, or an
+      extension_version in a server file) would disagree again after a restart, so they are no
+      sign of older code.
+
+    It reads files (their times, manifests), so the window calls it on a worker thread."""
+    if not isinstance(entry, dict):
+        return []
+    reasons, changed, gone = [], [], []
+    code = entry.get("code")
+    for path, mtime in (code.items() if isinstance(code, dict) else ()):
+        if not isinstance(path, str) or not os.path.isabs(path) or not isinstance(mtime, int):
+            continue  # (a damaged entry: no reason to believe anything changed)
+        try:
+            if os.stat(path).st_mtime_ns != mtime:
+                changed.append(path)
+        except FileNotFoundError:
+            gone.append(path)
+        except OSError:  # it cannot be looked at now: nothing is known
+            continue
+    if changed:
+        reasons.append(f"{_files(changed)} changed since it started")
+    if gone:
+        reasons.append(f"{_files(gone)} {'was' if len(gone) == 1 else 'were'} deleted since it started")
+    folders, started = _entry_folders(entry), entry.get("started")
+    for name, described in sorted((devices or {}).items() if isinstance(started, (int, float)) else ()):
+        runs = described.get("extension_version") if isinstance(described, dict) else None
+        if not isinstance(runs, str) or not runs:
+            continue
+        ext = _for_device(described, folders.get(name, []), list)[0]  # (list: no other copy is looked for)
+        if ext is not None and ext.version and ext.version != runs and _changed_since(ext.manifest, started):
+            reasons.append(f"the folder has {ext.id} {ext.version}, it runs {runs}")
+    return list(dict.fromkeys(reasons))
+
+
+def outdated_here() -> list[str]:
+    """Why this program runs older insthub code than the disk holds: outdated() of the files of
+    insthub's own modules as this process loaded them (server._code, the listing a server writes
+    into its registry entry).  For a client that has no entry, such as the window or `insthub mcp`.
+    Each file keeps the time it had when it was first listed, so a program calls this once when it
+    starts (it then finds nothing), and again whenever it wants to know.  It reads the files'
+    times, so the window calls it on a worker thread."""
+    from .server import _code
+
+    return outdated({"code": _code(())})
+
+
+def _changed_since(path: Path, when: float) -> bool:
+    """Whether a file was modified after the time `when` (seconds, as time.time() gives them)."""
+    try:
+        return os.stat(path).st_mtime > when
+    except OSError:
+        return False
+
+
+def _files(paths: list[str]) -> str:
+    """Files as a person reads them: each as its folder's name and its own ("insthub/server.py"),
+    the first few (NAMED) in order, then how many more."""
+    names = sorted(f"{os.path.basename(os.path.dirname(path))}/{os.path.basename(path)}" for path in paths)
+    shown, more = (names, 0) if len(names) <= NAMED else (names[:NAMED], len(names) - NAMED)
+    if more:
+        return f"{', '.join(shown)} and {more} more"
+    return shown[0] if len(shown) == 1 else f"{', '.join(shown[:-1])} and {shown[-1]}"
 
 
 def add_folder(path: str | Path) -> Extension:
@@ -551,12 +811,12 @@ def _write_list(paths: list[str]) -> None:
         tomlfile.update(user_file(), {(): {"paths": paths}}, new_file=(
             "# Folders of insthub extensions (docs/design.md#extensions).  Written by `insthub ext add` and "
             "insthub gui; edit freely.\n"))
-    except ValueError as e:
-        raise ValueError(f"{user_file()}: {e}") from None
+    except (OSError, ValueError) as e:  # (OSError: it, or its folder, may not be written; it is another's link)
+        raise ValueError(f"{user_file()}: {getattr(e, 'strerror', None) or e}") from None
 
 
 # ---------------------------------------------------------------- starting a UI
-def launch(ext: Extension, ui_name: str, device: str, address: str) -> Launched:
+def launch(ext: Extension, ui_name: str, device: str, address: str) -> inventory.Launched:
     """Start a UI of an extension for a device, in a program of its own run with the extension's
     Python (docs/design.md#two-halves-each-where-its-libraries-are): an app as `<python> <run...>`,
     with {device} and {address} in its arguments filled in; a panel as `<python> -m insthub -a
@@ -565,15 +825,13 @@ def launch(ext: Extension, ui_name: str, device: str, address: str) -> Launched:
     its output goes to a log file (inventory.ui_log).  Raises ValueError for an extension that
     cannot be used, and for a device name or address that must not fill a placeholder (the name
     came over the network)."""
-    from . import inventory, wire
-
     if ext.python is None or ext.error:
         raise ValueError(f"extension {ext.id or ext.folder} cannot be used: {ext.error}")
     ui = ext.ui[ui_name]
     values = {"device": registry.check_name(device, "device name"), "address": address}
     if wire.parse_address(address)[0] == "inproc":
         raise ValueError(f"{address}: only the program that hosts it can reach it")
-    if ui.run:  # (a placeholder it does not know stays as it is)
+    if ui.kind == "app":  # (a placeholder it does not know stays as it is)
         args = [re.sub(r"\{(\w+)\}", lambda m: values.get(m[1], m[0]), arg) for arg in ui.run]
     else:
         args = ["-m", "insthub", "-a", address, "panel", device, ui.panel, f"--title={ui.title}"]
@@ -592,13 +850,14 @@ def _warn(message: str) -> None:
 def check(path: str | Path, import_: bool = False) -> list[str]:
     """What is wrong with an extension (its folder, or its manifest), or with the extensions of the
     devices of a server file (a .toml): one message per problem, none if all is well.  It reads,
-    and runs nothing.  With `import_`, it also imports the drivers (and the exception classes their
-    link_errors name) in a program of their own, run with the extension's Python, and reports those
-    that fail; for a server file, in the Python its
-    extensions run in, and with the check `insthub service install` makes.  Warns (ConfigWarning)
-    about what works, but probably not as meant: keys this insthub does not read, a device class
-    whose `extension_version` (read from its source) is not its manifest's `version`, a driver that
-    imports Qt, a server file whose devices' extensions run in different Pythons."""
+    and runs nothing.  With `import_`, it also loads what the extension's entries name, in a
+    program of its own run with the extension's Python (_import: the drivers, the exception
+    classes their link_errors name, the UIs' panels and app modules), and reports what fails or
+    is not what the manifest says; for a server file, it checks in the Python that serves it
+    (python_for) what `insthub service install` checks.  Warns (ConfigWarning) about what works,
+    but probably not as meant: keys this insthub does not read, a device class whose
+    `extension_version` is not its manifest's `version`, a driver that imports Qt, a server file
+    whose devices' extensions run in different Pythons."""
     path = Path(path).expanduser()
     if path.is_dir():
         manifest = find_manifest(path)
@@ -615,8 +874,8 @@ def check(path: str | Path, import_: bool = False) -> list[str]:
     else:
         return [f"{path}: expected an extension's folder, its {MANIFEST}, a server's .toml or a file of recipes"]
     ext, problems = _check_manifest(manifest)
-    if import_ and ext.python and ext.devices:
-        problems += _import(ext, list(ext.devices.values()))
+    if import_ and ext.python:
+        problems += _import(ext)
     return problems
 
 
@@ -633,21 +892,30 @@ def _check_recipes(path: Path) -> list[str]:
 
 def _check_manifest(manifest: Path) -> tuple[Extension, list[str]]:
     """A manifest's extension and its problems, each naming the manifest.  Warns about what it says
-    that this insthub does not read, and about a device class whose extension_version is not the
-    manifest's version."""
+    that this insthub does not read, and about a device class whose extension_version (read from
+    its source) is not the manifest's version."""
     ext, problems, notes = _read(manifest)
     for note in notes:
         _warn(f"{ext.manifest}: {note}")
     recipe_problems = [p for path in ext.recipes for p in _check_recipes(path)]  # (they leave it usable)
     for offer in ext.devices.values():
-        module, _, cls = offer.driver.partition(":")
-        file = module_file(module, ext.root)
-        said = _assigned(file, "extension_version", cls) if file else None
+        said = _said(ext, offer, "extension_version")
         if isinstance(said, str) and said != ext.version:
-            _warn(f"{ext.manifest}: [devices.{offer.name}] {offer.driver} says extension_version = "
-                  f"{config._shown(said)}, but the manifest's version is {config._shown(ext.version)}: is one of "
-                  "them out of date? (see docs/design.md#versions)")
+            _warn(_version_warning(ext, offer, said))
     return ext, [f"{ext.manifest}: {p}" for p in problems] + recipe_problems
+
+
+def _said(ext: Extension, offer: DeviceOffer, attr: str):
+    """What the class of an offer assigns to `attr` in its body, read from its source (_assigned)."""
+    module, _, cls = offer.driver.partition(":")
+    file = module_file(module, ext.root)
+    return _assigned(file, attr, cls) if file else None
+
+
+def _version_warning(ext: Extension, offer: DeviceOffer, said: str) -> str:
+    return (f"{ext.manifest}: [devices.{offer.name}] {offer.driver} says extension_version = {config._shown(said)}, "
+            f"but the manifest's version is {config._shown(ext.version)}: is one of them out of date? (see "
+            "docs/design.md#versions)")
 
 
 def _assigned(path: Path, attr: str, cls: str | None = None):
@@ -673,7 +941,7 @@ def _assigned(path: Path, attr: str, cls: str | None = None):
 def _check_server(path: Path, import_: bool) -> list[str]:
     """check() of a server file: the manifests found from its devices' folders (_device_folders, as
     discover() finds them), and whether each device's `extension` is its manifest's id; with
-    `import_`, also what `insthub service install` checks, in the Python of the devices' extensions."""
+    `import_`, also what `insthub service install` checks, in the Python that serves it (python_for)."""
     try:
         devices = config._read(path).get("devices", {})
     except ValueError as e:
@@ -695,10 +963,7 @@ def _check_server(path: Path, import_: bool) -> list[str]:
         _warn(f"{path}: its devices' extensions run in different Pythons ({', '.join(pythons)}), but a server runs "
               "in one: host them in separate servers")
     if import_:
-        from . import service
-
-        python = pythons[0] if len(pythons) == 1 else venv_python(path.resolve().parent) or sys.executable
-        report = service.check_report(path, python)
+        report = service.check_report(path, python_for(path))
         for message in report["warnings"]:
             _warn(message)
         problems += [f"{path}: {line}" for line in (report["problem"] or "").splitlines()]
@@ -706,60 +971,80 @@ def _check_server(path: Path, import_: bool) -> list[str]:
 
 
 #: What check(import_=True) runs in an extension's Python, as `python -c _IMPORT REPORT FOLDER NAMES
-#: GUI`: it loads each name ("module:Name") of NAMES, with the extension's folder first on sys.path,
-#: and writes as JSON to the file REPORT, for each, the error if any, whether it is an exception
-#: class, and which of the modules GUI (Qt bindings, pyqtgraph) loading it brought in.  It needs
+#: GUI`: it loads each name of NAMES ("module:Name"; a "module" alone is only looked for, not run),
+#: with the extension's folder first on sys.path, and writes as JSON to the file REPORT, for each,
+#: the error if any, whether it is an exception class, which of the modules GUI (Qt bindings,
+#: pyqtgraph) loading it brought in, and for an insthub Device class what it says it is
+#: (extension, extension_version; read as insthub reads them, without running a getter).  It needs
 #: only the standard library, so it works with any insthub there, or none.
 _IMPORT = """\
-import importlib, json, sys
+import importlib, importlib.util, inspect, json, sys
 folder, names, gui, report = sys.argv[2], json.loads(sys.argv[3]), json.loads(sys.argv[4]), []
 if folder:
     sys.path.insert(0, folder)
 for name in names:
     before, obj = set(sys.modules), None
-    module, _, attr = name.partition(":")
+    module, colon, attr = name.partition(":")
     try:
-        obj = importlib.import_module(module)
-        for part in attr.split("."):
-            obj = getattr(obj, part)
+        if colon:
+            obj = importlib.import_module(module)
+            for part in attr.split("."):
+                obj = getattr(obj, part)
+        elif importlib.util.find_spec(module) is None:
+            raise ModuleNotFoundError(f"No module named {module!r}")
         error = None
     except BaseException as e:
         error = f"{type(e).__name__}: {e}"
+    device = getattr(sys.modules.get("insthub.device"), "Device", None)
+    says = {key: value for key in ("extension", "extension_version")
+            if isinstance(obj, type) and device is not None and issubclass(obj, device)
+            and isinstance(value := inspect.getattr_static(obj, key, None), str)}
     report.append({"error": error, "exception": isinstance(obj, type) and issubclass(obj, BaseException),
-                   "gui": [m for m in gui if m in sys.modules and m not in before]})
+                   "gui": [m for m in gui if m in sys.modules and m not in before], "says": says})
 with open(sys.argv[1], "w") as f:
     json.dump(report, f)
 """
 
 
-def _import(ext: Extension, offers: list[DeviceOffer]) -> list[str]:
-    """Load what the offers of an extension name, in a program of their own run with its Python
-    (_IMPORT): each driver, and the exception classes of its link_errors, as a server does.  A
-    problem for each that fails (as config.check says it), a warning for each driver that brings
-    in Qt."""
-    from . import service
-
-    names = []  # (offer, key, "module:Name")
-    for offer in offers:
-        errors = offer.keys.get("link_errors")
-        names += [(offer, "driver", offer.driver),
-                  *((offer, "link_errors", name) for name in (errors if config._CLASSES.test(errors) else ()))]
-    folder = str(ext.path or "")
-    report, stderr = service.ask_python(ext.python, _IMPORT, folder, json.dumps([name for *_, name in names]),
-                                        json.dumps(config._GUI_MODULES), cwd=ext.root, doing="import the drivers")
+def _import(ext: Extension) -> list[str]:
+    """Load what the entries of an extension name (each item's loads(): drivers, the exception
+    classes of their link_errors, panels, apps' modules), in a program of their own run with its
+    Python (_IMPORT), as a server, or starting a UI, does.  A problem for each that fails (as
+    config.check says it), and for a device class whose `extension` is not the manifest's id (its
+    devices would find no UI); a warning for each driver that brings in Qt, and for a class whose
+    extension_version is not the manifest's version where its source does not say it plainly."""
+    names = [(kind, item, key, name) for kind in _ADDS for item in getattr(ext, kind).values()
+             for key, name in item.loads()]  # (kind, item, key, name)
+    if not names:
+        return []
+    report, stderr = service.ask_python(ext.python, _IMPORT, str(ext.path or ""),
+                                        json.dumps([name for *_, name in names]), json.dumps(config._GUI_MODULES),
+                                        cwd=ext.root, doing="import the drivers and the UIs")
     if report is None:  # it did not get that far: not a Python, or one that crashed
-        return [f"{ext.manifest}: {ext.python} cannot import the drivers: "
+        return [f"{ext.manifest}: {ext.python} cannot import the drivers and the UIs: "
                 + (stderr.strip().splitlines() or ["it stopped without saying why"])[-1]]
     problems = []
-    for (offer, key, name), got in zip(names, report, strict=True):
-        where = f"{ext.manifest}: [devices.{offer.name}]"
-        if key == "driver":
-            if got["error"]:
-                problems.append(f"{where} cannot import {name} with {ext.python}: {got['error']}")
-            if got["gui"]:
-                _warn(config.gui_warning(where, name, got["gui"]))
-        elif got["error"]:
-            problems.append(f"{where} link_errors: cannot load {name!r} with {ext.python}: {got['error']}")
-        elif not got["exception"]:
-            problems.append(f"{where} link_errors: {name!r} is not an exception class")
+    for (kind, item, key, name), got in zip(names, report, strict=True):
+        where, error, says = f"{ext.manifest}: [{kind}.{item.name}]", got["error"], got.get("says", {})
+        if key == "link_errors":
+            if error:
+                problems.append(f"{where} link_errors: cannot load {name!r} with {ext.python}: {error}")
+            elif not got["exception"]:
+                problems.append(f"{where} link_errors: {name!r} is not an exception class")
+            continue
+        if error:
+            what = {"driver": "import", "panel": "load the panel", "run": "find the module"}[key]
+            problems.append(f"{where} cannot {what} {name} with {ext.python}: {error}")
+        if key != "driver":  # (a UI's panel is meant to import Qt)
+            continue
+        if got["gui"]:
+            _warn(config.gui_warning(where, name, got["gui"]))
+        if "extension" in says and says["extension"] != ext.id:
+            problems.append(f"{where} {name} says extension = {config._shown(says['extension'])}, but the manifest's "
+                            f"id is {config._shown(ext.id)}: its devices would announce an extension that has no UI "
+                            "here")
+        version = says.get("extension_version")
+        if version is not None and version != ext.version and not isinstance(_said(ext, item, "extension_version"),
+                                                                             str):
+            _warn(_version_warning(ext, item, version))
     return problems

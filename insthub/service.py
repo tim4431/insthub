@@ -3,16 +3,19 @@
 A server started in a terminal stops when the terminal closes.  This module
 registers it as a systemd *user* service instead: started when you log in (or
 at boot, see `linger_hint`) unless it is told not to (`login=False`, `disable`),
-restarted if it crashes, its output kept in the journal.  Nothing here needs
-root.
+restarted if it crashes (but not forever: see unit_text), its output kept in the
+journal.  Installing, starting and restarting wait until its server has
+announced itself, and say why it did not, with the journal's last lines.
+Nothing here needs root.
 
 There is one convention for every server, whatever instrument it drives:
 
     unit        ~/.config/systemd/user/insthub-NAME.service
-    command     the Python interpreter that ran `insthub service install` (or
-                --python), so the server runs in that environment (the
-                virtualenv with the driver's dependencies), on a .toml config
-                or a .py script
+    command     a Python interpreter on a .toml config or a .py script: the one
+                the server file needs (extensions.python_for: its devices'
+                extensions', else a virtualenv next to it or its drivers, else
+                the one that ran `insthub service install`), or --python, so
+                the server runs in the environment with the drivers' packages
 
 Before writing the unit, `install` makes sure that Python can import insthub
 and, for a config, every driver it names, and that each device's keys fit its
@@ -20,17 +23,26 @@ driver (config.check); what config.check warns about is passed on as a
 ConfigWarning.  It refuses to run from the user-wide `insthub` command (a uv
 tool or pipx environment), which has no drivers.
 
+After a `git pull` or an edited driver, `update` brings services up to date, for
+`insthub service update` and the window alike: a unit written by an older insthub
+(units()' "stale") is written anew with the same file and Python, and a running
+service whose unit changed or whose server runs older code (outdated) restarts.
+
 What stays outside: anything that gives the operating system access to the
 hardware (udev rules, kernel modules, groups).  That belongs to the driver.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import warnings
 from pathlib import Path
 
@@ -39,6 +51,17 @@ from .config import ConfigWarning
 from .errors import BusError
 
 PREFIX = "insthub-"
+WAIT = 60.0  #: seconds install, start and restart wait for the server to announce itself
+MARK = "# Written by `insthub service install`"  #: how the first line of every unit insthub writes begins
+UNIT_FORMAT = 2  #: the format of the units this insthub writes (unit_text), said in their first line
+
+#: What an older insthub wrote where this one writes something else, for _judge: {(section, key): the
+#: values older unit_texts gave it, None for "not written at all"}.  Units of format 1 (which did not say
+#: their format yet) restarted a crashed server 2 s later, and forever.  When unit_text changes,
+#: UNIT_FORMAT gets one more and what it wrote before goes here (a setting it no longer writes too,
+#: with its values), so that a unit counts as stale only for what an older insthub really wrote.
+_OLDER = {("[Service]", "RestartSec"): {"2"},
+          ("[Unit]", "StartLimitIntervalSec"): {None}, ("[Unit]", "StartLimitBurst"): {None}}
 
 
 def unit_dir() -> Path:
@@ -63,6 +86,40 @@ def command_for(target: str | Path, python: str | None = None) -> list[str]:
     if target.suffix == ".py":
         return [python, str(target)]
     raise BusError(f"{target.name}: expected a .toml config (for `insthub serve`) or a .py server script")
+
+
+def served(argv: list[str]) -> str | None:
+    """What a server's command line runs (command_for's `target`, read back): the config after
+    `insthub serve` (or `python -m insthub serve`), else the script a Python runs ("python
+    my_server.py settings.toml": the .py)."""
+    args = argv[1:]
+    if "serve" in args:
+        before = [os.path.basename(a) for a in [argv[0], *args[:args.index("serve")]]]
+        if "insthub" in before or "insthub.exe" in before:  # the command, `python -m insthub` or its script
+            return next((a for a in args[args.index("serve") + 1:] if a.endswith(".toml")), None)
+    if argv and os.path.basename(argv[0]).startswith("python"):
+        while args and args[0].startswith("-") and args[0] not in ("-m", "-c"):
+            args = args[2:] if args[0] in ("-X", "-W", "--check-hash-based-pycs") else args[1:]  # its options
+        if args and args[0].endswith(".py"):
+            return args[0]
+    return None
+
+
+def command_of(unit: dict) -> list[str]:
+    """The command line of an installed service (units()' "command": its ExecStart=, as command_for
+    made it); [] if it cannot be read.  What _quote doubled for systemd ("$$", "%%") is single again."""
+    try:
+        return [arg.replace("$$", "$").replace("%%", "%") for arg in shlex.split(unit.get("command") or "")]
+    except ValueError:
+        return []
+
+
+def target(unit: dict) -> Path | None:
+    """The .toml config or .py script that an installed service serves (units()' entry), if it is
+    there."""
+    arg = served(command_of(unit))
+    path = Path(arg) if arg else None
+    return path if path is not None and path.is_file() else None
 
 
 def tool_environment(prefix: str | None = None) -> str | None:
@@ -167,25 +224,97 @@ def check_python(target: str | Path, python: str) -> list[str]:
 
 
 def unit_text(name: str, target: str | Path, python: str | None = None) -> str:
-    """The systemd unit that keeps the server of `target` running."""
+    """The systemd unit that keeps the server of `target` running: restarted 5 s after it crashes,
+    but no more than 5 starts in 5 minutes, so that a server that cannot start (a broken config,
+    an instrument it cannot do without) ends up "failed" instead of restarting forever."""
     registry.check_name(name, "service name")
     target = Path(target).expanduser().resolve()
     command = " ".join(_quote(part) for part in command_for(target, python))
-    return f"""# Written by `insthub service install`.  Remove it with:  insthub service remove {name}
+    return f"""{MARK} (unit format {UNIT_FORMAT}).  Remove it with:  insthub service remove {name}
 [Unit]
 Description=insthub server {name}
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 ExecStart={command}
 WorkingDirectory={str(target.parent).replace("%", "%%")}
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 TimeoutStopSec=20
 
 [Install]
 WantedBy=default.target
 """
+
+
+def _settings(text: str) -> dict | None:
+    """What a unit file sets, as {(its section, key): value}; None if it sets one key twice."""
+    found, section = {}, ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("["):
+            section = line
+            continue
+        key, _, value = line.partition("=")
+        if (section, key.strip()) in found:
+            return None
+        found[section, key.strip()] = value.strip()
+    return found
+
+
+def _differences(have: dict, want: dict, keys: list, now: str) -> str:
+    """How the settings `have` differ from `want` (as _settings gives them) in `keys`, for people:
+    "RestartSec=2, now 5; without StartLimitIntervalSec=300, StartLimitBurst=5" (`now`: the words
+    before want's value)."""
+    changed = [f"{key}={have[section, key]}, " + (f"{now} {want[section, key]}" if (section, key) in want
+                                                  else "which this insthub does not write")
+               for section, key in keys if (section, key) in have]
+    missing = [f"{key}={want[section, key]}" for section, key in keys if (section, key) not in have]
+    return "; ".join([*changed, *([f"without {', '.join(missing)}"] if missing else [])])
+
+
+def _judge(unit: dict, text: str) -> dict:
+    """Whether an installed service's unit (`text`, its file) is one an older insthub wrote:
+    {"stale": what is old about it, for people ("RestartSec=2, now 5; without
+    StartLimitIntervalSec=300, StartLimitBurst=5"), else None; "unchecked": why it was not judged
+    at all, else None}.  It is compared with the unit this insthub writes (unit_text) for the same
+    name, file and Python, as the unit itself says them.  Only a unit insthub wrote is judged: it
+    has insthub's first line (MARK), of a format no newer than this insthub's (UNIT_FORMAT), its file
+    is still there, its command is the one insthub makes of that file and Python, and each of its
+    settings is today's or what an older insthub wrote instead (_OLDER).  Any other unit was written
+    by hand, changed by hand (a value that no insthub wrote, a setting insthub does not write) or
+    written by a newer insthub, and is left as it is, so that update never undoes what somebody
+    chose, nor what a newer insthub wrote."""
+    def unchecked(why: str) -> dict:
+        return {"stale": None, "unchecked": why}
+
+    if not text.startswith(MARK):
+        return unchecked("insthub did not write it")
+    number = re.match(rf"{re.escape(MARK)} \(unit format (\d+)\)", text)
+    if number and int(number[1]) > UNIT_FORMAT:
+        return unchecked(f"a newer insthub wrote it (unit format {number[1]}; this one writes {UNIT_FORMAT})")
+    command, file = command_of(unit), target(unit)
+    if file is None:
+        arg = served(command)
+        return unchecked(f"the file it serves, {arg}, is gone" if arg else "its command is not one insthub writes")
+    try:
+        if command_for(file, command[0]) != command:
+            return unchecked("its command is not the one insthub writes for its file and Python")
+        have, want = _settings(text), _settings(unit_text(unit["name"], file, command[0]))
+    except (BusError, ValueError):  # (a name insthub would not give a service)
+        return unchecked("its name is not one insthub gives a service")
+    if have is None:
+        return unchecked("it was changed by hand (it sets one key twice)")
+    keys = list(dict.fromkeys([*want, *have]))
+    hand = [key for key in keys if have.get(key) != want.get(key) and have.get(key) not in _OLDER.get(key, ())]
+    if hand:
+        return unchecked(f"it was changed by hand ({_differences(have, want, hand, 'insthub writes')})")
+    old = [key for key in keys if have.get(key) != want.get(key)]
+    return {"stale": _differences(have, want, old, "now") or None, "unchecked": None}
 
 
 def _systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -199,15 +328,19 @@ def _systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
 
 
 def install(target: str | Path, name: str | None = None, start: bool = True, python: str | None = None,
-            login: bool | None = None) -> Path:
-    """Register the server of `target` as the service insthub-NAME and start it.
-    Installing again under the same name replaces the old definition.
-    `python`: the interpreter the service runs (default: this one).
+            login: bool | None = None, wait: float | None = None) -> Path:
+    """Register the server of `target` as the service insthub-NAME and start it (and wait for
+    it, as start() does).  Installing again under the same name replaces the old definition.
+    `python`: the interpreter the service runs (default: the one the file needs, as `insthub
+    check --import` checks it: extensions.python_for, which is this one unless the file's
+    devices' extensions or a virtualenv next to it or its drivers say another).
     `login`: start it at every login (default: as `start`); False: only when started by hand."""
+    from .extensions import python_for  # (here: the extensions are only looked for when installing)
+
     target = Path(target).expanduser().resolve()
     name = name or target.stem
     if python is None:
-        python = sys.executable
+        python = python_for(target)
     else:
         found = shutil.which(python)
         if found is None:
@@ -234,7 +367,10 @@ def install(target: str | Path, name: str | None = None, start: bool = True, pyt
     elif existed:  # a new definition: the new choice holds
         _systemctl("disable", path.name, check=False)
     if start:
-        _systemctl("restart" if existed else "start", path.name)
+        try:
+            _begin("restart" if existed else "start", name, wait)
+        except BusError as e:
+            raise BusError(f"installed {path}, but {e}") from None
     return path
 
 
@@ -254,8 +390,11 @@ def remove(name: str) -> None:
     _systemctl("reset-failed", path.name, check=False)
 
 
-def start(name: str) -> None:
-    _systemctl("start", _unit(name))
+def start(name: str, wait: float | None = None) -> int | None:
+    """Start it (also one that gave up after too many restarts), and wait up to `wait` seconds
+    (default WAIT; 0: not at all) until its server has announced itself (_wait_up).  Returns that
+    server's pid."""
+    return _begin("start", name, wait)
 
 
 def stop(name: str) -> None:
@@ -273,19 +412,58 @@ def disable(name: str) -> None:
     _systemctl("disable", _unit(name))
 
 
-def restart(name: str) -> None:
-    """Restart, e.g. after changing the server's code or config."""
-    _systemctl("restart", _unit(name))
+def restart(name: str, wait: float | None = None) -> int | None:
+    """Restart, e.g. after changing the server's code or config, and wait as start() does."""
+    return _begin("restart", name, wait)
 
 
-def units() -> list[dict]:
-    """The installed services: name, state ("active", "failed", "inactive", "activating", ...), sub
-    (systemd's detail, e.g. "auto-restart" while it waits to restart a crashed server), enabled,
-    pid (of the running server, else None) and command."""
-    paths = sorted(unit_dir().glob(f"{PREFIX}*.service"))
+def _begin(what: str, name: str, wait: float | None) -> int | None:
+    """systemctl `what` ("start", "restart", or "try-restart": a restart only if it runs), then _wait_up."""
+    unit = _unit(name)
+    _systemctl("reset-failed", unit, check=False)  # what failed before (or gave up) starts again by hand, and
+    # its counts of restarts and starts begin anew (reset-failed starts nothing)
+    _systemctl(what, unit)
+    return _wait_up(name, WAIT if wait is None else wait)
+
+
+def _wait_up(name: str, wait: float) -> int | None:
+    """Wait up to `wait` seconds (0: not at all) until the process of insthub-NAME has announced
+    its server (a registry entry with its pid), and return that pid.  Raises BusError, with the last
+    lines of its journal, if it ends or waits to be restarted (it crashed) before that, or if it
+    takes longer."""
+    if not wait:
+        return None
+    end = time.monotonic() + wait
+    while True:
+        u = units(name)[0]
+        if u["pid"] and any(entry.get("pid") == u["pid"] for entry in registry.servers()):
+            return u["pid"]
+        if u["state"] in ("failed", "inactive") or u["sub"] == "auto-restart":
+            why = "ended" if u["state"] == "inactive" else "stopped with an error"
+            break
+        if time.monotonic() > end:
+            why = f"has announced no insthub server after {wait:g} s"
+            break
+        time.sleep(0.25)
+    try:
+        said = journal(name, 20).rstrip() or "(nothing)"
+    except BusError as e:
+        said = str(e)
+    raise BusError(f"{PREFIX}{name} {why}. The end of its log (insthub service logs {name}):\n{said}")
+
+
+def units(name: str | None = None) -> list[dict]:
+    """The installed services (or the one called `name`): name, state ("active", "failed",
+    "inactive", "activating", ...), sub (systemd's detail, e.g. "auto-restart" while it waits to
+    restart a crashed server), enabled, pid (of the running server, else None), restarts (how often
+    systemd restarted it since it was started), result (how it last ended: "success", "exit-code",
+    "start-limit-hit" once it gave up, ...), command, unit (the path of its file), stale (what is
+    old about its unit, when an older insthub wrote it, else None) and unchecked (why its unit was
+    not judged: not written by insthub, changed by hand, ...; else None): see _judge."""
+    paths = [unit_dir() / _unit(name)] if name else sorted(unit_dir().glob(f"{PREFIX}*.service"))
     if not paths:
         return []
-    out = _systemctl("show", "--property=Id,ActiveState,SubState,UnitFileState,MainPID",
+    out = _systemctl("show", "--property=Id,ActiveState,SubState,UnitFileState,MainPID,NRestarts,Result",
                      *(path.name for path in paths), check=False).stdout
     shown = {}
     for block in out.split("\n\n"):
@@ -294,14 +472,180 @@ def units() -> list[dict]:
             shown[props["Id"]] = props
     found = []
     for path in paths:
-        command = next((line.split("=", 1)[1] for line in path.read_text().splitlines()
-                        if line.startswith("ExecStart=")), "")
+        text = path.read_text()
+        command = next((line.split("=", 1)[1] for line in text.splitlines() if line.startswith("ExecStart=")), "")
         props = shown.get(path.name, {})
         pid = int(props.get("MainPID") or 0)
-        found.append({"name": path.stem[len(PREFIX):], "state": props.get("ActiveState") or "unknown",
-                      "sub": props.get("SubState", ""), "enabled": props.get("UnitFileState") == "enabled",
-                      "pid": pid or None, "command": command, "unit": str(path)})
+        unit = {"name": path.stem[len(PREFIX):], "state": props.get("ActiveState") or "unknown",
+                "sub": props.get("SubState", ""), "enabled": props.get("UnitFileState") == "enabled",
+                "pid": pid or None, "restarts": int(props.get("NRestarts") or 0),
+                "result": props.get("Result", ""), "command": command, "unit": str(path)}
+        found.append({**unit, **_judge(unit, text)})
     return found
+
+
+def restarts_text(unit: dict) -> str:
+    """"restarted 3 times" (since it was started), and "gave up" when systemd did; else ""."""
+    n = unit.get("restarts") or 0
+    told = [f"restarted {n} time{'s' * (n != 1)}"] if n else []
+    if unit.get("result") == "start-limit-hit":
+        told.append("gave up: too many restarts")
+    return ", ".join(told)
+
+
+# ---------------------------------------------------------------- bringing services up to date
+def outdated(unit: dict) -> list[str]:
+    """Why the server of a running service (units()' entry) runs older code than its folders hold:
+    extensions.outdated, the rule `insthub list` and the window follow, applied to the registry entry
+    of the service's process (its MainPID) and to what its devices say of themselves.  None when it
+    does not run, has announced no server, or when that cannot be told; a server that does not
+    answer is judged by its files alone."""
+    from . import extensions  # (here: extensions imports this module)
+    from .client import connect, discover
+
+    entry = next((e for e in discover() if e.get("pid") == unit.get("pid")), None) if unit.get("pid") else None
+    if entry is None:
+        return []
+    try:
+        with connect(entry["address"], timeout=5.0, connect_timeout=2.0) as c:
+            devices = c.describe()
+    except (BusError, OSError):
+        devices = None
+    return extensions.outdated(entry, devices)
+
+
+def plan(unit: dict, reasons: list[str] = ()) -> list[str]:
+    """What update() does for a service (units()' entry), in order: "rewrite" its unit when it is stale,
+    then "restart" it when it runs and its unit was rewritten or its server runs older code
+    (`reasons`: why, as outdated() says).  A service that does not run is never started.  [] for one up
+    to date.  The one rule for this: the window asks it too, to offer Update and to say what will
+    restart."""
+    steps = ["rewrite"] if unit.get("stale") else []
+    if unit.get("state") == "active" and (steps or reasons):
+        steps.append("restart")
+    return steps
+
+
+_STEPS = {"rewrite": ("write its unit anew", "wrote its unit anew"), "restart": ("restart it", "restarted it")}
+
+
+def plan_text(steps: list[str], done: bool = False) -> str:
+    """Steps of plan() for people: "write its unit anew and restart it" (`done`: "wrote ... restarted it")."""
+    return " and ".join(_STEPS[step][done] for step in steps)
+
+
+@dataclasses.dataclass
+class Update:
+    """What update() found for one service, and what it did or, with `check`, would do: the record
+    that `insthub service update` prints (text(); with --json, as it is) and the window shows."""
+
+    name: str
+    state: str = "unknown"  #: what systemd said of it (units()' "state")
+    stale: str | None = None  #: what is old about its unit (units()' "stale")
+    unchecked: str | None = None  #: why its unit was not judged, and so is left as it is (units()' "unchecked")
+    outdated: list[str] = dataclasses.field(default_factory=list)  #: why its server runs older code (outdated())
+    plan: list[str] = dataclasses.field(default_factory=list)  #: what it does, in order (plan()); [] if up to date
+    done: list[str] = dataclasses.field(default_factory=list)  #: the steps of the plan that were done
+    pid: int | None = None  #: its server's process after the restart
+    error: str | None = None  #: why (the rest of) the plan was not done, or could not be
+    check: bool = False  #: only looked: nothing was changed
+
+    @property
+    def found(self) -> list[str]:
+        """What is old about it, a sentence each."""
+        return [*([f"its unit is out of date ({self.stale})"] if self.stale else []),
+                *([f"its server runs older code ({'; '.join(self.outdated)})"] if self.outdated else [])]
+
+    @property
+    def outcome(self) -> str:
+        """What was done, or would be, and what went wrong; "" when there was nothing to do."""
+        if self.check and self.plan:
+            told = [f"would {plan_text(self.plan)}" + (f", but cannot: {self.error}" if self.error else "")]
+        else:
+            told = [plan_text(self.done, done=True) + (f" (pid {self.pid})" if self.pid else "")] if self.done else []
+            told += [f"error: {self.error}"] if self.error else []
+        if self.plan == ["rewrite"] and not self.error:
+            told.append("it does not run, so it is not started; its next start uses the new unit")
+        return "; ".join(told)
+
+    def text(self) -> str:
+        """For people: "NAME: what was found" ("up to date"), then the outcome on a line of its own;
+        and, for a unit that was not judged, why (never "up to date": nobody looked)."""
+        told = [self.outcome] if self.outcome else []
+        if self.unchecked:
+            told.append(f"its unit was not checked: {self.unchecked}, so it is left as it is")
+        found = "; ".join(self.found)
+        if not found:
+            return f"{self.name}: {'; '.join(told) or 'up to date'}"
+        return "\n    ".join([f"{self.name}: {found}", *told])
+
+
+def update(names: list[str] | None = None, *, check: bool = False, wait: float | None = None) -> list[Update]:
+    """Bring services up to date after their code or insthub changed (a `git pull`, an edited
+    driver): for each service called in `names` (default: every insthub service), what plan()
+    says.  A stale unit is written anew with the same file and the same Python, never another one,
+    then systemd reloads it; it is written in place, so whether it starts at login stays as it was.
+    A running service whose unit was written anew, or whose server runs older code (outdated), is
+    restarted, waiting up to `wait` seconds as restart() does.  A service that does not run is never
+    started; one up to date is left alone.  `check`: only find out, change nothing.
+    Each service is looked at again just before its turn, since an earlier one's restart takes a
+    while: one stopped meanwhile is not started, and its restart is systemd's try-restart, which
+    never starts a service that has stopped.
+    One service failing (its Python gone, a restart that does not come up) never stops the others:
+    the result is a record (Update) for each, in order.  Raises BusError only without systemd."""
+    known = [u["name"] for u in units()]
+    records = []
+    for name in dict.fromkeys(known if names is None else names):
+        try:
+            if name not in known:
+                raise BusError(f"no service {PREFIX}{name} (see `insthub service list`)")
+            unit = units(name)[0]  # (as it is now)
+        except BusError as e:  # (also one removed meanwhile)
+            records.append(Update(name, error=str(e), check=check))
+            continue
+        records.append(_update(unit, check, wait))
+    return records
+
+
+def _update(unit: dict, check: bool, wait: float | None) -> Update:
+    record = Update(unit["name"], unit["state"], unit.get("stale"), unit.get("unchecked"), check=check)
+    try:
+        record.outdated = outdated(unit)
+        record.plan = plan(unit, record.outdated)
+        record.error = _cannot_start(unit) if record.plan else None
+        if check or record.error:
+            return record
+        for step in record.plan:
+            if step == "rewrite":
+                path = Path(unit["unit"])  # (in place: the link that starts it at login stays)
+                path.write_text(unit_text(unit["name"], target(unit), command_of(unit)[0]))
+                _systemctl("daemon-reload")
+            else:
+                record.pid = _begin("try-restart", unit["name"], wait)
+            record.done.append(step)
+    except Exception as e:  # noqa: BLE001  (said in its record: one service never stops the others)
+        record.error = str(e) or type(e).__name__
+    return record
+
+
+def _cannot_start(unit: dict) -> str | None:
+    """Why a service could not start again, so that update leaves it as it is: the Python its unit
+    runs is gone (a virtualenv deleted or made anew elsewhere), or the file it serves is; None when
+    neither is known to be gone.  It never picks another Python by itself.  The command it advises
+    keeps the service as it is: not started if it does not run, and starting at login or not."""
+    command, name = command_of(unit), unit["name"]
+    file = served(command)
+    if command and shutil.which(command[0]) is None:
+        gone, again = f"its Python, {command[0]}, is gone", f"{shlex.quote(file or 'FILE')} --name {name} --python PATH"
+    elif file is not None and os.path.isabs(file) and not os.path.isfile(file):
+        gone, again = f"its file, {file}, is gone", f"FILE --name {name} --python {shlex.quote(command[0])}"
+    else:
+        return None
+    if unit.get("state") != "active":  # (--no-start: not at login either; enable gives that back)
+        again += " --no-start" + (f", then insthub service enable {name}" if unit.get("enabled") else "")
+    elif not unit.get("enabled"):
+        again += " --no-login"
+    return f"{gone}, so it could not start again; install it again (insthub service install {again})"
 
 
 def journal(name: str, lines: int = 200) -> str:

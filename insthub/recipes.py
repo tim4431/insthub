@@ -739,8 +739,17 @@ def available(discovered: list | None = None) -> tuple[list[Recipe], list[str]]:
     from . import extensions
 
     found, problems = [], []
-    python = extensions.venv_python(folder())
-    for path in your_files():
+    yours = folder()
+    python = extensions.venv_python(yours)
+    # As for extensions: nothing that another user may change is run (extensions._others).
+    who = (extensions._others(yours) if yours.is_dir() else None) or \
+        (extensions._python_shared(Path(python)) if python else None)
+    if who:
+        problems.append(f"{yours}: insthub runs none of your recipes, since {who}")
+    for path in [] if who else your_files():
+        if who := extensions._others(path):
+            problems.append(f"{path}: insthub runs none of its recipes, since {who}")
+            continue
         recipes, said = read_file(path, YOURS, python)
         found += recipes
         problems += said

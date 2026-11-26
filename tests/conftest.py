@@ -1,12 +1,18 @@
+import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
 
 import insthub
 from insthub import registry, sim
+
+# Before any test module imports Qt (this file is read first): no window on a real screen, and none needed
+# (a test module run alone, without a display, would abort the run).
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 @pytest.fixture(autouse=True)
@@ -19,10 +25,32 @@ def _isolated_bus(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("INSTHUB_DEVICES", str(path / "devices.toml"))
     monkeypatch.setenv("INSTHUB_EXTENSIONS", "none")
     monkeypatch.setenv("INSTHUB_RECIPES", str(path / "recipes"))
+    insthub.client._remote_seen[0] = float("-inf")  # what servers on other computers said: asked again
     yield
     insthub.close_all()
     for server in insthub.server.local_servers():
         server.stop()
+
+
+@pytest.fixture(autouse=True)
+def _process_wide_logging(monkeypatch):
+    """What a test that runs `insthub serve` or `insthub sim` in this process changes for the
+    whole process (server.keep_logs(everything=True)) is put back: the hooks for exceptions that
+    nothing caught (PyQt hands an exception raised in a slot to a hook that is not Python's own,
+    instead of failing the test), and where the log is kept from.  (Its basicConfig() does nothing
+    here: pytest's own handlers are on the root logger.)"""
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    root, ours, recent = logging.getLogger(), logging.getLogger("insthub"), insthub.server._RECENT
+    on_root, ours_before, level = recent in root.handlers, list(ours.handlers), root.level
+    yield
+    if not on_root:
+        root.removeHandler(recent)
+    for handler in [h for h in ours.handlers if h not in ours_before]:
+        ours.removeHandler(handler)
+    for handler in ours_before:
+        ours.addHandler(handler)  # (no-op for one still there)
+    root.setLevel(level)
 
 
 @pytest.fixture

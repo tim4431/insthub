@@ -8,13 +8,20 @@ scanning those files.  The directory is private to the user (mode 0700), which
 is also what protects the Unix sockets.
 
 Devices on other machines are listed by hand in a small TOML file
-(`$INSTHUB_DEVICES`, default `~/.config/insthub/devices.toml`):
+(`$INSTHUB_DEVICES`, default `~/.config/insthub/devices.toml`, or in
+$XDG_CONFIG_HOME if set: see config_dir), and so are
+servers there whose devices are found by asking them:
 
     [devices]
     awg = "tcp://192.168.1.20:8701"
 
-`edit_static_devices()` adds and removes entries of it, leaving the rest of the
-file (comments included) as it was; the manager window uses it.
+    [servers]
+    labpc = "tcp://192.168.1.21:8700"
+
+`remote_addresses()` is the one list of those servers, for everything that
+looks beyond this machine.  `edit_static_devices()` adds and removes entries
+of [devices], leaving the rest of the file (comments included) as it was; the
+manager window uses it.
 """
 from __future__ import annotations
 
@@ -26,6 +33,8 @@ import tempfile
 import tomllib
 from collections.abc import Iterable
 from pathlib import Path
+
+from .errors import BusError
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
 
@@ -106,23 +115,28 @@ def _alive(pid: int) -> bool | None:
     return True
 
 
+def identity(info: dict) -> tuple:
+    """What tells one server's process from every other, on any computer: its name, its pid and
+    when it started, as its hello, its registry entry and discover() say them.  Two addresses
+    whose servers have the same identity reach the same server (its addresses are no test: a
+    server on another computer may announce the very ones of a server here, as tcp://127.0.0.1
+    and the same port)."""
+    return info.get("server"), info.get("pid"), info.get("started")
+
+
 def _answers(info: dict) -> bool:
     """Whether the server of a registry entry still answers at one of its
     addresses, and is the very process the entry names (a port can be reused).
     Used where a pid cannot be tested; works on every platform."""
-    from .client import _SocketTransport  # here, not at the top: client imports this module
-    from .errors import BusError
+    from .client import connect  # here, not at the top: client imports this module
 
     for address in info.get("addresses", ()):
         try:
-            transport = _SocketTransport(address, connect_timeout=1.0)
+            client = connect(address, connect_timeout=1.0)
         except (BusError, OSError, ValueError, AttributeError):
             continue
-        try:
-            hello = transport.hello
-            return hello.get("pid") == info.get("pid") and hello.get("server") == info.get("server")
-        finally:
-            transport.close()
+        with client:
+            return identity(client.hello) == identity(info)
     return False
 
 
@@ -150,20 +164,50 @@ def find(device: str) -> list[dict]:
     return [s for s in servers() if device in s.get("devices", ())]
 
 
+def config_dir() -> Path:
+    """insthub's folder of your settings: insthub in XDG_CONFIG_HOME, which is ~/.config unless set
+    (devices.toml, extensions.toml, the configs of the servers the window makes)."""
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "insthub"
+
+
 def devices_file() -> Path:
     """The hand-written table of devices on other machines."""
     path = os.environ.get("INSTHUB_DEVICES")
-    return Path(path) if path else Path.home() / ".config" / "insthub" / "devices.toml"
+    return Path(path) if path else config_dir() / "devices.toml"
+
+
+def _devices_table(name: str) -> dict[str, str]:
+    """A table of devices.toml ("devices", "servers"): {name: address}.  Raises BusError, naming
+    the file, if it cannot be read or is not TOML."""
+    path = devices_file()
+    try:
+        with open(path, "rb") as f:
+            table = tomllib.load(f).get(name, {})
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        raise BusError(f"cannot read {path}: {e.strerror or e}") from None
+    except tomllib.TOMLDecodeError as e:
+        raise BusError(f"{path}: {e}") from None
+    return {str(k): str(v) for k, v in table.items()} if isinstance(table, dict) else {}
 
 
 def static_devices() -> dict[str, str]:
-    """The hand-written name -> address table for devices on other machines."""
-    try:
-        with open(devices_file(), "rb") as f:
-            table = tomllib.load(f).get("devices", {})
-    except FileNotFoundError:
-        return {}
-    return {str(k): str(v) for k, v in table.items()}
+    """The hand-written name -> address table for devices on other machines.  Raises BusError,
+    naming devices.toml, if it cannot be read."""
+    return _devices_table("devices")
+
+
+def remote_addresses() -> dict[str, list[str]]:
+    """The servers on other machines that this one knows of: {address: the names of the devices
+    devices.toml lists there}, each address once.  Those of its [servers] table come first, with
+    no device of their own unless [devices] lists some there too: their devices are found by asking
+    them (and their names in the table are for you: a server says its own).  Raises BusError,
+    naming devices.toml, if it cannot be read."""
+    found: dict[str, list[str]] = {address: [] for address in _devices_table("servers").values()}
+    for name, address in static_devices().items():
+        found.setdefault(address, []).append(name)
+    return found
 
 
 def edit_static_devices(add: dict[str, str] | None = None, remove: Iterable[str] = ()) -> Path:

@@ -33,8 +33,8 @@ from pathlib import Path
 
 from . import cli, config, extensions, registry, service, tomlfile
 from . import widgets as ui
-from .client import _SocketTransport
-from .inventory import find_python, server_python
+from .client import connect
+from .inventory import server_python
 from .qt import QtCore, QtGui, QtWidgets
 
 Qt = QtCore.Qt
@@ -71,7 +71,7 @@ class _Offers(QtGui.QStandardItemModel):
 
 def servers_folder() -> Path:
     """Where new server configs go unless another folder is chosen."""
-    return Path.home() / ".config" / "insthub" / "servers"
+    return registry.config_dir() / "servers"
 
 
 # ---------------------------------------------------------------- reading a driver without running it
@@ -143,15 +143,11 @@ def constructor_args(driver: str, folder: str = "", base: str | Path | None = No
 
 
 def driver_file(driver: str, folder: str = "", base: str | Path | None = None) -> Path | None:
-    """The .py file of a driver ("module:Class") in `folder` (a relative one counts from `base`), if there."""
+    """The .py file of a driver ("module:Class") in `folder` (a relative one counts from `base`, as
+    in a server file: config.device_folder), if there."""
     module = driver.partition(":")[0]
-    if not module or not folder:
-        return None
-    where = Path(folder).expanduser()
-    if not where.is_absolute() and base is not None:
-        where = Path(base) / where
-    stem = where / Path(*module.split("."))
-    return next((p for p in (stem.with_suffix(".py"), stem / "__init__.py") if p.is_file()), None)
+    where = config.device_folder({"path": folder}, base) if module else None
+    return extensions.module_file(module, where) if where is not None else None
 
 
 # ---------------------------------------------------------------- a new server
@@ -252,19 +248,15 @@ def _gone(old: dict, new: dict, path: tuple = ()) -> list[str]:
     for k, v in old.items():
         if k not in new:
             if isinstance(v, dict):
-                out.append(f"<code>{_esc(tomlfile.header((*path, k)))}</code>")
+                out.append(f"<code>{ui.esc(tomlfile.header((*path, k)))}</code>")
             else:
                 line = f"{tomlfile.key(k)} = {tomlfile.value(v)}"
                 line = line if len(line) <= 60 else line[:57] + "..."
-                out.append(f"<code>{_esc(line)}</code>" + (f" in <code>{_esc(tomlfile.header(path))}</code>"
-                                                            if path else ""))
+                out.append(f"<code>{ui.esc(line)}</code>" + (f" in <code>{ui.esc(tomlfile.header(path))}</code>"
+                                                              if path else ""))
         elif isinstance(v, dict) and isinstance(new[k], dict):
             out += _gone(v, new[k], (*path, k))
     return out
-
-
-def _esc(text) -> str:
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def read_config(text: str, base: str | Path | None = None) -> tuple[dict, list[DeviceSpec]]:
@@ -776,13 +768,12 @@ class ServerDialog(QtWidgets.QDialog):
 
     def _needed_python(self, d: DeviceSpec) -> str | None:
         """The Python a device's code is to run in, if it says: that of the extension it was chosen
-        from (none for insthub's own, which runs in any Python that has insthub), else a virtualenv's
-        next to its driver's file."""
+        from (none for insthub's own, which runs in any Python that has insthub), else as for a
+        device of a server file (extensions.device_python: its folder's extension, or virtualenv)."""
         if d.offer is not None:
             ext = d.offer[0]
             return None if ext.builtin else ext.python
-        file = driver_file(d.driver, d.folder, self._base())
-        return extensions.venv_python(file.parent) if file is not None else None
+        return extensions.device_python({"driver": d.driver, "path": d.folder}, self._base())
 
     def _fit_python(self) -> None:
         """A new server runs in the Python its devices' code needs (_needed_python): that of the
@@ -1026,7 +1017,7 @@ class ServerDialog(QtWidgets.QDialog):
         old, new = tomllib.loads(self._original), tomllib.loads(text)
         before = old.get("devices", {})
         names = {d.was: d.name for d in self.devices if d.was is not None}
-        gone = [f"<code>{_esc(tomlfile.header(('devices', n)))}</code>" for n in before if n not in names]
+        gone = [f"<code>{ui.esc(tomlfile.header(('devices', n)))}</code>" for n in before if n not in names]
         if "devices" in old:
             old["devices"] = {names[n]: table for n, table in before.items() if n in names}
             if not old["devices"] and "devices" not in new:
@@ -1182,8 +1173,8 @@ class ServiceDialog(QtWidgets.QDialog):
         box.addWidget(ui.label("Keep a server running", "h1"))
         box.addWidget(ui.label("It starts now and, unless you switch it off below, at every login; it is started "
                                "again if it crashes (a systemd user service). Python must be the interpreter that "
-                               "has the drivers' packages: a virtualenv next to the server file is picked by "
-                               "itself.", "muted", wrap=True))
+                               "has the drivers' packages: that of their extensions, or a virtualenv next to "
+                               "the server file or its drivers, is picked by itself.", "muted", wrap=True))
         box.addLayout(form)
         box.addWidget(ui.label("It runs:", "small"))
         box.addWidget(self.command)
@@ -1206,7 +1197,7 @@ class ServiceDialog(QtWidgets.QDialog):
         path = Path(text.strip()).expanduser()
         if path.suffix in (".toml", ".py") and path.is_file():
             self.name.setText(path.stem)
-            self.python.setText(find_python(path))
+            self.python.setText(extensions.python_for(path))
         self._show_command()
 
     def _show_command(self, *_) -> None:
@@ -1254,13 +1245,8 @@ class ServiceDialog(QtWidgets.QDialog):
 # ---------------------------------------------------------------- devices on another computer
 def ask_server(address: str, timeout: float = 4.0) -> tuple[dict, dict]:
     """(its info, its devices) from the server at a tcp:// address."""
-    transport = _SocketTransport(address, connect_timeout=timeout)
-    try:
-        info = transport.request("", "info", (), {}).result(timeout)
-        devices = transport.request("", "devices", (), {}).result(timeout)
-    finally:
-        transport.close()
-    return info, devices
+    with connect(address, timeout=timeout, connect_timeout=timeout) as client:
+        return client.info(), client.describe()
 
 
 def tcp_address(text: str) -> str:

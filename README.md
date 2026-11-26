@@ -71,8 +71,23 @@ flowchart LR
   windows for them, with one small file, `insthub-extension.toml`. `insthub
   ext add` it, and the window's New server lists its devices, ready to run in
   the project's own Python; a device's page then has a button for each of its
-  windows (`insthub open DEVICE` does the same). `insthub check` says what is
-  wrong with one.
+  windows (`insthub open DEVICE` does the same). Such a window can show the
+  same settings and commands as the device's page, ready-made. `insthub
+  check` says what is wrong with one, and
+  [`examples/extension`](examples/extension) is a complete one to copy, which
+  runs without hardware.
+- **Looked after.** `insthub logs SERVER` shows what any server logged, from
+  any computer. A service waits until its server answers, shows why it did
+  not, and stops restarting one that cannot start. After you edit a driver or
+  update insthub, `insthub list` and the window say which servers still run
+  the old code and need a restart. `insthub.states()` saves what every
+  instrument was set to, next to your data.
+- **Updated in one step.** `insthub service update` restarts the services
+  that run older code and writes anew the units an older insthub wrote, with
+  the same Python, never starting one that is stopped; `--check` tells a
+  script whether anything needs doing, and `--json` says it as data. In the
+  window it is **Update** on a server, or **Update all**. The window and an
+  agent's `insthub mcp` say when they run older code themselves.
 - **Recipes.** Keep the snippets you run again and again (a square wave on
   the Red Pitaya, arm it and wait for a trigger, a comb across two
   instruments) as Python functions in a folder, and run them by name: from
@@ -200,7 +215,8 @@ you list:
   stays off the instrument until you resume it, while you use it by hand.
 - **Servers**: start, stop and restart them, read their logs, choose whether
   each starts at login, edit their config, and see which programs are
-  connected.
+  connected, and which servers run older code than their folders hold;
+  **Update** (or **Update all**) loads the new code.
 - **Recipes**: your recipes, each with its code, **Run** and **Stop**. A
   device's page lists those that use it, and **Save as recipe...** keeps a
   command you just ran as one.
@@ -239,15 +255,15 @@ gui` does this setup with a click and shows which agents are connected. See
 | [Running servers](docs/running-servers.md) | starting servers, keeping them running in the background, who sets up what, several computers |
 | [AI agents](docs/agents.md) | letting Claude Code or another agent use the instruments: setup, the tools, what comes back |
 | [Design](docs/design.md) | the rules every change follows, extensions (an instrument's driver and UI in one folder, each run where its libraries are), recipes, and what we learned from other lab-control projects |
-| [examples/](examples/) | four runnable examples and a file of recipes, all on simulated instruments |
+| [examples/](examples/) | four runnable examples, a file of recipes, and [a reference extension](examples/extension) (a laser with a panel and an app) to start your own from, all on simulated instruments |
 
 ## Status
 
-- 471 tests cover calls, streams, device lifecycle, finding servers,
+- 569 tests cover calls, streams, device lifecycle, finding servers,
   reconnecting, mixed insthub versions, the command line, config files,
-  services, extensions, recipes, the GUIs, the agent interface, and how little
-  `import insthub` loads. Run them with `python -m pytest tests` (about a
-  minute).
+  services, extensions (the reference extension among them), recipes, the
+  GUIs, the agent interface, and how little `import insthub` loads. Run them
+  with `python -m pytest tests` (about a minute).
 - Developed and tested on Linux with Python 3.11, 3.12 and 3.14. Written to
   run on Windows, but never run there.
 - Not included: passwords or encryption for network connections, clients for
@@ -268,12 +284,13 @@ insthub/
   client.py     connect, device; proxies, futures, subscriptions, reconnecting
   codec.py      what can be sent, and how it is packed
   wire.py       the layout of a message on a connection
-  registry.py   finding servers by name
-  config.py     servers from a TOML file
-  service.py    insthub service: background services
-  extensions.py manifests: what an instrument's folder adds
+  registry.py   finding servers by name         errors.py   the exceptions a call can raise
+  config.py     servers from a TOML file        tomlfile.py changing one in place, comments kept
+  service.py    insthub service: background services, and bringing them up to date
+  extensions.py finding, checking and starting extensions (insthub ext, check, open)
   recipes.py    recipes: Python functions you keep, read without running them, run by name
   qt.py         helpers for Qt GUIs             viewer.py   the generic live viewer
+  controls.py   a device's settings and commands, for the window and for panels
   mcp.py        insthub mcp: the bus for AI agents
   render.py     results as JSON plus files and plots, for agents
   manager.py    insthub gui: the window (refreshing, navigation, actions), the tray icon
@@ -281,9 +298,12 @@ insthub/
   inventory.py  what it knows of servers and devices, and how it asks them (no Qt)
   widgets.py    its look: colours, icons, tiles  launcher.py its launcher icon
   sim.py        simulated instruments           bench.py    insthub bench
+  sim_ui.py     a panel for the simulated scope
+  insthub-extension.toml   insthub's own extension: its simulated instruments and that panel
   cli.py        the insthub command
 docs/           the pages above
 examples/       runnable examples
+  extension/    the reference extension: a simulated laser, with a panel and an app
 tests/
 ```
 

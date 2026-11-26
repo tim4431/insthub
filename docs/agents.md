@@ -65,6 +65,13 @@ claude mcp add --scope user insthub -- insthub mcp
 
 - **Check it.** `claude mcp list` shows whether it connects, and `/mcp`
   inside a session shows its tools.
+- **After an update.** The agent starts `insthub mcp` once per session, so
+  after a `git pull` it still runs the old code. `list_devices` then adds a
+  note ("this insthub mcp runs older insthub code than the disk holds
+  (insthub/mcp.py changed since it started): ask the user to reconnect it"),
+  and the agent can ask you to reconnect it: in Claude Code, `/mcp`, then
+  reconnect insthub. The servers themselves are brought up to date as
+  [updating](running-servers.md#updating) says.
 
 Other MCP clients (Claude Desktop, other agents) take the same command and
 arguments in their own configuration.
@@ -110,8 +117,13 @@ There are two steps, and you only set up the first.
    tells the agent what insthub is and where to start. You do not need to
    explain it in your prompt.
 2. **insthub finds the instruments** the same way every client does: the
-   servers running on this computer, plus the devices on other computers
-   listed in `devices.toml` (see [running servers](running-servers.md#reaching-a-server-from-another-computer)).
+   servers running on this computer, plus the devices and servers on other
+   computers that `devices.toml` names (see [running servers](running-servers.md#reaching-a-server-from-another-computer)).
+   `list_devices` notes a server there that does not answer, and a
+   `devices.toml` that cannot be read. It lists each device where the other
+   tools find it (as `insthub.locate` does: this computer first, then
+   `devices.toml`'s `[devices]`); a name that two servers have, so that the
+   tools refuse it as ambiguous, is left out with a note that says so.
    A server you start later is visible at the agent's next call.
 
 The agent's knowledge of each instrument is whatever `describe` returns: the
@@ -327,6 +339,11 @@ The same things make a device pleasant to use from a notebook:
 - **Keep state up to date** with `set_state`. `describe` includes it, so the
   agent sees the current settings without a query per property.
 
+The device of the reference extension,
+`examples/extension/demolaser_insthub/device.py`, does most of this for a
+wrapped driver: units and limits, choices from an annotation, a value polled
+every second, what is dangerous, and that it is simulated.
+
 ## Trying it without hardware
 
 `insthub sim` includes a spectrum analyzer (`sa`) that is cabled to the
@@ -381,6 +398,10 @@ There are two ways:
   read-only ones (`list_devices`, `describe`, `get`, `snapshot`), or every
   tool except `call_dangerous` (and `run_recipe`, unless you trust your
   recipes with any values an agent picks).
+- **It does not restart servers or services.** A restart drops an
+  instrument for a few seconds, for every program that uses it, so no tool
+  does it. An agent that has a shell can run `insthub service update`, as
+  you can, when you ask it to.
 - **It cannot stop a command once it has started.** If a call outlasts its
   timeout, the agent is told the command may still be running, and later
   calls to that device wait behind it (see

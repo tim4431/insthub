@@ -476,6 +476,22 @@ def test_names_that_several_folders_share_are_told_apart_by_path(tmp_path):
     assert recipes.available([broken])[1] == [said]
 
 
+def test_recipes_that_another_user_may_change_are_not_run():
+    path = write("lab.py", "def setup():\n    pass\n")
+    write("other.py", "def other():\n    pass\n")
+    path.chmod(0o666)
+    found, problems = recipes.available()
+    assert [r.name for r in found] == ["other"]
+    said = f"{path}: insthub runs none of its recipes, since every user may change {path} (chmod o-w {path})"
+    assert problems == [said]
+    path.chmod(0o644)
+    recipes.folder().chmod(0o777)
+    found, problems = recipes.available()
+    assert found == [] and problems[0].startswith(f"{recipes.folder()}: insthub runs none of your recipes, since every")
+    with pytest.raises(RecipeError, match="no recipe 'setup' .1 cannot be listed"):
+        recipes.find("setup")
+
+
 def test_run_here_keeps_the_folder_for_imports_made_when_it_runs(server):
     write("helper2.py", "VALUE = 'helper'\n")
     write("lazy.py", "def lazy():\n    import helper2\n    return helper2.VALUE\n")

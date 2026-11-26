@@ -39,11 +39,20 @@ running in the background, register it as a service:
 insthub service install lab.toml           # or a .py server script
 ```
 
-This writes a small *systemd user service*, starts it, and from then on:
+This writes a small *systemd user service*, starts it, waits until its server
+answers (up to a minute), and from then on:
 
 - it starts by itself when you log in (unless installed with `--no-login`),
-- it is restarted if it crashes,
+- it is restarted 5 seconds after it crashes, but not forever: after 5 starts
+  within 5 minutes systemd gives up and marks it *failed*, so a server that
+  cannot start (a broken config, an instrument it cannot do without) does not
+  restart all day. `insthub service list` and its page in the window say how
+  often it was restarted,
 - its output is kept and can be read with `insthub service logs lab`.
+
+If the server stops, or does not answer within a minute, `install` (and
+`start` and `restart`) say so and print the last 20 lines of its log, which
+usually name the problem.
 
 An instrument that is not always connected may be better off with
 `--no-login`: installed, with its logs and its buttons in the window, but
@@ -55,11 +64,12 @@ login** switch on the server's page in the window.
 |---|---|
 | `insthub service install TARGET [--name NAME] [--python PATH]` | register and start, now and at every login; run it again to replace the definition |
 | `... install TARGET --no-login` | register and start now, but not at login |
-| `insthub service list` | what is installed, whether it is running, and whether it starts at login ("at login") or only when started ("by hand") |
+| `insthub service list` | what is installed, whether it is running, whether it starts at login ("at login") or only when started ("by hand"), how often it was restarted after a crash, and what is out of date: its unit, or the code its server runs |
 | `insthub service logs NAME [-f]` | its output; `-f` follows it live |
-| `insthub service restart NAME` | restart, after changing code or config |
+| `insthub service restart NAME` | restart, after changing code or config, and wait until it answers |
+| `insthub service update [NAME ...] [--check] [--json]` | after a `git pull` or an edited driver: write the units of an older insthub anew, and restart the services that run older code (see [updating](#updating)) |
 | `insthub service stop NAME` | stop it; it starts again with `start`, or, if it starts at login, the next time your user's services start (a login after all your sessions ended, or a boot with lingering on) |
-| `insthub service start NAME` | start it again |
+| `insthub service start NAME` | start it again, also one that gave up after too many restarts, and wait until it answers |
 | `insthub service enable NAME` / `disable NAME` | start it at every login from now on, or no longer |
 | `insthub service remove NAME` | stop it and remove it |
 
@@ -74,13 +84,17 @@ Nothing here needs administrator rights. Two details:
   the computer boots, with nobody logged in, turn on *lingering* once:
   `sudo loginctl enable-linger $USER`. `insthub service install` tells you if
   it is off.
-- **Which Python.** The service runs with the Python interpreter that ran
-  `insthub service install`, or the one named with `--python`. If a server
-  needs the packages of a particular virtualenv, install it with that
-  virtualenv's `insthub`:
+- **Which Python.** The service runs with the Python that the server file
+  needs, by the rule that `insthub check --import` and the window follow
+  too: that of its devices' [extensions](guide.md#extensions) when they
+  agree on one, else a virtualenv's (`.venv`, `venv` or `env`) next to the
+  file or next to a device's code, else the Python interpreter that ran
+  `insthub service install`. `--python` names another. If a server needs
+  the packages of a virtualenv that is not next to its files, install it
+  with that virtualenv's `insthub` (or pass `--python`):
 
   ```bash
-  ~/Code/mydriver/.venv/bin/insthub service install ~/Code/mydriver/server.toml
+  ~/Code/mydriver/.venv/bin/insthub service install ~/lab/server.toml
   ```
 
   Before it writes anything, `install` checks that this Python can import
@@ -96,9 +110,8 @@ Nothing here needs administrator rights. Two details:
   which has insthub but none of your drivers.
 
   `insthub check server.toml --import` makes the same check without
-  installing anything, in the Python of the devices'
-  [extensions](guide.md#extensions) (else the `.venv` next to the file), and
-  also checks each device's `extension` against the manifest of its folder.
+  installing anything, in the same Python, and also checks each device's
+  `extension` against the manifest of its folder.
 
 This needs Linux with systemd. On other systems, start servers with the
 system's own autostart mechanism.
@@ -106,6 +119,162 @@ system's own autostart mechanism.
 **Servers with a window** are different. A program that shows a GUI belongs to
 your desktop session, so start it from a launcher or the desktop's autostart,
 not as a service.
+
+## After changing code
+
+A server loads its code once, when it starts. After you edit a driver, pull a
+new version of an extension or update insthub, the servers that were running
+still run the old code. insthub says which ones:
+
+- `insthub list` adds a line under such a server:
+
+  ```
+  lab  (pid 4242)  ipc:///run/user/1000/insthub/lab.sock
+      out of date: hp8562a_insthub/device.py changed since it started; a restart loads the new code
+      analyzer         SpectrumAnalyzer connected; ...
+  ```
+
+- the window marks it **OUT OF DATE** on its card and above its devices, and
+  its page says what changed and how to restart it.
+
+Restart the servers marked so: [updating](#updating) says what each kind
+needs (for services, `insthub service update` does it). Programs using a
+server get an error for calls under way, then reconnect by themselves.
+
+How it knows: a server writes into its `.json` file in the runtime folder
+the files of the code it loaded, and when each was last changed at that
+time. Those are insthub's own modules and the modules in its devices'
+folders, but not the libraries of a virtualenv in such a folder (a project's
+`.venv`). A module that a driver imports later, inside a command say, is
+added within about a second. A file changed or deleted since then is code
+the server does not run. It compares times, not contents, so a file saved
+without a change counts too.
+
+When the manifest of a device's extension changed after the server started
+(a `git pull`), the `version` it holds is also compared with the
+`extension_version` the device states ("the folder has demo-laser 0.2, it
+runs 0.1"). Versions that disagreed already when the server started are not
+a sign of old code, since a restart would not change them: `insthub check`
+warns about a class and a manifest that disagree.
+
+Only servers on this computer are judged: one on another computer, or one
+started by an older insthub, which writes no such list, is never marked for
+its files.
+
+## Updating
+
+After a `git pull` of insthub or of an extension, or after you edit a
+driver, the servers that were running still run the old code. What each kind
+of server needs:
+
+| The server is | It needs | How |
+|---|---|---|
+| a service | a restart, if it runs older code; its unit written anew, if an older insthub wrote it | `insthub service update`, or **Update** in the window |
+| a server the window started | a restart | **Update** (or **Restart**) on its page in the window |
+| a server you started in a terminal | a restart | Ctrl-C, then start it again there |
+| a server on another computer | what that computer's setup needs | update it there |
+
+```bash
+insthub service update            # every service
+insthub service update lab rf     # only these
+insthub service update --check    # only say what it would do
+```
+
+For each service, `update` does what is needed and nothing more:
+
+- **Its unit is out of date** when an older insthub wrote it, for example one
+  from before the limit on restart loops (`RestartSec=2, now 5; without
+  StartLimitIntervalSec=300, StartLimitBurst=5`). It is written anew for the
+  same server file and the same Python, never another one, and systemd
+  reloads it. Whether it starts at login stays as it was. If that Python is
+  gone (a virtualenv deleted, or made anew elsewhere), `update` says so and
+  leaves the service as it is: install it again with `--python`, as the
+  command it prints says (that command keeps the service stopped, or not
+  starting at login, if it was).
+- **Its unit is not checked** when insthub did not write it, when it was
+  changed by hand, or when a newer insthub wrote it. Changed by hand means a
+  setting insthub does not write, or one of insthub's settings with a value
+  that no insthub wrote, such as a longer `TimeoutStopSec` for an instrument
+  that is slow to close. Such a unit is never written anew, so `update` never
+  undoes what you chose. It says so ("its unit was not checked: it was
+  changed by hand (TimeoutStopSec=90, insthub writes 20)"), and never calls
+  it up to date. The first line of a unit says which format of unit it is
+  (`(unit format 2)`), so an older insthub leaves a newer one's units alone.
+- **It runs**, and its unit was written anew or its server runs older code
+  (what `insthub list` marks out of date): it is restarted, and `update` waits
+  until it answers, as `insthub service restart` does. Each service is looked
+  at again just before its turn, and the restart only restarts a service that
+  still runs (systemd's `try-restart`), so one you stopped meanwhile stays
+  stopped.
+- **It does not run**: it is not started. Its next start uses the new unit.
+- **It is up to date**: it is left alone.
+
+One service that fails does not stop the others. `update` prints what it
+found and did for each service, and ends with exit code 1 if one failed.
+With `--json` it prints a record per service instead: `name`, `state`,
+`stale` (what is old about its unit), `unchecked` (why its unit was not
+checked), `outdated` (why its server runs older code), `plan` (`"rewrite"`,
+`"restart"`), `done`, `pid` (after a restart), `error` and `check`.
+
+**For scripts**, `--check` only looks: it prints what it would do, and ends
+with exit code 1 when anything would change (or something is wrong, such as
+a Python that is gone), else 0. `insthub service list` says what is out of
+date under each service, and `insthub list --json` gives the `outdated`
+reasons of every server on this computer, services or not.
+
+**In the window**, a server that can be updated gets **Update**: on its page
+next to **Restart**, and in the menu of its card (right-click). For a service
+it does what `insthub service update NAME` does; for a server the window
+started, it restarts it, as **Restart** does. A server started in a terminal
+gets no Update: its page says to restart it where you started it. When at
+least one server can be updated, the **Servers** page shows **Update all**,
+which asks once, listing what each server gets (which ones restart, and what
+is old about each unit it writes anew). A service's page says what is old
+about its unit, in a **Unit** row, even when its code is current, or why its
+unit was not checked. When both its unit and its code are old, the page's
+links offer **Update**, which does both with one restart.
+
+**The window and agents** run insthub's own code too, so after an update
+they also run the old code until they start again. Their connections to the
+servers are not the problem: a restarted server is reconnected by itself.
+
+- The window says so in its sidebar ("This window runs older code") and on
+  its **Settings** page, with what changed. Quit it (**Quit** in its tray
+  menu, or close it when it has no tray icon) and start it again; your
+  servers keep running.
+- An agent's `insthub mcp` adds a note to `list_devices` when its own code
+  changed since it started, so that the agent can ask you to reconnect it
+  (in Claude Code: `/mcp`). No MCP tool restarts a server or a service,
+  because a restart drops an instrument for a few seconds; an agent that has
+  a shell can run `insthub service update` when you ask it to.
+
+## Reading a server's log
+
+Every server keeps the last 1000 lines it logged, and `insthub logs` shows
+them from any computer that can reach it. This works where there is no
+journal to read: for a server started in a terminal, a program that hosts
+its own server, or a server on another computer.
+
+```bash
+insthub logs lab                     # by the server's name, as insthub list shows it, or one of its devices' (this computer's first)
+insthub logs lab -f                  # and what it logs from now on, until Ctrl-C (also across a restart)
+insthub logs lab --level WARNING     # only warnings and errors
+insthub -a tcp://labpc:8700 logs     # a server on another computer, by its address
+```
+
+| The server is | It keeps |
+|---|---|
+| `insthub serve`, `insthub sim`, or a script that calls `insthub.serve(...)` | everything the program logs, from INFO up, and exceptions that nothing caught, in any thread |
+| a program that makes a `Server` itself (a GUI that hosts its own) | insthub's own lines, at the level the program's logging lets through: warnings and errors unless it sets up logging |
+
+Keeping them changes nothing about where the lines are printed: a program
+that leaves logging alone still shows its warnings on stderr, and so in a
+service's journal. The lines are kept in the server's memory, so after a
+restart only the new run's are there; a service's journal (`insthub service
+logs`) has the earlier runs too. A server of an older insthub keeps none and says so: read
+its output where it runs. In the window, a server's **Logs** button shows a
+service's journal, the output of a server the window started, and this log
+for any other server.
 
 ## Using insthub from an instrument's project
 
@@ -157,7 +326,9 @@ in every folder without activating anything, and AI agents can start it by
 name (see [AI agents](agents.md#setting-it-up)). `--editable` makes it run the
 code of your checkout, like the projects that installed insthub with `-e`.
 After a `git pull` every program runs the same version. Servers started
-before the pull still run the old one until they restart; that works, since
+before the pull still run the old one until they restart (`insthub list` and
+the window mark them: see [after changing code](#after-changing-code)); that
+works, since
 each server says which version it runs and what it supports, and skips
 messages it does not know ([what travels on a
 connection](architecture.md#what-travels-on-a-connection)). An older server
@@ -167,8 +338,10 @@ dangerous or simulated, until it restarts. To remove it:
 
 Servers do not use it. A server needs its driver's packages, and those are
 in its project's environment, not in this one. That is why
-`insthub service install` refuses this command's Python and asks you to run
-the project's `insthub` or to pass `--python` (see
+`insthub service install` takes the Python of the server's extensions, or of
+a virtualenv next to its file or its drivers, when there is one, and else
+refuses this command's Python and asks you to run the project's `insthub` or
+to pass `--python` (see
 [keeping a server running](#keeping-a-server-running)). Run `insthub serve`
 from the project's environment as well; from this command it stops at the
 first driver it cannot import.
@@ -256,6 +429,26 @@ alone is enough:
 awg = "tcp://192.168.1.20:8765"
 ```
 
+To use every device of a server there without listing each one, name the
+server instead:
+
+```toml
+[servers]
+labpc = "tcp://192.168.1.20:8765"
+```
+
+When a name is not found on this computer or in `[devices]`, insthub asks
+the servers of `devices.toml` which devices they have (each gets about a
+second to answer, and the answers are kept for 5 seconds, or until
+`devices.toml` changes). The name `labpc` is for you: insthub calls a server
+by the name it gives itself. `insthub list`, `insthub states`, the window and
+AI agents show these servers and their devices too, and say which ones do
+not answer. A server is shown once, however many addresses reach it, so
+every computer of the lab can share one `devices.toml`: a computer's own
+server, named there by its network address, is shown as this computer's.
+If `devices.toml` cannot be read, they say so, naming the file, and go on
+with this computer's servers.
+
 There is no password and no encryption. Anyone who can reach the port can use
 the instruments, so open a TCP port only on a network you trust.
 
@@ -275,7 +468,8 @@ the instruments, so open a TCP port only on a network you trust.
 5. Use it from experiment scripts with `insthub.device("name")`.
 6. To offer it to others, give its folder an `insthub-extension.toml` and
    check it with `insthub check FOLDER --import`
-   ([share it as an extension](adding-a-device.md#8-share-it-as-an-extension)).
+   ([share it as an extension](adding-a-device.md#8-share-it-as-an-extension);
+   `examples/extension/` is a complete one to start from).
 
 [Adding an instrument](adding-a-device.md) walks through each step, with every
 key of a config file and what to do when something does not work.
@@ -285,12 +479,15 @@ key of a config file and what to do when something does not work.
 | What | Where |
 |---|---|
 | Sockets and announcements of running servers | `$XDG_RUNTIME_DIR/insthub/` (for example `/run/user/1000/insthub/`); without `XDG_RUNTIME_DIR`, `/tmp/insthub-UID`, used only if it is your account's alone; override with `INSTHUB_DIR` |
-| Addresses of devices on other computers | `~/.config/insthub/devices.toml`; override with `INSTHUB_DEVICES` |
+| Addresses of devices and servers on other computers | `~/.config/insthub/devices.toml`; override with `INSTHUB_DEVICES` |
+| A server's last 1000 log lines | in the server's memory; `insthub logs SERVER` reads them |
 | Your list of extension folders | `~/.config/insthub/extensions.toml`, written by `insthub ext add`; `INSTHUB_EXTENSIONS` (folders) looks only there instead |
-| Output of what the window or `insthub open` started | in the runtime folder (the first row): `NAME.log` for a server, `ui/DEVICE-UI.log` for a UI of a device's extension, `ui/DEVICE-view.log` for its live view |
+| The configs of the servers the window makes | `~/.config/insthub/servers/`, unless you choose another folder |
+| Output of what the window or `insthub open` started | in the runtime folder (the first row): `NAME.log` for a server, `ui/DEVICE/UI.log` for a UI of a device's extension, `ui/DEVICE/_view.log` for its live view. Each run adds to its log, after a line that says when it started and what ran |
 | Service definitions | `~/.config/systemd/user/insthub-NAME.service` |
 | The insthub command for yourself | `~/.local/bin/insthub`; its environment in `~/.local/share/uv/tools/insthub/` |
 | Results saved for AI agents by `insthub mcp` | `.insthub/` in the folder the agent was started in; override with `INSTHUB_DATA` or `--data` |
+| (`~/.config` in the rows above) | `$XDG_CONFIG_HOME`, if it is set |
 | The launcher of `insthub gui` | `~/.local/share/applications/insthub.desktop`, its icon under `~/.local/share/icons/`, a copy on the desktop, and `~/.config/autostart/insthub.desktop` with Start at login |
 
 A server and its clients must use the same first folder to find each other by

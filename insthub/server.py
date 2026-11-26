@@ -11,6 +11,9 @@ thread that produced them with a non-blocking send; whatever does not fit in
 the socket buffer is handed to the writer.  A client that reads slowly
 therefore never stalls a device, and stream frames it has not been sent yet are
 replaced by newer ones (per subscription, unless it asked for a queue).
+
+A server's process keeps its last log records, which clients read with the
+server call "logs" from any computer (keep_logs).
 """
 from __future__ import annotations
 
@@ -42,8 +45,10 @@ _UNIX_SOCKETS = hasattr(socket, "AF_UNIX") and os.name != "nt"
 #: (`Client.supports("pause")`) before it relies on a newer server call or key, so
 #: that old and new insthub versions can share a lab.  Add a name with each one.
 #: "meta": describe() may carry metadata (units, limits, choices) and what a device is
-#: (extension, simulated); "dangerous": it marks what is dangerous to use.
-FEATURES = frozenset({"pause", "meta", "dangerous"})
+#: (extension, simulated); "dangerous": it marks what is dangerous to use; "logs": the
+#: server call "logs" (see keep_logs).
+FEATURES = frozenset({"pause", "meta", "dangerous", "logs"})
+LOG_RECORDS = 1000  #: how many of its last log records a server's process keeps (keep_logs)
 
 _local_lock = threading.Lock()
 _local_servers: dict[str, Server] = {}
@@ -60,6 +65,102 @@ def local_servers() -> list[Server]:
 def _stop_all() -> None:
     for server in list(_started):
         server.stop()
+
+
+# ---------------------------------------------------------------- its log, for others to read
+class _Recent(logging.Handler):
+    """The last log records of this process, for the server call "logs": so that a server's log
+    can be read from any computer, also when it has no journal or log file (one started in a
+    terminal, a GUI that hosts its own).  A record keeps what can be sent: its number, time,
+    level, logger, message, and an exception's traceback as text."""
+
+    def __init__(self, size: int):
+        super().__init__()
+        self._records: collections.deque = collections.deque(maxlen=size)  # (levelno, record)
+        self._count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:  # (Handler.handle holds self.lock)
+        try:
+            message = record.getMessage()
+            exc = logging.Formatter().formatException(record.exc_info) if record.exc_info else record.exc_text
+        except Exception:  # noqa: BLE001 - e.g. a format string its arguments do not fit: logging says so
+            self.handleError(record)
+            return
+        self._count += 1
+        self._records.append((record.levelno, {"seq": self._count, "time": record.created,
+                                               "level": record.levelname, "logger": record.name,
+                                               "message": message, "exc": exc}))
+        # Python prints a record that no handler takes (logging.lastResort: WARNING and above, to
+        # stderr), but only while no logger on its way has a handler at all, and this is one: so it
+        # prints it in Python's stead, and keeping a program's log never hides it.
+        last = logging.lastResort
+        if last is not None and record.levelno >= last.level and not self._others(record):
+            last.handle(record)
+
+    def _others(self, record: logging.LogRecord) -> bool:
+        """Whether another handler is on the record's way up the loggers (as Logger.callHandlers
+        goes: whatever their levels)."""
+        logger: logging.Logger | None = logging.getLogger(record.name)
+        while logger is not None:
+            if any(handler is not self for handler in logger.handlers):
+                return True
+            logger = logger.parent if logger.propagate else None
+        return False
+
+    def select(self, n: int = 200, level: str | int = "INFO", since: int | None = None) -> list[dict]:
+        """The last `n` records at `level` or above (a name, as "WARNING", or a number) that came
+        after the one numbered `since`, oldest first."""
+        floor = level if isinstance(level, int) else logging.getLevelNamesMapping().get(str(level).upper())
+        if floor is None:
+            raise ValueError(f"unknown log level {level!r}: DEBUG, INFO, WARNING, ERROR or CRITICAL")
+        with self.lock:
+            kept = list(self._records)
+        found = [record for levelno, record in kept
+                 if levelno >= floor and (since is None or record["seq"] > since)]
+        return found[max(0, len(found) - int(n)):]
+
+
+_RECENT = _Recent(LOG_RECORDS)
+
+
+def keep_logs(everything: bool = False) -> None:
+    """Keep this process's last log records (LOG_RECORDS of them) for the server call "logs"
+    (`insthub logs SERVER`, `Client.logs`): insthub's own, as every Server does when it starts.
+    With `everything`, those of every logger, and uncaught exceptions, of the main thread and of
+    the others, go to the log too instead of straight to stderr: what serve(), `insthub serve` and
+    `insthub sim` do, where the process is a server and nothing else.  Logging is then set up to
+    print INFO and above, if nothing set it up before.  Only records that the loggers' levels let
+    through are kept: a program that leaves logging alone has WARNING and above, and still sees
+    them on stderr, as before (see _Recent.emit)."""
+    ours, root = logging.getLogger("insthub"), logging.getLogger()
+    if not everything:
+        if _RECENT not in root.handlers:
+            ours.addHandler(_RECENT)
+        return
+    if not root.handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    ours.removeHandler(_RECENT)  # the root's handler sees insthub's records too: each is kept once
+    root.addHandler(_RECENT)
+    if sys.excepthook is sys.__excepthook__:  # (a hook the program set itself stays)
+        sys.excepthook = _uncaught
+    if threading.excepthook is threading.__excepthook__:
+        threading.excepthook = _uncaught_in_thread
+
+
+def _uncaught(kind, value, tb) -> None:
+    """sys.excepthook of a server's process (keep_logs): an exception nothing caught is logged."""
+    if issubclass(kind, KeyboardInterrupt):
+        sys.__excepthook__(kind, value, tb)
+    else:
+        logging.getLogger().critical("uncaught exception", exc_info=(kind, value, tb))
+
+
+def _uncaught_in_thread(args) -> None:
+    """threading.excepthook of a server's process (keep_logs)."""
+    if not issubclass(args.exc_type, SystemExit):  # (as Python's own: a thread may end that way)
+        name = args.thread.name if args.thread is not None else "?"
+        logging.getLogger().error("uncaught exception in thread %s", name,
+                                  exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 
 
 # ---------------------------------------------------------------- sending
@@ -335,6 +436,7 @@ class Server:
         self._done = threading.Event()
         self.addresses: list[str] = []
         self.started_at: float | None = None
+        self._modules = 0  #: how many modules this process had when its registry entry was last written
         for dev in devices:
             self.add(dev)
 
@@ -372,6 +474,7 @@ class Server:
 
     # -- lifecycle -------------------------------------------------------------
     def start(self) -> Server:
+        keep_logs()  # first: what starting the devices logs ("not connected at start") is kept too
         with self._lock:
             if self._running:
                 return self
@@ -508,6 +611,7 @@ class Server:
             try:
                 sock, peer = lsock.accept()
             except TimeoutError:
+                self._loaded_more()  # (each second no one connects)
                 continue
             except OSError:
                 break
@@ -516,6 +620,22 @@ class Server:
             conn = _Conn(self, sock, peer)
             self._conns.add(conn)
             threading.Thread(target=conn.run, name="insthub:conn", daemon=True).start()
+            self._loaded_more()
+
+    def _loaded_more(self) -> None:
+        """Write its registry entry again if this process has loaded modules since it was last
+        written (a helper that a driver imports inside a command, or when it connects), so that
+        its "code" lists them too, timed within about a second of their loading.  The threads
+        that accept connections call it, about every second."""
+        if len(sys.modules) == self._modules:
+            return
+        with self._lock:
+            if not self._running or len(sys.modules) == self._modules:  # (stopped, or written meanwhile)
+                return
+            try:
+                self._register()
+            except Exception:  # noqa: BLE001  (never the end of accepting connections)
+                _log.warning("could not write the registry entry of server %r", self.name, exc_info=True)
 
     def _close_listeners(self) -> None:
         listeners, self._listeners = self._listeners, []
@@ -533,13 +653,21 @@ class Server:
 
     def _entry(self) -> dict:
         """What its registry file says: its hello, and what only this user's programs on this
-        computer need, so what the hello never carries: the Python it runs in, and for each
-        device the folders of its code, from which its extension is found (see
-        docs/design.md#how-a-device-finds-its-extension)."""
-        return {**self._hello(), "python": sys.executable,
-                "folders": {name: dev._insthub_folders() for name, dev in list(self._devices.items())}}
+        computer need, so what the hello never carries: the Python it runs in, for each device
+        the folders of its code, from which its extension is found (see
+        docs/design.md#how-a-device-finds-its-extension), and the files of the code it runs,
+        from which they tell that it runs older code than the disk holds (_code; left out if
+        they cannot be listed: a notice is never a reason not to start or not to be found)."""
+        folders = {name: dev._insthub_folders() for name, dev in list(self._devices.items())}
+        entry = {**self._hello(), "python": sys.executable, "folders": folders}
+        try:
+            entry["code"] = _code(folder for listed in folders.values() for folder in listed)
+        except Exception:  # noqa: BLE001
+            _log.warning("could not list the files of the code server %r runs", self.name, exc_info=True)
+        return entry
 
     def _register(self) -> None:
+        self._modules = len(sys.modules)  # what its entry's "code" was listed from (see _loaded_more)
         if not self.addresses:  # in-process only: nothing for another process to find
             return
         try:
@@ -589,11 +717,76 @@ class Server:
             return {**self._hello(), "clients": [c.summary() for c in list(self._conns)]}
         if method == "devices":
             return {name: dev._rt.describe() for name, dev in list(self._devices.items())}
+        if method == "logs":  # args: n, level, since (see Client.logs)
+            return _RECENT.select(*args)
         raise UnknownCommand(f"unknown server command {method!r}")
 
     def __repr__(self) -> str:
         state = ", ".join(self.addresses) if self._running else "stopped"
         return f"<insthub.Server {self.name!r} [{state}] devices={list(self._devices)}>"
+
+
+#: Folders that hold a Python environment's libraries, not the code of a project: a project's
+#: folder usually holds its virtualenv, whose numpy is no part of what its server is (see _code).
+_ENVIRONMENTS = frozenset({"site-packages", "dist-packages", ".venv", "venv"})
+_PACKAGE = os.path.dirname(os.path.abspath(__file__))  #: insthub's own folder
+#: module -> (its __spec__, the st_mtime_ns of its file) when _code first listed it (None: no file
+#: on disk).  By module, not by file: a script run as __main__ that is also imported by name is
+#: loaded twice.  With its spec: importlib.reload (IPython's %autoreload) runs a module's code
+#: anew in the same module object, and gives it a new spec, so it is timed again then.
+_first_listed: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _code(folders) -> dict[str, int]:
+    """The source files of the modules this process has loaded that make up what its servers run,
+    as {absolute path: st_mtime_ns}: each module of insthub's own package, and each module whose
+    file lies in one of `folders` (its devices'), but not in a Python environment below that
+    folder (_ENVIRONMENTS, or this Python's own installation, as in a home folder).  Each file's
+    time is the one it had when this process first listed its module (the module loaded first,
+    for a file loaded twice; again after the module is reloaded), so a file changed since stays
+    changed in every later entry, also after a device is added.  A program on this computer
+    compares them with the files on disk (extensions.outdated)."""
+    roots = {os.path.join(os.path.normcase(folder), "") for folder in (_PACKAGE, *folders)}
+    pythons = {os.path.join(os.path.normcase(prefix), "") for prefix in (sys.prefix, sys.base_prefix)}
+    found = {}
+    for module in list(sys.modules.values()):  # (in the order they were loaded)
+        listed = _listed(module, roots, pythons)
+        if listed is not None:
+            found.setdefault(*listed)
+    return found
+
+
+def _listed(module, roots: set[str], pythons: set[str]) -> tuple[str, int] | None:
+    """(its file, the time _code lists for it) for a module of what the servers run (in one of
+    `roots`, see _inside), else None, also for what cannot be told.  It runs none of the module's
+    code: a module that importlib.util.LazyLoader put in sys.modules loads, and may fail to (an
+    optional dependency missing), when one of its attributes is read, so its own are read from
+    its __dict__."""
+    try:
+        attrs = object.__getattribute__(module, "__dict__")
+        file, spec = attrs.get("__file__"), attrs.get("__spec__")
+        if not isinstance(file, str) or not os.path.isabs(file) or \
+                not any(_inside(os.path.normcase(file), root, pythons) for root in roots):
+            return None
+        first = _first_listed.get(module)
+        if first is None or first[0] is not spec:  # not listed yet, or loaded anew since
+            try:
+                mtime = os.stat(file).st_mtime_ns
+            except OSError:  # no file on disk (one inside a zip archive)
+                mtime = None
+            first = _first_listed[module] = (spec, mtime)
+    except Exception:  # noqa: BLE001  an object in place of a module (one that cannot be referred to weakly)
+        return None
+    return None if first[1] is None else (file, first[1])
+
+
+def _inside(file: str, root: str, pythons: set[str]) -> bool:
+    """Whether a file lies in the folder `root` but not in a Python environment below it (both
+    normcased, `root` and each of `pythons` ending in a separator)."""
+    if not file.startswith(root):
+        return False
+    return not _ENVIRONMENTS.intersection(file[len(root):].split(os.sep)[:-1]) and \
+        not any(python != root and python.startswith(root) and file.startswith(python) for python in pythons)
 
 
 # -- bus-level commands every device answers ("$name"; cannot clash with Python names)
@@ -709,7 +902,7 @@ _BUILTINS = {
 
 
 def serve(*devices, name: str | None = None, tcp: int | str | None = None, ipc: bool = True) -> None:
-    """Host the given devices until Ctrl-C.  Shorthand for `Server(...).serve_forever()`."""
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    """Host the given devices until Ctrl-C.  Shorthand for `Server(...).serve_forever()`, in a
+    process that is a server and nothing else: its whole log is kept for others to read (keep_logs)."""
+    keep_logs(everything=True)
     Server(name, devices, tcp=tcp, ipc=ipc).serve_forever()

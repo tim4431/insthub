@@ -431,3 +431,55 @@ def test_agents_see_where_a_device_is_and_what_it_is(tmp_path):
         listed = ok(tools.list_devices())["devices"]["rp"]
         assert listed["address"] == "10.0.0.5" and listed["description"] == "the one on the optics table"
         assert ok(tools.describe("rp"))["address"] == "10.0.0.5"
+
+
+def test_a_device_is_listed_where_the_other_tools_find_it(tmp_path):
+    """Of two servers that have a device of one name, list_devices shows the one that describe and call
+    reach (as insthub.locate places it), or, if they refuse it as ambiguous, says so and shows none."""
+    from insthub import registry
+
+    def far(name):  # a server "on another computer": it announces itself where this test does not look
+        folder = tmp_path / name
+        proc = subprocess.Popen([sys.executable, "-m", "insthub", "sim", "--name", name, "--tcp", "0"],
+                                env={**os.environ, "INSTHUB_DIR": str(folder)}, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        end = time.monotonic() + 15
+        while time.monotonic() < end:
+            try:
+                entry = json.loads((folder / f"{name}.json").read_text())
+                return proc, next(a for a in entry["addresses"] if a.startswith("tcp://"))
+            except (OSError, ValueError, StopIteration):
+                time.sleep(0.05)
+        proc.kill()
+        raise TimeoutError(f"{name} did not come up")
+
+    started = [far("srva"), far("srvb")]
+    try:
+        (_, a), (_, b) = started
+        tools = ThroughRun(mcp.Tools(render.Renderer(tmp_path / "data"), timeout=10))
+        registry.devices_file().write_text(f'[servers]\nlabpc = "{a}"\nrig = "{b}"\n')
+        listed = ok(tools.list_devices())
+        assert "scope" not in listed["devices"]                              # both have one: neither is guessed
+        assert any("device name 'scope' is ambiguous: servers on other computers" in n for n in listed["notes"])
+        assert "is ambiguous" in failed(tools.describe("scope"))             # as the other tools say
+        registry.devices_file().write_text(f'[servers]\nlabpc = "{a}"\n\n[devices]\nscope = "{b}"\n')
+        insthub.client._remote_seen[0] = float("-inf")                       # (devices.toml changed)
+        listed = ok(tools.list_devices())
+        assert listed["devices"]["scope"]["server"] == "srvb"                 # [devices] places it: no question
+        assert not any("'scope'" in n for n in listed["notes"]) and "synth" not in listed["devices"]
+        assert any("device name 'synth' is ambiguous" in n for n in listed["notes"])  # (the others are on both)
+        assert tools.tools._bus("scope").address == b                       # where describe and call go
+    finally:
+        for proc, _ in started:
+            proc.terminate()
+            proc.wait(10)
+
+
+def test_list_devices_says_when_this_program_runs_older_code(tools, monkeypatch):
+    """So that the agent can ask its user to reconnect it; there is no tool that restarts anything."""
+    assert "notes" not in ok(tools.list_devices())
+    monkeypatch.setattr(mcp.extensions, "outdated_here", lambda: ["insthub/mcp.py changed since it started"])
+    [note] = ok(tools.list_devices())["notes"]
+    assert note == ("this insthub mcp runs older insthub code than the disk holds (insthub/mcp.py changed since it "
+                    "started): ask the user to reconnect it, which starts it anew (in Claude Code: /mcp)")
+    assert not any("restart" in t["name"] or "update" in t["name"] for t in mcp.TOOLS)
