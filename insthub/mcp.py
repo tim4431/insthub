@@ -42,6 +42,7 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__, client, registry
+from .device import busy_with
 from .errors import DevicePaused, RemoteError
 from .render import Renderer
 
@@ -330,7 +331,7 @@ class Tools:
             # its reply waits for what runs now, but the pause is in effect already: say so, not "no reply"
             st = bus.status()
             result = {**st, "note": "pausing: it refuses every call already; its session is closed once "
-                                    f"{st.get('busy') or 'what it is doing'} finishes (list_devices shows it paused)"}
+                                    f"{busy_with(st) or 'what it is doing'} finishes (list_devices shows it paused)"}
         return self._reply(result, f"{bus.name}-{command}", plot)
 
     def snapshot(self, device: str, stream: str, fresh: int = 1, timeout: float = 10.0, plot: bool = False) -> Reply:
@@ -389,8 +390,9 @@ def _danger(described: dict, command: str, args: list) -> str | None:
 
 
 def _about(d: dict) -> dict:
-    """What a device says it is, for agents: its extension, and whether it is a simulator."""
-    return {k: d[k] for k in ("extension", "extension_version", "simulated") if d.get(k)}
+    """What a device says it is, for agents: its description and address (which of several of a
+    kind it is), its extension, and whether it is a simulator."""
+    return {k: d[k] for k in ("description", "address", "extension", "extension_version", "simulated") if d.get(k)}
 
 
 def _brief(server: str, d: dict) -> dict:

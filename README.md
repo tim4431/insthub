@@ -67,6 +67,12 @@ flowchart LR
   spin box with the unit or a list, and asks before anything dangerous;
   agents read the units and need a tool of their own for what is dangerous.
   A simulator says so, and is marked SIM everywhere.
+- **Extensions.** An instrument's project offers its devices, and its own
+  windows for them, with one small file, `insthub-extension.toml`. `insthub
+  ext add` it, and the window's New server lists its devices, ready to run in
+  the project's own Python; a device's page then has a button for each of its
+  windows (`insthub open DEVICE` does the same). `insthub check` says what is
+  wrong with one.
 - **AI agents, in plain sight.** Claude Code or any agent that speaks MCP can
   read your instruments' documentation and use them, and the window shows
   when one does.
@@ -179,14 +185,16 @@ you list:
   instrument is connected (and if not, why), shows a live preview of its
   trace, image or reading, and who is watching it. Click a tile to read and
   set its properties, run its commands, switch its periodic tasks, open live
-  plots, or **Pause** it: everything stays off the instrument until you
-  resume it, while you use it by hand.
+  plots or a window its extension provides, or **Pause** it: everything
+  stays off the instrument until you resume it, while you use it by hand.
 - **Servers**: start, stop and restart them, read their logs, choose whether
   each starts at login, edit their config, and see which programs are
   connected.
-- **Add**: write the config of a new server by picking its drivers, keep a
-  server running in the background, or add the devices of another computer.
-- **Settings**: light or dark, or the same as the desktop.
+- **Add**: write the config of a new server by picking its drivers (or the
+  devices your extensions offer), keep a server running in the background, or
+  add the devices of another computer.
+- **Settings**: light or dark, or the same as the desktop; your extensions,
+  and what is wrong with them.
 
 Closed, it keeps watching from the tray and tells you when something breaks.
 `insthub gui --install` puts it in the applications menu. The window is an
@@ -216,15 +224,15 @@ gui` does this setup with a click and shows which agents are connected. See
 | [Using insthub](docs/guide.md) | writing devices, putting existing drivers on the bus, calls, streams, errors, GUIs, the window, the command line |
 | [Running servers](docs/running-servers.md) | starting servers, keeping them running in the background, who sets up what, several computers |
 | [AI agents](docs/agents.md) | letting Claude Code or another agent use the instruments: setup, the tools, what comes back |
-| [Design](docs/design.md) | the rules every change follows, the planned extensions (an instrument's driver and UI in one folder), and what we learned from other lab-control projects |
+| [Design](docs/design.md) | the rules every change follows, extensions (an instrument's driver and UI in one folder, each run where its libraries are), and what we learned from other lab-control projects |
 | [examples/](examples/) | four runnable examples, all on simulated instruments |
 
 ## Status
 
-- 350 tests cover calls, streams, device lifecycle, finding servers,
+- 417 tests cover calls, streams, device lifecycle, finding servers,
   reconnecting, mixed insthub versions, the command line, config files,
-  services, the GUIs, the agent interface, and how little `import insthub`
-  loads. Run them with `python -m pytest tests` (about 30 s).
+  services, extensions, the GUIs, the agent interface, and how little
+  `import insthub` loads. Run them with `python -m pytest tests` (about 30 s).
 - Developed and tested on Linux with Python 3.11, 3.12 and 3.14. Written to
   run on Windows, but never run there.
 - Not included: passwords or encryption for network connections, clients for

@@ -380,6 +380,7 @@ _ICONS = {
                           _line(p, 11, 5, 14, 8, 11, 11)),
     "logs": lambda p: (_rect(p, 1.75, 2.75, 12.5, 10.5, 2), _line(p, 4.5, 6, 6.5, 8, 4.5, 10),
                        p.drawLine(_pt(8, 10), _pt(11.5, 10))),
+    "window": lambda p: (_rect(p, 1.75, 2.75, 12.5, 10.5, 2), p.drawLine(_pt(1.75, 6), _pt(14.25, 6))),
     "stop": lambda p: _rect(p, 3.5, 3.5, 9, 9, 1.5),
     "pause": lambda p: (_rect(p, 4, 3, 2.8, 10, 1), _rect(p, 9.2, 3, 2.8, 10, 1)),
     "edit": lambda p: (_line(p, 3, 13, 3.5, 10, 11, 2.5, 13.5, 5, 6, 12.5, 3, 13), p.drawLine(_pt(9.5, 4), _pt(12, 6.5))),
@@ -1115,6 +1116,80 @@ class Tile(_Ring, QtWidgets.QWidget):
             p.setPen(QtGui.QColor(t.ink))
             p.drawText(QtCore.QRectF(x, y + fl.height() + 2, width, fv.height()), _flags(*_LEFT),
                        fv.elidedText(value, Qt.TextElideMode.ElideRight, width))
+
+
+class AddTile(_Ring, QtWidgets.QWidget):
+    """A tile-sized place to add something (a device to a server): a dashed outline, a plus,
+    a label and a line of detail.  A click (or Enter) emits `clicked`."""
+
+    clicked = Signal()
+
+    def __init__(self, text: str, detail: str = "", parent=None):
+        super().__init__(parent)
+        self.text, self.detail = text, detail
+        self._pressed = False
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(Tile.HEIGHT)
+        self.setAccessibleName(text)
+
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(280, Tile.HEIGHT)
+
+    def set_detail(self, detail: str) -> None:
+        if detail != self.detail:
+            self.detail = detail
+            self.update()
+
+    def mousePressEvent(self, event) -> None:
+        self._pressed = event.button() == Qt.MouseButton.LeftButton
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        pos = event.position() if hasattr(event, "position") else QtCore.QPointF(event.pos())
+        if self._pressed and event.button() == Qt.MouseButton.LeftButton and self.rect().contains(pos.toPoint()):
+            self.clicked.emit()
+        self._pressed = False
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.clicked.emit()
+        else:
+            super().keyPressEvent(event)
+
+    def paintEvent(self, event) -> None:
+        t = _current
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        hover, focus = self.underMouse(), self.ring
+        pen = QtGui.QPen(QtGui.QColor(t.accent if (hover or focus) else t.strong), 1.5)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.setBrush(QtGui.QColor(t.hover) if hover else Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QtCore.QRectF(self.rect()).adjusted(1, 1, -1, -1), 12, 12)
+        ink = t.accent if (hover or focus) else t.ink2
+        label = scaled(self.font(), 1.02, _MEDIUM)
+        small = scaled(self.font(), 0.92)
+        fl, fs = QtGui.QFontMetricsF(label), QtGui.QFontMetricsF(small)
+        size = 28
+        block = size + 10 + fl.height() + (fs.height() + 2 if self.detail else 0)
+        top = (self.height() - block) / 2
+        draw_icon(p, QtCore.QRectF((self.width() - size) / 2, top, size, size), "plus", ink)
+        y = top + size + 10
+        width = self.width() - 28
+        p.setFont(label)
+        p.setPen(QtGui.QColor(ink))
+        p.drawText(QtCore.QRectF(14, y, width, fl.height()),
+                   _flags(Qt.AlignmentFlag.AlignHCenter, Qt.AlignmentFlag.AlignVCenter), self.text)
+        if self.detail:
+            p.setFont(small)
+            p.setPen(QtGui.QColor(t.muted))
+            p.drawText(QtCore.QRectF(14, y + fl.height() + 2, width, fs.height()),
+                       _flags(Qt.AlignmentFlag.AlignHCenter, Qt.AlignmentFlag.AlignVCenter),
+                       fs.elidedText(self.detail, Qt.TextElideMode.ElideMiddle, width))
+        p.end()
 
 
 class PreviewView(QtWidgets.QWidget):

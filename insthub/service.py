@@ -76,21 +76,43 @@ def tool_environment(prefix: str | None = None) -> str | None:
     return None
 
 
-#: What check_python runs in the service's Python: `python -c _CHECK target report`.  It writes
-#: its report to the file `report` (not to stdout, which drivers may write to as well), as JSON:
-#: the problem, if any; what would fix it, by the kind of error ("file": the config file;
-#: "environment": another Python, or packages installed into this one; for a driver's own error,
-#: neither); and config.check's warnings, not those of the drivers' libraries.  Besides
-#: config.check it uses only the standard library, and it falls back to what an older insthub
-#: raises (a plain ValueError for a problem of the file), so any insthub there will do.
+def ask_python(python: str, code: str, *args: str, cwd: str | Path, doing: str) -> tuple[dict | None, str]:
+    """Run `python -c code REPORT ARGS...` in the folder `cwd`, where `code` writes what it found,
+    as JSON, to the file REPORT: not to stdout, which the drivers it imports may write to as well.
+    Returns (that report, or None if it wrote none: it is not a Python, or it crashed; what it
+    wrote to stderr).  Raises BusError if `python` cannot be run, or takes more than 120 s to do
+    what `doing` says ("import the drivers")."""
+    with tempfile.TemporaryDirectory(prefix="insthub-check-") as folder:
+        report = Path(folder) / "report.json"
+        try:
+            result = subprocess.run([python, "-c", code, str(report), *args], cwd=cwd, capture_output=True,
+                                    text=True, errors="replace", timeout=120, check=False)  # (a vendor
+            # library may write bytes of another encoding to stderr: they must not stop the check)
+        except OSError as e:
+            raise BusError(f"cannot run {python}: {e}") from None
+        except subprocess.TimeoutExpired:
+            raise BusError(f"{python} took more than 120 s to {doing}") from None
+        try:
+            return json.loads(report.read_text()), result.stderr
+        except (OSError, ValueError):
+            return None, result.stderr
+
+
+#: What check_report runs in the service's Python: `python -c _CHECK REPORT TARGET`.  It writes its
+#: report to the file REPORT (see ask_python), as JSON: the problem, if any; what would fix it, by
+#: the kind of error ("file": the config file; "environment": another Python, or packages installed
+#: into this one; for a driver's own error, neither); and config.check's warnings, not those of the
+#: drivers' libraries.  Besides config.check it uses only the standard library, and it falls back
+#: to what an older insthub raises (a plain ValueError for a problem of the file), so any insthub
+#: there will do.
 _CHECK = """\
 import json, sys, warnings
 report = {"problem": None, "fixes": [], "warnings": []}
 with warnings.catch_warnings(record=True) as caught:
     try:
         from insthub import config
-        if sys.argv[1].endswith(".toml"):
-            config.check(sys.argv[1])
+        if sys.argv[2].endswith(".toml"):
+            config.check(sys.argv[2])
     except Exception as e:
         cfg = sys.modules.get("insthub.config")
         of_file = getattr(cfg, "ConfigError", ValueError)  # an older insthub has none: a ValueError
@@ -105,7 +127,7 @@ with warnings.catch_warnings(record=True) as caught:
             report["fixes"].append("environment")
     ours = getattr(sys.modules.get("insthub.config"), "ConfigWarning", ())
     report["warnings"] = [str(w.message) for w in caught if issubclass(w.category, ours)]
-with open(sys.argv[2], "w") as f:
+with open(sys.argv[1], "w") as f:
     json.dump(report, f)
 """
 
@@ -117,39 +139,31 @@ _FIXES = {
 }
 
 
-def check_python(target: str | Path, python: str) -> list[str]:
-    """Make sure `python` can serve `target`: it imports insthub and, for a .toml
-    config, every driver of it (without creating a device), from the folder the
-    service will run in, and each device's keys fit its driver.  Raises BusError
-    saying what is missing or wrong, and what to do about it.  Returns the
-    warnings, such as a driver that imports Qt, which a server without a screen
-    may not have."""
+def check_report(target: str | Path, python: str) -> dict:
+    """What `python` finds when it is to serve `target`: it imports insthub and, for a .toml
+    config, every driver of it (without creating a device), from the folder the service will
+    run in, and checks each device's keys against its driver (config.check).  Returns
+    {"problem": what is missing or wrong, or None; "fixes": what would fix it (see _FIXES);
+    "warnings": config.check's}.  Raises BusError as ask_python does."""
     target = Path(target).expanduser().resolve()
-    with tempfile.TemporaryDirectory(prefix="insthub-check-") as folder:
-        report_file = Path(folder) / "report.json"
-        try:
-            result = subprocess.run([python, "-c", _CHECK, str(target), str(report_file)], cwd=target.parent,
-                                    capture_output=True, text=True, timeout=120, check=False)
-        except OSError as e:
-            raise BusError(f"cannot run {python}: {e}") from None
-        except subprocess.TimeoutExpired:
-            raise BusError(f"{python} took more than 120 s to import the drivers of {target.name}") from None
-        report = _report(report_file)
+    report, stderr = ask_python(python, _CHECK, str(target), cwd=target.parent,
+                                doing=f"import the drivers of {target.name}")
     if report is None:  # it did not get that far: not a Python, or one that crashed
-        problem = (result.stderr.strip().splitlines() or ["(no output)"])[-1]
-        report = {"problem": problem, "fixes": ["environment"]}
+        report = {"problem": (stderr.strip().splitlines() or ["(no output)"])[-1], "fixes": ["environment"],
+                  "warnings": []}
+    return report
+
+
+def check_python(target: str | Path, python: str) -> list[str]:
+    """Make sure `python` can serve `target` (check_report).  Raises BusError saying
+    what is missing or wrong, and what to do about it.  Returns the warnings, such
+    as a driver that imports Qt, which a server without a screen may not have."""
+    target = Path(target).expanduser().resolve()
+    report = check_report(target, python)
     if report["problem"]:
         advice = [_FIXES[fix].format(file=target.name) for fix in report["fixes"]]
         raise BusError("\n".join([f"{python} cannot serve {target.name}: {report['problem']}", *advice]))
     return report["warnings"]
-
-
-def _report(path: Path) -> dict | None:
-    """What _CHECK reported, or None if it did not get that far."""
-    try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
 
 
 def unit_text(name: str, target: str | Path, python: str | None = None) -> str:

@@ -59,7 +59,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from . import tomlfile
-from .device import Device, _checked_meta, wrap
+from .device import Device, _checked_meta, given_address, wrap
 from .errors import UnknownCommand, did_you_mean
 
 
@@ -124,6 +124,9 @@ class _Key(NamedTuple):
     #: any device is made; a ConfigError it raises is a problem of the table.
     load: Callable | None = None
     apply: Callable | None = None  #: apply(device, loaded value): what it does to the device once made
+    #: Its load imports what the value names, so it needs the Python the driver runs in (a
+    #: manifest is checked in insthub's own, and imports only with `insthub check --import`).
+    imports: bool = False
 
 
 def _sets(attr: str, convert: Callable | None = None) -> Callable:
@@ -180,14 +183,22 @@ _RESERVED: dict[str, _Key] = {
     "accessors": _Key(_BOOL, wrap=True),
     "lazy": _Key(_BOOL, apply=_sets("open_on_start", lambda lazy: not lazy)),
     "reconnect_interval": _Key(_SECONDS, apply=_sets("reconnect_interval", float)),
-    "link_errors": _Key(_CLASSES, load=_exceptions, apply=_sets("link_errors")),
+    "link_errors": _Key(_CLASSES, load=_exceptions, apply=_sets("link_errors"), imports=True),
     "extension": _Key(_TEXT, apply=_sets("extension")),
     "extension_version": _Key(_TEXT, apply=_sets("extension_version")),
     "simulated": _Key(_BOOL, apply=_sets("simulated")),
     "meta": _Key(_TABLES, load=_metadata, apply=_set_meta),
     "poll": _Key(_SECONDS_EACH, apply=_sets("poll", dict)),
     "dangerous": _Key(_NAMES_OR_ALL, apply=_sets("dangerous", lambda names: names if names is True else tuple(names))),
+    "description": _Key(_TEXT, apply=lambda dev, text: _describe(dev, text)),
 }
+
+
+def _describe(dev: Device, text: str) -> None:
+    """`description`: what this device is, in a few words, for the people who see it."""
+    if not isinstance(inspect.getattr_static(dev, "description", None), (str, type(None))):
+        raise ConfigError(f"description: {type(dev).__name__} has a command or property of that name")
+    dev.description = text.strip() or None
 
 #: The keys of the [server] table.
 _SERVER_KEYS = ("name", "tcp", "ipc")
@@ -195,6 +206,12 @@ _SERVER_KEYS = ("name", "tcp", "ipc")
 #: Top-level modules of the Qt bindings and of pyqtgraph.  A server often runs as a
 #: service, without a screen, so its drivers should not need them (check() warns).
 _GUI_MODULES = ("PyQt5", "PyQt6", "PySide2", "PySide6", "pyqtgraph")
+
+
+def gui_warning(where: str, driver: str, modules: list[str]) -> str:
+    """What check() (and `insthub check --import`) say about a driver that imports some of _GUI_MODULES."""
+    return (f"{where} driver {driver} imports {', '.join(modules)}; servers often run without a screen: move UI "
+            "code to the extension's UI module (see docs/design.md#rules-inside-an-extension)")
 
 
 def _own_keys(spec: dict) -> list[tuple[str, object, _Key]]:
@@ -339,8 +356,7 @@ def validate(name: str, spec: dict, advise: bool = False) -> tuple[object, list[
     cls = _driver(name, spec)
     gui = [m for m in absent if m in sys.modules]
     if advise and gui:
-        _warn(f"{where} driver {spec['driver']} imports {', '.join(gui)}; servers often run without a screen: "
-              "move UI code to the extension's UI module (see docs/design.md#rules-inside-an-extension)")
+        _warn(gui_warning(where, spec["driver"], gui))
     problems = [*wrong.values(), *_key_problems(where, spec, cls, wrong)]
     if not wrong.keys() & {"args", "kwargs"}:  # else the arguments cannot be told, or checked
         problems += _argument_problems(where, name, spec, cls, advise)
@@ -356,19 +372,28 @@ def _wrong_kinds(name: str, spec: dict) -> dict[str, str]:
 
 def _key_problems(where: str, spec: dict, cls, wrong: dict) -> list[str]:
     """validate()'s half about insthub's own keys that have their kind of value: what they
-    name must load.  Warns about an option of wrapped drivers given to a Device subclass."""
-    problems = []
-    for key, value, rule in _own_keys(spec):
-        if key in wrong:
-            continue
-        if rule.wrap and _is_device(cls):
+    name must load (_loaded_problems).  Warns about an option of wrapped drivers given to a
+    Device subclass."""
+    for key, _, rule in _own_keys(spec):
+        if rule.wrap and key not in wrong and _is_device(cls):
             _warn(f"{where} {key}: does nothing for {spec['driver']}, a Device subclass (it is an option for "
                   "drivers that insthub wraps)")
-        if rule.load is not None:
-            try:
-                rule.load(value)
-            except ConfigError as e:
-                problems.append(f"{where} {key}: {e}")
+    return _loaded_problems(where, spec, wrong)
+
+
+def _loaded_problems(where: str, spec: dict, wrong: dict, imports: bool = True) -> list[str]:
+    """What is wrong with what insthub's own keys say, each key that has its kind of value (not
+    in `wrong`, see _wrong_kinds) checked by its `load` step: the words of `meta`, the classes of
+    `link_errors`.  With `imports` false, only the steps that import nothing (as an extension's
+    manifest is checked, in insthub's Python rather than the extension's)."""
+    problems = []
+    for key, value, rule in _own_keys(spec):
+        if key in wrong or rule.load is None or (rule.imports and not imports):
+            continue
+        try:
+            rule.load(value)
+        except ConfigError as e:
+            problems.append(f"{where} {key}: {e}")
     return problems
 
 
@@ -439,6 +464,7 @@ def _make(name: str, spec: dict, cls) -> Device:
         except Exception as e:  # the driver's own code, such as a vendor library it imports: not the file's
             raise DriverError(f"[devices.{name}]: {spec['driver']}(...) failed: {type(e).__name__}: {e}") from e
         dev.name = name
+        given_address(dev, cls, args, kwargs)  # (unless it says its address itself)
     else:
         options = {key: value for key, value, rule in _own_keys(spec) if rule.wrap}
         dev = wrap(cls, name, args=args, kwargs=kwargs, **options)

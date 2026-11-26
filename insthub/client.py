@@ -899,8 +899,9 @@ def device(name: str, address: str | None = None, *, timeout: float | None = Non
 
 
 def discover() -> list[dict]:
-    """The servers visible from here: in this process and on this machine."""
-    found = [{**srv._hello(), "addresses": [f"inproc://{srv.name}", *srv.addresses]}
+    """The servers visible from here, in this process and on this machine: their registry
+    entries (for one in this process, what its entry would say; see Server._entry)."""
+    found = [{**srv._entry(), "addresses": [f"inproc://{srv.name}", *srv.addresses]}
              for srv in _server.local_servers()]
     names = {f["server"] for f in found}
     found += [s for s in registry.servers() if s.get("server") not in names]

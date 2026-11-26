@@ -1,0 +1,34 @@
+# insthub's own extension: the simulated instruments of `insthub sim`, to try insthub
+# without hardware.  insthub reads it like any other manifest (see docs/design.md#the-manifest),
+# so it is also an example of one.  Its version is insthub's, and its code runs in any Python
+# that has insthub, so it says neither.
+
+[extension]
+id = "insthub-sim"
+title = "Simulated instruments"
+api = 1
+
+[devices.scope]
+driver = "insthub.sim:SimScope"
+doc = "a simulated two-channel oscilloscope"
+
+[devices.synth]
+driver = "insthub.sim:SimSynth"
+doc = "a simulated signal generator"
+
+[devices.camera]
+driver = "insthub.sim:SimCamera"
+doc = "a simulated camera"
+
+[devices.analyzer]
+driver = "insthub.sim:SimAnalyzer"
+doc = "a simulated spectrum analyzer"
+
+[devices.loopback]
+driver = "insthub.sim:Loopback"
+doc = "echoes, sleeps and fails on demand"
+
+[ui.scope]                           # a panel: a widget, which insthub puts in a window of its own
+title = "Scope panel"
+panel = "insthub.sim_ui:scope"
+types = ["SimScope"]                 # only for the scope: every other device of this extension is no scope

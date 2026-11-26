@@ -220,3 +220,11 @@ def test_pause_and_resume_say_when_they_wait(capsys):
 def test_program_label(monkeypatch, argv, label):
     monkeypatch.setattr(insthub.client.sys, "argv", argv)
     assert insthub.client.program_label() == label
+
+
+def test_serve_says_in_one_line_that_the_name_is_taken(tmp_path, capsys, spawned):
+    spawned.start()                                                            # a server named "child", elsewhere
+    cfg = tmp_path / "lab.toml"
+    cfg.write_text('[server]\nname = "child"\n\n[devices.echo2]\ndriver = "insthub.sim:Loopback"\n')
+    code, _, err = run(capsys, "serve", str(cfg))
+    assert code == 1 and err.startswith("error: a server named 'child' is already running") and "Traceback" not in err

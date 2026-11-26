@@ -2,9 +2,12 @@
 typed into a file by hand.  Each shows the file it writes or the command it runs.
 
     ServerDialog      a server's config.  New: its name, who may reach it, and its devices;
-                      for each a driver ("module:Class", or a .py file to pick a class from)
-                      and the arguments of its constructor, which are read from the driver's
-                      source without running it.  Writes NAME.toml (config.dump), then starts
+                      for each a driver (one an extension offers, "module:Class", or a .py
+                      file to pick a class from) and the arguments of its constructor, which
+                      are read from the driver's source without running it.  An extension's
+                      device brings its keys, and its Python to run the server (one Python
+                      per server: it says which devices another would suit).  Writes
+                      NAME.toml (config.dump), then starts
                       it as a background service (at login or not), or once, or not at all.
                       Existing (`path=`): the same form, filled from the file; saving changes
                       only what was changed (tomlfile.edit: comments stay), then restarts it.
@@ -28,21 +31,42 @@ import sys
 import tomllib
 from pathlib import Path
 
-from . import cli, config, registry, service, tomlfile
+from . import cli, config, extensions, registry, service, tomlfile
 from . import widgets as ui
 from .client import _SocketTransport
-from .inventory import find_python
+from .inventory import find_python, server_python
 from .qt import QtCore, QtGui, QtWidgets
 
 Qt = QtCore.Qt
 
-EXAMPLES = {  #: drivers offered in the list, so that a server can be tried without hardware
-    "insthub.sim:SimScope": "a simulated two-channel oscilloscope",
-    "insthub.sim:SimSynth": "a simulated signal generator",
-    "insthub.sim:SimCamera": "a simulated camera",
-    "insthub.sim:SimAnalyzer": "a simulated spectrum analyzer",
-    "insthub.sim:Loopback": "echoes, sleeps and fails on demand",
-}
+_DRIVER, _OFFER = Qt.ItemDataRole.UserRole, Qt.ItemDataRole.UserRole + 1  #: what an entry of _Offers holds
+
+
+class _Offers(QtGui.QStandardItemModel):
+    """The driver list: the devices that extensions offer (insthub's own simulated instruments
+    among them), each shown as its extension's title and its doc.  Choosing one puts its driver
+    into the field, because an editable combo box fills its field from an entry's edit role
+    (here the driver, _DRIVER) and shows the display role in its list.  _OFFER: (extension, offer)."""
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        return super().data(index, _DRIVER if role == Qt.ItemDataRole.EditRole else role)
+
+    def add(self, ext: extensions.Extension) -> None:
+        """The devices an extension offers, unless they are listed already."""
+        if any(self.item(row).data(_OFFER)[0].manifest == ext.manifest for row in range(self.rowCount())):
+            return
+        for offer in ext.devices.values():
+            item = QtGui.QStandardItem(f"{ext.title}: {offer.doc or offer.name}")
+            item.setData(offer.driver, _DRIVER)
+            item.setData((ext, offer), _OFFER)
+            item.setToolTip(offer.driver if ext.builtin else f"{offer.driver}, from {ext.folder}")
+            self.appendRow(item)
+
+    def offer(self, driver: str) -> extensions.DeviceOffer | None:
+        """The device offered with this driver, if exactly one is (a manifest may offer one driver
+        twice, as a real instrument and as a simulated one: then only a choice in the list tells)."""
+        offers = [offer for row in range(self.rowCount()) if (offer := self.item(row).data(_OFFER)[1]).driver == driver]
+        return offers[0] if len(offers) == 1 else None
 
 
 def servers_folder() -> Path:
@@ -109,19 +133,25 @@ def constructor_args(driver: str, folder: str = "", base: str | Path | None = No
             return None
         return [(p.name, None if p.default is p.empty else _text(p.default), isinstance(p.default, str))
                 for p in params if p.name != "name" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)]
-    if not folder:
+    path = driver_file(driver, folder, base)
+    if path is None:
+        return None
+    try:
+        return classes_in(path.read_text()).get(name)
+    except (OSError, SyntaxError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def driver_file(driver: str, folder: str = "", base: str | Path | None = None) -> Path | None:
+    """The .py file of a driver ("module:Class") in `folder` (a relative one counts from `base`), if there."""
+    module = driver.partition(":")[0]
+    if not module or not folder:
         return None
     where = Path(folder).expanduser()
     if not where.is_absolute() and base is not None:
         where = Path(base) / where
-    base = where / Path(*module.split("."))
-    for path in (base.with_suffix(".py"), base / "__init__.py"):
-        if path.is_file():
-            try:
-                return classes_in(path.read_text()).get(name)
-            except (OSError, SyntaxError, ValueError, UnicodeDecodeError):
-                return None
-    return None
+    stem = where / Path(*module.split("."))
+    return next((p for p in (stem.with_suffix(".py"), stem / "__init__.py") if p.is_file()), None)
 
 
 # ---------------------------------------------------------------- a new server
@@ -135,6 +165,7 @@ class DeviceSpec:
     driver: str = ""
     folder: str = ""
     lazy: bool = False
+    description: str = ""  #: what this one is, in a few words (shown on its tile)
     args: dict = dataclasses.field(default_factory=dict)  #: constructor argument -> text typed (empty: default)
     texts: set = dataclasses.field(default_factory=set)  #: arguments whose default is text
     strings: set = dataclasses.field(default_factory=set)  #: keys that are text in the file
@@ -145,6 +176,9 @@ class DeviceSpec:
     original: dict = dataclasses.field(default_factory=dict)  #: the device's table in the file
     was: str | None = None  #: its name in the file (None: a new device)
     dirty: bool = False  #: changed in the dialog
+    #: (extension, DeviceOffer) chosen in the driver list, while its driver is the one in the field
+    offer: tuple | None = None
+    auto_name: str = ""  #: the name the dialog gave it after what was chosen (not one typed)
 
     def table(self) -> dict:
         """Its [devices.NAME] table.  Raises ValueError for what cannot be written."""
@@ -159,6 +193,10 @@ class DeviceSpec:
             out["lazy"] = True
         elif old.get("lazy") is False:
             out["lazy"] = False  # written as false in the file: stays so
+        if self.description.strip():
+            text = old.get("description")
+            out["description"] = text if isinstance(text, str) and text.strip() == self.description.strip() else \
+                self.description.strip()
         old_kwargs = self._old_kwargs()
         kwargs: dict = {}  # what the dialog shows of them: its fields, and the kwargs.* lines of more keys
         for key, text in self.args.items():
@@ -205,7 +243,7 @@ class DeviceSpec:
         return inside, value
 
 
-_SHOWN = ("driver", "path", "lazy")  #: keys of a device table that have their own field
+_SHOWN = ("driver", "path", "lazy", "description")  #: keys of a device table that have their own field
 
 
 def _gone(old: dict, new: dict, path: tuple = ()) -> list[str]:
@@ -243,6 +281,8 @@ def read_config(text: str, base: str | Path | None = None) -> tuple[dict, list[D
     for name, table in devices.items():
         spec = DeviceSpec(name, str(table.get("driver", "")), str(table.get("path", "")), table.get("lazy") is True,
                           original=table, was=name)
+        if isinstance(table.get("description"), str):
+            spec.description = table["description"]
         arguments = constructor_args(spec.driver, spec.folder, base)
         known = spec.known = None if arguments is None else {arg for arg, _, _ in arguments}
         known = known or set()
@@ -256,7 +296,8 @@ def read_config(text: str, base: str | Path | None = None) -> tuple[dict, list[D
                 spec.in_kwargs.add(key)
 
         for key, value in table.items():  # insthub's keys (driver, close, ...) never fill an argument's field
-            if key in _SHOWN or (key == "kwargs" and isinstance(value, dict)):
+            if (key in _SHOWN and (key != "description" or isinstance(value, str))) or \
+                    (key == "kwargs" and isinstance(value, dict)):
                 continue
             if key in known and _plain(value) and key not in config._RESERVED and key not in kwargs:
                 field(spec, key, value)
@@ -282,8 +323,22 @@ def _first_change(old: str, new: str) -> int | None:
 
 
 def _placeholder(d: DeviceSpec) -> bool:
-    """Whether a device still has the name Add gave it (device1): the driver chosen may name it."""
-    return d.was is None and re.fullmatch(r"device\d+", d.name) is not None
+    """Whether a new device has no name of its own yet: the one Add gave it (device1), or one the
+    dialog gave it after a driver chosen before.  The driver chosen may name it."""
+    return d.was is None and (re.fullmatch(r"device\d+", d.name) is not None or d.name == d.auto_name)
+
+
+def _offer_lines(ext: extensions.Extension, offer: extensions.DeviceOffer) -> list[str]:
+    """The more-keys lines of a device an extension offers: its table (Extension.device_table) but
+    the driver and the folder, which have fields of their own."""
+    return [f"{tomlfile.key(k)} = {tomlfile.value(v)}" for k, v in ext.device_table(offer).items()
+            if k not in ("driver", "path")]
+
+
+def _same_python(a, b) -> bool:
+    """Whether two paths name one Python: compared as written, made absolute, but not resolved (a
+    virtualenv's python is a link to the Python it was made from)."""
+    return a is not None and b is not None and os.path.abspath(a) == os.path.abspath(b)
 
 
 def _plain(value) -> bool:
@@ -351,11 +406,14 @@ class ServerDialog(QtWidgets.QDialog):
 
     SERVICE, ONCE, SAVE, RESTART = "service", "once", "save", "restart"
 
-    def __init__(self, window, path: str | Path | None = None, server=None, select: str | None = None):
+    def __init__(self, window, path: str | Path | None = None, server=None, select: str | None = None,
+                 add: bool = False):
         super().__init__(window)
         self.window = window
+        adding = add  # (below, `add` is the Add button)
         self.existing = Path(path).expanduser() if path else None
         self.server = server  #: inventory.Server of a running (or installed) server, when editing its file
+        self._server_python = server_python(server) if server is not None else None
         self._arg_edits: dict[str, QtWidgets.QLineEdit] = {}
         self._loading = False
         if self.existing is not None:
@@ -364,8 +422,9 @@ class ServerDialog(QtWidgets.QDialog):
             self._server_table = table
         else:
             self._original, self._server_table = "", {}
-            self.devices = [DeviceSpec("scope", "insthub.sim:SimScope")]
-        title = f"Edit {self.existing.name}" if self.existing else "New server"
+            self.devices = [DeviceSpec("scope", "insthub.sim:SimScope", auto_name="scope")]  # (another driver renames it)
+        title = (f"Add a device to {self.existing.name}" if add else f"Edit {self.existing.name}") \
+            if self.existing else "New server"
         self.setWindowTitle(title)
 
         self.name = QtWidgets.QLineEdit(str(self._server_table.get("name") or
@@ -413,12 +472,16 @@ class ServerDialog(QtWidgets.QDialog):
         buttons.addWidget(self.drop)
         side.addLayout(buttons)
         self.dev_name = QtWidgets.QLineEdit()
+        self.dev_description = QtWidgets.QLineEdit()
+        self.dev_description.setPlaceholderText("optional: what this one is, e.g. the one on the optics table")
+        self.dev_description.setToolTip("Shown on its tile, to tell it from other instruments of its kind")
         self.driver = QtWidgets.QComboBox()
         self.driver.setEditable(True)
         self.driver.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
-        for driver, what in EXAMPLES.items():
-            self.driver.addItem(driver)
-            self.driver.setItemData(self.driver.count() - 1, what, Qt.ItemDataRole.ToolTipRole)
+        self.offers = _Offers(self.driver)
+        self.driver.setModel(self.offers)
+        self.offers.add(extensions.load(extensions.OWN, "insthub"))  # at once; the others once they are found
+        window.submit(window.actions, extensions.discover, self._found)
         self.driver.lineEdit().setPlaceholderText("module:Class, e.g. mydriver:PowerSupply")
         driver_row = QtWidgets.QHBoxLayout()
         driver_row.setSpacing(8)
@@ -438,7 +501,11 @@ class ServerDialog(QtWidgets.QDialog):
         self.extra.setFixedHeight(70)
         editor = _form()
         editor.addRow(ui.label("Name", "label"), self.dev_name)
+        editor.addRow(ui.label("Description", "label"), self.dev_description)
         editor.addRow(ui.label("Driver", "label"), driver_row)
+        self.driver_note = ui.label("", "small", wrap=True)  # when the driver may not import in the server's Python
+        self.driver_note.hide()
+        editor.addRow("", self.driver_note)
         editor.addRow(ui.label("Folder", "label"), _browse_row(self.dev_folder, self._browse_dev_folder))
         open_row = QtWidgets.QHBoxLayout()
         open_row.addWidget(self.open_now)
@@ -470,6 +537,7 @@ class ServerDialog(QtWidgets.QDialog):
         box2.addLayout(split)
 
         self.python = QtWidgets.QLineEdit(sys.executable)
+        self._python_set = sys.executable  #: what the dialog put there (another text: chosen by hand, see _fit_python)
         self.then = QtWidgets.QComboBox()
         self.login = ui.Switch(True)
         self.login.setToolTip("Start the service at every login (and at boot, with lingering on)")
@@ -541,7 +609,9 @@ class ServerDialog(QtWidgets.QDialog):
         self.port.valueChanged.connect(self._reach_changed)
         self.then.currentIndexChanged.connect(self._update)
         self.dev_name.textEdited.connect(self._edited)
+        self.dev_description.textEdited.connect(self._edited)
         self.driver.currentTextChanged.connect(self._driver_changed)
+        self.driver.activated.connect(self._offer_chosen)
         self.dev_folder.textEdited.connect(self._driver_changed)
         self.open_now.toggled.connect(self._edited)
         self.extra.textChanged.connect(self._edited)
@@ -550,6 +620,8 @@ class ServerDialog(QtWidgets.QDialog):
         row = names.index(select) if select in names else 0
         self.list.setCurrentRow(row)
         self._select(row)
+        if adding:  # a new device, to fill in
+            self._add()
 
     def _fill_then(self) -> None:
         """What may follow the saving: for a new server, how to start it; for an existing file,
@@ -595,6 +667,7 @@ class ServerDialog(QtWidgets.QDialog):
         if self.current() is not None and len(self.devices) > (0 if self.existing else 1):
             del self.devices[self.list.currentRow()]
             self._refill_list()
+            self._fit_python()
             self._select(self.list.currentRow())
 
     def current(self) -> DeviceSpec | None:
@@ -609,6 +682,7 @@ class ServerDialog(QtWidgets.QDialog):
             return
         self._loading = True
         self.dev_name.setText(d.name)
+        self.dev_description.setText(d.description)
         self.driver.setCurrentText(d.driver)
         self.dev_folder.setText(d.folder)
         self.open_now.set_quietly(not d.lazy)
@@ -628,6 +702,7 @@ class ServerDialog(QtWidgets.QDialog):
             return
         d.dirty = True
         d.name = self.dev_name.text().strip()
+        d.description = self.dev_description.text()
         d.driver = self.driver.currentText().strip()
         d.folder = self.dev_folder.text().strip()
         d.lazy = not self.open_now.isChecked()
@@ -646,23 +721,91 @@ class ServerDialog(QtWidgets.QDialog):
         self._edited()
         d = self.current()
         if d is not None:
+            if d.offer is not None and d.driver != d.offer[1].driver:  # another driver typed in its place
+                self._drop_offer(d)
             self._show_args(d)
-            if _placeholder(d) and d.driver in EXAMPLES:  # a better name than device1
-                name = d.driver.partition(":")[2].removeprefix("Sim").lower()
-                if name not in {o.name for o in self.devices}:
-                    self.dev_name.setText(name)
+            offer = self.offers.offer(d.driver)
+            if offer is not None:
+                self._name_after(d, offer.name)
+            self._fit_python()
             self._edited()  # (again: what is written depends on the arguments of the driver now chosen)
+
+    def _name_after(self, d: DeviceSpec, name: str) -> None:
+        """Name a device that has no name of its own yet (_placeholder) after what was chosen for it,
+        unless another device has that name."""
+        if _placeholder(d) and name not in {o.name for o in self.devices if o is not d}:
+            self.dev_name.setText(name)
+            d.auto_name = name
+
+    def _found(self, found: list) -> None:
+        """The devices of the other extensions, once discover() has found them (on a worker thread)."""
+        text, blocked = self.driver.currentText(), self.driver.blockSignals(True)
+        for ext in found:
+            if ext.usable:
+                self.offers.add(ext)
+        self.driver.setEditText(text)
+        self.driver.blockSignals(blocked)
+
+    def _offer_chosen(self, row: int) -> None:
+        """A device an extension offers was chosen from the list: its driver, its folder and the
+        keys its manifest gives (more keys, so that they are written as they are), named after it
+        if it has no name of its own yet, and run by the extension's Python (_fit_python)."""
+        d, chosen = self.current(), self.offers.item(row).data(_OFFER) if row >= 0 else None
+        if d is None or chosen is None:
+            return
+        ext, offer = chosen
+        self._loading = True
+        self._name_after(d, offer.name)
+        self.driver.setEditText(offer.driver)
+        self.dev_folder.setText(ext.device_table(offer).get("path", ""))
+        self.extra.setPlainText("\n".join(_offer_lines(ext, offer)))
+        self._loading = False
+        d.offer = chosen
+        self._driver_changed()
+
+    def _drop_offer(self, d: DeviceSpec) -> None:
+        """Another driver than that of the device chosen from the list: the device is no longer that
+        one, so the keys the choice brought go from more keys (those still as they were), above all
+        its `extension`, which would announce an extension it is not from.  The folder stays: the
+        driver typed may be another class of it."""
+        brought = set(_offer_lines(*d.offer))
+        d.offer = None
+        self._loading = True
+        self.extra.setPlainText("\n".join(line for line in self.extra.toPlainText().split("\n") if line not in brought))
+        self._loading = False
+
+    def _needed_python(self, d: DeviceSpec) -> str | None:
+        """The Python a device's code is to run in, if it says: that of the extension it was chosen
+        from (none for insthub's own, which runs in any Python that has insthub), else a virtualenv's
+        next to its driver's file."""
+        if d.offer is not None:
+            ext = d.offer[0]
+            return None if ext.builtin else ext.python
+        file = driver_file(d.driver, d.folder, self._base())
+        return extensions.venv_python(file.parent) if file is not None else None
+
+    def _fit_python(self) -> None:
+        """A new server runs in the Python its devices' code needs (_needed_python): that of the
+        first device that needs one, else insthub's own.  One chosen by hand stays; _check_python
+        says which devices it may not suit."""
+        if self.existing is not None or self.python.text() != self._python_set:
+            return
+        self._python_set = next((p for d in self.devices if (p := self._needed_python(d))), sys.executable)
+        self.python.setText(self._python_set)
 
     def _show_args(self, d: DeviceSpec) -> None:
         while self.args_form.rowCount():
             self.args_form.removeRow(0)
         self._arg_edits = {}
         known = constructor_args(d.driver, d.folder, self._base())
-        if known:  # its own arguments, each in a field (another driver's, typed before, are kept but not written)
+        exact = d.driver.partition(":")[0].split(".")[0] == "insthub"  # imported: [] means it takes none
+        if known or (known == [] and exact):  # its own arguments, each in a field (another driver's, typed
+            # before, are kept but not written)
             d.texts = {name for name, _, text in known if text}
             d.known = {name for name, _, _ in known}
             fields = [(name, "required" if default is None else default) for name, default, _ in known]
-            self.args_note.setText("Leave a field empty to keep the driver's default.")
+            self.args_note.setText("Leave a field empty to keep the driver's default." if known else
+                                   "Its constructor takes no arguments; give anything else under more keys.")
         else:  # not known here (or inherited): what the fields hold stays in sight, and is written as it is
             d.known = None
             fields = [(name, "") for name, text in d.args.items() if text.strip()]
@@ -679,6 +822,30 @@ class ServerDialog(QtWidgets.QDialog):
             self._arg_edits[name] = edit
             self.args_form.addRow(ui.label(name, "label"), edit)
         self._mark_given()
+
+    def _check_python(self, d: DeviceSpec | None) -> None:
+        """Say so when a device's code needs a Python (_needed_python) other than the one its server
+        runs in: the server imports every driver in its one Python, which may not have this one's
+        packages.  The server's: for a new one, the one chosen below; else that of its service or
+        its command line, if known."""
+        ours = (self.python.text().strip() or sys.executable) if self.existing is None else self._server_python
+        theirs = self._needed_python(d) if d is not None and ours else None
+        note = ""
+        if theirs is not None and not _same_python(theirs, ours):
+            own = (f"Its extension, {d.offer[0].title}, runs in {theirs}" if d.offer else
+                   f"This driver's folder has a Python of its own ({theirs})")
+            if self.existing is not None:
+                note = (f"{own}, but {self.server.name} runs in {ours}. If the driver's packages are only in its "
+                        "own, it will not load here: give it a server of its own (Add → New server...).")
+            elif other := next((o.name for o in self.devices
+                                if o is not d and _same_python(self._needed_python(o), ours)), None):
+                note = (f"{own}, but the server runs in {ours}, which {other} needs: a server runs in one Python, "
+                        "so host them in separate servers.")
+            else:
+                note = (f"{own}, but the server is to run in {ours}. If the driver's packages are only in its own, "
+                        "it will not load there.")
+        self.driver_note.setText(note)
+        self.driver_note.setVisible(bool(note))
 
     def _mark_given(self) -> None:
         """An argument that more keys gives (a list, say) is set there, not in its field: say so."""
@@ -713,12 +880,11 @@ class ServerDialog(QtWidgets.QDialog):
         self.dev_folder.setText(str(path.parent))
         self.driver.setCurrentText(f"{path.stem}:{choice}")
         d = self.current()
-        if d is not None and _placeholder(d):
-            self.dev_name.setText(choice.lower())
+        if d is not None:
+            self._name_after(d, choice.lower())
         self._edited()
         self._show_args(self.current())
-        if self.python.text() == sys.executable:
-            self.python.setText(find_python(path))
+        self._fit_python()  # (the virtualenv next to the file, unless a Python was chosen by hand)
 
     def _browse_dev_folder(self) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder of the driver",
@@ -835,7 +1001,8 @@ class ServerDialog(QtWidgets.QDialog):
         if self.existing is None:
             self.preview.setExtraSelections([])
             return
-        old, new = self._original.splitlines(), text.splitlines()
+        # (lines as Qt's blocks are: only a line feed ends one, not U+2028 and the like)
+        old, new = (t.replace("\r\n", "\n").removesuffix("\n").split("\n") for t in (self._original, text))
         marks = []
         for op, a0, a1, b0, b1 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
             if op in ("replace", "insert"):
@@ -873,6 +1040,7 @@ class ServerDialog(QtWidgets.QDialog):
         self.file_label.setToolTip(path)
         d = self.current()
         self.open_hint.setText("" if d is None else "lazy: opened on first use" if d.lazy else "")
+        self._check_python(d)  # (here: a change of the Python below counts too)
         then = self.then.currentData()
         service_chosen = then == self.SERVICE
         self.login.setVisible(service_chosen)
@@ -889,11 +1057,13 @@ class ServerDialog(QtWidgets.QDialog):
         }.get(then, ""))
         try:
             text = self.text()
-            shown, now = self.preview.toPlainText(), text.replace("\r\n", "\n")
+            # (compared with what it was given, not toPlainText(): Qt turns a no-break space into a space)
+            shown, now = getattr(self, "_shown", ""), text.replace("\r\n", "\n")
             if shown != now:
                 bar = self.preview.verticalScrollBar()
                 at = bar.value()  # the preview stays where it was scrolled to ...
                 self.preview.setPlainText(text)
+                self._shown = now
                 bar.setValue(at)
                 where = _first_change(shown, now) if shown else None
                 if where is not None:  # ... but shows the line this edit changed
@@ -969,7 +1139,7 @@ class ServerDialog(QtWidgets.QDialog):
             return
         self.accept()
         if self.then.currentData() == self.RESTART:
-            self.window.restart_server(self.server, after=f"saved {path.name}")
+            self.window.restart_server(self.server, after=f"saved {path.name}", name=self.name.text().strip() or None)
         else:
             self.window.say(f"Saved {path.name}; restart the server to use it", 8000)
 

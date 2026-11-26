@@ -38,6 +38,7 @@ from __future__ import annotations
 import enum
 import inspect
 import logging
+import os
 import queue
 import threading
 import time
@@ -371,6 +372,50 @@ def _command(name: str, fn, call, drop_first: bool = False, opts: dict | None = 
     return _Cmd(name, call, _shown(sig), _doc(fn), params=params, sig=typed, **opts)
 
 
+#: insthub's own requests, as what a device is busy with (for "waiting for ... to finish").
+_OWN_REQUESTS = {"$open": "the opening of its session", "$resume": "the resume (it opens its session again)",
+                 "$pause": "the pause (it closes its session)", "$release": "the release of its session"}
+
+
+def busy_with(status: dict) -> str | None:
+    """What a device is doing now, from its status, in words: the name of the command that runs,
+    or what one of insthub's own requests does ("the opening of its session"); None: nothing."""
+    busy = status.get("busy")
+    if busy is None:
+        return _OWN_REQUESTS["$open"] if status.get("opening") else None
+    return _OWN_REQUESTS.get(busy, busy)
+
+
+#: Arguments that say where an instrument is, by kind: the first one given is its address.
+_WHERE = ("resource", "resource_name", "visa_address", "visa", "url", "uri", "host", "hostname", "ip", "ip_address",
+          "address", "addr", "port", "serial_port", "serial", "device", "tty")
+
+
+def given_address(dev: Device, cls, args=(), kwargs=None) -> None:
+    """Set dev.address from the arguments `cls` is made with, unless the device says it itself
+    (an address of its own, or a command or property of that name): "10.0.0.5:5000" from host
+    and port, "GPIB0::18" from board and pad, else the first of _WHERE that is given."""
+    if inspect.getattr_static(dev, "address", None) is not None:
+        return
+    try:
+        bound = dict(inspect.signature(cls).bind_partial(*args, **(kwargs or {})).arguments)
+    except (TypeError, ValueError):
+        bound = dict(kwargs or {})
+    given = {k.lower(): v for k, v in bound.items()
+             if isinstance(v, (str, int)) and not isinstance(v, bool) and str(v).strip()}
+    for key in _WHERE:
+        value = given.get(key)
+        if value is None or (key == "port" and not isinstance(value, str)):  # a TCP port alone says little
+            continue
+        value = str(value).strip()
+        if key in ("host", "hostname", "ip", "ip_address", "address", "addr") and isinstance(given.get("port"), int):
+            value = f"{value}:{given['port']}"
+        dev.address = value
+        return
+    if isinstance(given.get("pad"), int):  # GPIB: the board and the instrument's primary address
+        dev.address = f"GPIB{given.get('board', 0)}::{given['pad']}"
+
+
 def _declared(obj, attr: str, kind, default=None):
     """What a device (or a driver) declares as `attr` (extension, simulated, poll, dangerous), if
     it is of that kind.  Read without running anything: a subclass may use the name for a command
@@ -410,6 +455,7 @@ class _Runtime:
         self.last_attempt = float("-inf")
         self.open_failed = False
         self.busy: str | None = None
+        self.opening = False  #: the device thread opens the session on its own (at start, for a task)
         self.calls = 0
         self.errors = 0
         self.paused: dict | None = None  #: while paused: since when, and who paused it (pid, peer, by)
@@ -578,13 +624,13 @@ class _Runtime:
     def _run(self) -> None:
         dev = self.dev
         if dev.open_on_start:
-            self.busy = "$open"  # (in the status: a pause that comes in meanwhile waits for it)
+            self.opening = True  # (in the status: a pause that comes in meanwhile waits for it)
             try:
                 self.ensure_open()
             except Exception as e:
                 dev.log.warning("not connected at start: %s", e)
             finally:
-                self.busy = None
+                self.opening = False
         q = self.queue
         tasks = list(self.tasks.values())
         started = time.monotonic()
@@ -765,12 +811,13 @@ class _Runtime:
             t.next_due = max(t.next_due + t.interval, now)
             try:
                 if not self.opened:
-                    self.busy = "$open"  # (in the status: a pause that comes in meanwhile waits for it)
+                    self.opening = True  # (in the status: a pause that comes in meanwhile waits for it)
                     try:
                         self.ensure_open()
                     finally:
-                        self.busy = None
-                    if self.paused is not None:  # paused while it opened: the task does not run
+                        self.opening = False
+                    if self.paused is not None:  # paused while it opened: the task runs once it is resumed
+                        t.next_due = now
                         return
                 t.fn()
                 t.runs += 1
@@ -828,7 +875,8 @@ class _Runtime:
     # -- introspection (any thread) ---------------------------------------
     def status(self) -> dict:
         return {"connected": self.opened, "error": self.last_error, "since": self.opened_at,
-                "busy": self.busy, "queued": self.queue.qsize(), "calls": self.calls, "errors": self.errors,
+                "busy": self.busy, "opening": self.opening, "queued": self.queue.qsize(), "calls": self.calls,
+                "errors": self.errors,
                 "subscribers": sum(len(s.sinks) for s in list(self.streams.values())),
                 "paused": dict(paused) if (paused := self.paused) is not None else None}
 
@@ -839,7 +887,8 @@ class _Runtime:
             last = st.last
             streams[name] = {"seq": st.seq, "time": last.time if last else None, "doc": self._stream_doc(st),
                              "kind": summarize(last.data) if last else None, "subscribers": len(st.sinks)}
-        about = {key: value for key in ("extension", "extension_version") if (value := _declared(dev, key, str))}
+        about = {key: value for key in ("extension", "extension_version", "description", "address")
+                 if (value := _declared(dev, key, str))}
         if _declared(dev, "simulated", bool):
             about["simulated"] = True
         return {
@@ -884,6 +933,12 @@ class Device:
     #: It talks to a simulator, not to an instrument.  Clients mark it SIM, so that
     #: its output is never taken for a measurement.
     simulated = False
+    #: What this one is, in a few words ("the one on the optics table"): the window shows it
+    #: instead of its class's docstring, which is the same for every instrument of a kind.
+    description: str | None = None
+    #: Where the instrument is (an IP address, a VISA resource, a serial port), to tell it from
+    #: others of its kind.  A wrapped driver's is taken from the arguments it is made with.
+    address: str | None = None
     #: Values to read again and again, {name: seconds}: a property, or a command
     #: that needs no argument.  Each value is published on a stream of the same name,
     #: by a periodic task "poll:<name>".
@@ -982,6 +1037,12 @@ class Device:
     def _insthub_doc(self):
         return type(self)
 
+    def _insthub_folders(self) -> list[str]:
+        """The folders of the files its code comes from.  Its server writes them into its registry
+        file, so that a program on this computer finds the device's extension from them (see
+        docs/design.md#how-a-device-finds-its-extension).  A Wrapped device adds its driver's."""
+        return _folders(type(self))
+
     def _insthub_tables(self) -> tuple[dict, dict]:
         """(commands, properties) exposed by this device, as its class marks them."""
         cls = type(self)
@@ -1001,6 +1062,23 @@ class Device:
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.name!r}>"
+
+
+def _folders(*classes) -> list[str]:
+    """The folders of the files that define these classes, each once; none for insthub's own base
+    classes, which say nothing about an extension, nor for a class without a file (one made at the
+    prompt, or written in C)."""
+    found = []
+    for cls in classes:
+        if cls in (Device, Wrapped):
+            continue
+        try:
+            folder = os.path.dirname(os.path.abspath(inspect.getfile(cls)))
+        except (TypeError, OSError):
+            continue
+        if folder not in found:
+            found.append(folder)
+    return found
 
 
 class _Getter:
@@ -1059,6 +1137,7 @@ class Wrapped(Device):
         if _declared(target, "simulated", bool):
             self.simulated = True
         super().__init__(name or self._cls.__name__.lower())
+        given_address(self, self._cls, self._args, self._kwargs)
 
     @property
     def target(self):
@@ -1081,6 +1160,9 @@ class Wrapped(Device):
 
     def _insthub_doc(self):
         return self._cls
+
+    def _insthub_folders(self) -> list[str]:
+        return _folders(type(self), self._cls)
 
     def _insthub_tables(self):
         cls = self._cls

@@ -368,3 +368,17 @@ def test_an_agents_pause_behind_a_long_command_is_not_reported_as_failed(server,
     finally:
         slow.result(5)
         server.device("loopback").bus.resume()
+
+
+def test_agents_see_where_a_device_is_and_what_it_is(tmp_path):
+    class Scpi:
+        def __init__(self, host, port=5000):
+            pass
+
+    rp = insthub.wrap(Scpi, "rp", kwargs={"host": "10.0.0.5"})
+    rp.description = "the one on the optics table"
+    with insthub.Server("w", [rp]):
+        tools = ThroughRun(mcp.Tools(render.Renderer(tmp_path / "data"), timeout=10))
+        listed = ok(tools.list_devices())["devices"]["rp"]
+        assert listed["address"] == "10.0.0.5" and listed["description"] == "the one on the optics table"
+        assert ok(tools.describe("rp"))["address"] == "10.0.0.5"

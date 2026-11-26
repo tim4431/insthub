@@ -14,7 +14,20 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("insthub.qt", exc_type=ImportError)  # needs a Qt binding
 
 import insthub  # noqa: E402
-from insthub import cli, config, forms, inventory, launcher, manager, pages, qt, registry, service, sim  # noqa: E402
+from insthub import (  # noqa: E402
+    cli,
+    config,
+    extensions,
+    forms,
+    inventory,
+    launcher,
+    manager,
+    pages,
+    qt,
+    registry,
+    service,
+    sim,
+)
 from insthub import widgets as ui  # noqa: E402
 
 
@@ -214,6 +227,8 @@ def test_controls_follow_what_a_device_says_and_dangerous_asks_first(window, mon
         window.open_device("local:t", "rig")
         page = window.device_page
         assert not page.header.badge.isHidden() and page.extension.text() == "rig-ext 0.4"
+        assert spin(3, lambda: "extension rig-ext is not installed on this computer: insthub ext add FOLDER"
+                    in page.extension.text())                                # its extension: not here
         rows = page.props.rows
         assert spin(3, lambda: all(row.loaded for row in rows.values()))
         mode, level, gain = rows["mode"], rows["level"], rows["gain"]
@@ -626,11 +641,12 @@ def test_new_server_writes_its_config_and_starts_it(window, monkeypatch, tmp_pat
     dialog._arg_edits["points"].setText("500")
     dialog._arg_edits["points"].textEdited.emit("500")
     dialog._add()
-    dialog.driver.setCurrentText("insthub.sim:Loopback")
-    assert dialog.dev_name.text() == "loopback"                              # named after the driver
+    _choose(dialog, "loopback")                                              # one insthub's own extension offers
+    assert dialog.dev_name.text() == "loopback"                              # named after it
     dialog.reach.setCurrentIndex(dialog.reach.findData(forms.NETWORK))
     dialog.port.setValue(8799)
-    assert '[devices.loopback]\ndriver = "insthub.sim:Loopback"' in dialog.preview.toPlainText()
+    assert '[devices.loopback]\ndriver = "insthub.sim:Loopback"\nextension = "insthub-sim"' in \
+        dialog.preview.toPlainText()
     dialog.dev_name.setText("scope")                                         # two of the same name: refused
     dialog.dev_name.textEdited.emit("scope")
     assert "same name" in dialog.problem.text() and not dialog.create.isEnabled()
@@ -644,6 +660,169 @@ def test_new_server_writes_its_config_and_starts_it(window, monkeypatch, tmp_pat
     assert kwargs == {"name": "bench", "tcp": "0.0.0.0:8799"} and [d.name for d in devices] == ["scope", "echo"]
     assert devices[0].points == 500
     assert started == [([sys.executable, "-m", "insthub", "serve", str(path)], "bench")]
+
+
+def test_new_server_offers_the_devices_of_extensions(window, monkeypatch, tmp_path):
+    folder = tmp_path / "hp"
+    (folder / ".venv" / "bin").mkdir(parents=True)
+    (folder / ".venv" / "bin" / "python").write_text("")
+    (folder / "hpdrv.py").write_text("class Analyzer:\n    def __init__(self, pad=1, sim=False):\n        pass\n")
+    (folder / "insthub-extension.toml").write_text(
+        '[extension]\nid = "hp8562a"\ntitle = "HP 8562A"\n\n[devices.analyzer-sim]\ndriver = "hpdrv:Analyzer"\n'
+        'doc = "a simulated analyzer"\nsim = true\nexclude = ["write"]\n')
+    monkeypatch.setenv("INSTHUB_EXTENSIONS", str(folder))
+    dialog = forms.NewServerDialog(window)
+    shown = lambda: [dialog.offers.item(r).text() for r in range(dialog.offers.rowCount())]
+    assert shown()[0] == "Simulated instruments: a simulated two-channel oscilloscope"  # insthub's own, at once
+    assert spin(3, lambda: "HP 8562A: a simulated analyzer" in shown())  # the others once found
+    assert dialog.driver.currentText() == "insthub.sim:SimScope"  # what the field held stays
+    dialog._add()
+    _choose(dialog, "analyzer-sim")
+    assert dialog.dev_name.text() == "analyzer-sim" and dialog.driver.currentText() == "hpdrv:Analyzer"
+    assert dialog.dev_folder.text() == str(folder) and dialog.python.text() == str(folder / ".venv/bin/python")
+    assert dialog._arg_edits["sim"].isReadOnly() and not dialog._arg_edits["pad"].isReadOnly()  # given: as is
+    table = tomllib.loads(dialog.preview.toPlainText())["devices"]["analyzer-sim"]
+    assert table == {"driver": "hpdrv:Analyzer", "path": str(folder), "extension": "hp8562a", "sim": True,
+                     "exclude": ["write"]}
+
+
+def _extension(folder, ext_id, offers, python=".venv/bin/python"):
+    """An extension's folder: a Python of its own (a stand-in), a driver module, and a manifest that offers
+    each of `offers` (name -> more lines of its table) with that one driver."""
+    (folder / python).parent.mkdir(parents=True)
+    (folder / python).write_text("")
+    (folder / f"drv_{ext_id}.py").write_text("class D:\n    def __init__(self, pad=1, sim=False):\n        pass\n")
+    declared = "" if python == ".venv/bin/python" else f'python = "{python}"\n'
+    (folder / "insthub-extension.toml").write_text(f'[extension]\nid = "{ext_id}"\ntitle = "{ext_id.upper()}"\n'
+                                                   f'{declared}' + "".join(
+        f'\n[devices.{name}]\ndriver = "drv_{ext_id}:D"\ndoc = "{name} of {ext_id}"\n{more}' for name, more in offers.items()))
+    return folder
+
+
+def test_a_device_chosen_from_the_list_is_named_after_it_until_it_is_another(window, monkeypatch, tmp_path):
+    hp = _extension(tmp_path / "hp", "hp", {"spectrum": "pad = 18\n", "spectrum-sim": "sim = true\n"})  # one driver
+    monkeypatch.setenv("INSTHUB_EXTENSIONS", str(hp))
+    dialog = forms.ServerDialog(window)
+    assert spin(3, lambda: any(dialog.offers.item(r).data(forms._OFFER)[0].id == "hp"
+                               for r in range(dialog.offers.rowCount())))
+    devices = lambda: tomllib.loads(dialog.preview.toPlainText())["devices"]
+    _choose(dialog, "spectrum")                                       # the first device, named by the dialog too
+    assert dialog.dev_name.text() == "spectrum"
+    _choose(dialog, "scope")
+    assert dialog.dev_name.text() == "scope" and devices()["scope"] == {"driver": "insthub.sim:SimScope",
+                                                                         "extension": "insthub-sim"}
+    dialog._add()
+    _choose(dialog, "spectrum-sim")                                   # the field gets the driver first: two offer it
+    assert dialog.dev_name.text() == "spectrum-sim"
+    assert devices()["spectrum-sim"] == {"driver": "drv_hp:D", "path": str(hp), "extension": "hp", "sim": True}
+    _choose(dialog, "spectrum")                                       # the name was the dialog's: chosen again
+    assert devices()["spectrum"] == {"driver": "drv_hp:D", "path": str(hp), "extension": "hp", "pad": 18}
+    _type(dialog.dev_name, "rf")                                      # a name of its own stays
+    _choose(dialog, "spectrum-sim")
+    assert dialog.dev_name.text() == "rf"
+    dialog.extra.setPlainText(dialog.extra.toPlainText() + "\nbaud = 9600")
+    dialog.driver.setEditText("mydrv:Other")                          # another driver: no longer the extension's
+    assert devices()["rf"] == {"driver": "mydrv:Other", "path": str(hp), "baud": 9600}  # what you wrote stays
+
+
+def test_a_new_server_runs_in_its_devices_python_and_says_what_does_not_fit(window, monkeypatch, tmp_path):
+    a, b = _extension(tmp_path / "a", "aaa", {"aaadev": ""}), _extension(tmp_path / "b", "bbb", {"bbbdev": ""})
+    py_a, py_b = str(a / ".venv/bin/python"), str(b / ".venv/bin/python")
+    monkeypatch.setenv("INSTHUB_EXTENSIONS", os.pathsep.join([str(a), str(b)]))
+    dialog = forms.ServerDialog(window)
+    assert spin(3, lambda: dialog.offers.offer("drv_bbb:D") is not None)
+    dialog._add()
+    _choose(dialog, "aaadev")
+    assert dialog.python.text() == py_a and dialog.driver_note.isHidden()
+    dialog._add()
+    _choose(dialog, "bbbdev")
+    assert dialog.python.text() == py_a                               # a server runs in one Python ...
+    note = dialog.driver_note.text()                                  # ... and the device it does not suit says so
+    assert not dialog.driver_note.isHidden() and "Its extension, BBB, runs in " + py_b in note
+    assert f"the server runs in {py_a}, which aaadev needs" in note and "separate servers" in note
+    dialog.list.setCurrentRow(1)
+    assert dialog.driver_note.isHidden()                              # aaadev: in its Python
+    dialog._remove()
+    assert dialog.python.text() == py_b and dialog.driver_note.isHidden()  # bbbdev's, now that it alone needs one
+    _type(dialog.python, "/opt/py/bin/python")                        # chosen by hand: it stays
+    dialog._add()
+    _choose(dialog, "aaadev")
+    assert dialog.python.text() == "/opt/py/bin/python"
+    assert "but the server is to run in /opt/py/bin/python" in dialog.driver_note.text()
+
+
+def test_adding_an_extension_s_device_says_when_its_server_runs_another_python(window, monkeypatch, tmp_path):
+    a = _extension(tmp_path / "a", "aaa", {"aaadev": ""}, python="py/python3")  # named in its manifest
+    monkeypatch.setenv("INSTHUB_EXTENSIONS", str(a))
+    path = tmp_path / "rig.toml"
+    path.write_text('[devices.echo]\ndriver = "insthub.sim:Loopback"\n')
+    monkeypatch.setattr(service, "units", lambda: [{"name": "rig", "state": "inactive", "sub": "dead", "pid": None,
+                                                    "enabled": False, "unit": "u",
+                                                    "command": f'"/srv/py/bin/python" "-m" "insthub" "serve" "{path}"'}])
+    assert spin(5, lambda: "service:rig" in window.servers)
+    dialog = forms.ServerDialog(window, path, server=window.servers["service:rig"], add=True)
+    assert spin(3, lambda: dialog.offers.offer("drv_aaa:D") is not None)
+    _choose(dialog, "aaadev")
+    note = dialog.driver_note.text()
+    assert f"Its extension, AAA, runs in {a / 'py' / 'python3'}, but rig runs in /srv/py/bin/python" in note
+
+
+def menu_of(window, monkeypatch, key, name) -> list[str]:
+    """What a right-click on a device's tile offers."""
+    shown = []
+    monkeypatch.setattr(qt.QtWidgets.QMenu, "exec", lambda self, *a: shown.extend(a.text() for a in self.actions()))
+    window.device_menu(key, name, None)
+    return shown
+
+
+def test_a_device_opens_the_uis_of_its_extension(window, monkeypatch):
+    """Open runs a UI of the device's extension as a program of its own, with the extension's Python
+    (insthub's own panel for its scope: this Python); the window imports none of it."""
+    imported = "insthub.sim_ui" in sys.modules
+    with insthub.Server("t", [sim.SimScope(), sim.SimSynth()]) as server:
+        assert spin(5, lambda: word(window, "device", "local:t", "scope") == "connected")
+        assert spin(5, lambda: "Open Scope panel" in menu_of(window, monkeypatch, "local:t", "scope"))
+        assert not any(text.startswith("Open ") for text in menu_of(window, monkeypatch, "local:t", "synth"))
+        window.open_device("local:t", "synth")
+        page = window.device_page
+        assert spin(5, lambda: window.device_uis(window.servers["local:t"], "synth") == (
+            extensions.load(extensions.OWN, "insthub"), [], None))         # found out: the scope's UI only
+        assert page.ui_buttons.count() == 0
+        window.open_device("local:t", "scope")
+        assert spin(5, lambda: page.ui_buttons.count() == 1)
+        button = page.ui_buttons.itemAt(0).widget()
+        assert button.text() == "Open Scope panel" and button.isEnabled() and sys.executable in button.toolTip()
+        button.click()
+        panel, = (p for p in window._spawned if p.title == "Scope panel for scope")
+        try:                                                             # it watches the scope, from its program
+            assert spin(20, lambda: server.devices["scope"].subscribers("ch1") > 0), panel.log.read_text()
+            assert panel.process.args[1:4] == ["-m", "insthub", "-a"] and "panel" in panel.process.args
+        finally:
+            panel.process.terminate()
+            panel.process.wait(10)
+    assert ("insthub.sim_ui" in sys.modules) == imported
+
+
+def test_a_window_opened_for_a_device_says_why_it_failed(window, monkeypatch, tmp_path):
+    said = []
+    monkeypatch.setattr(window, "say", lambda text, ms=5000: said.append(text))
+    gone = inventory.Server("local:gone", "gone", "local", ["tcp://127.0.0.1:9"])  # nothing answers there
+    window.live_view(gone, "scope")                                      # its output goes to a log, which says why
+    assert spin(20, lambda: any(t.startswith("The live view of scope ended with an error: ") for t in said)), said
+    assert inventory.ui_log("scope", "view").read_text().strip() and str(inventory.ui_log("scope", "view")) in said[-1]
+    folder = tmp_path / "hp"
+    folder.mkdir()
+    (folder / "insthub-extension.toml").write_text(
+        f'[extension]\nid = "hp"\npython = "{sys.executable}"\n\n[ui.quick]\ntitle = "Quick look"\n'
+        'run = ["-c", "import sys; sys.exit(\'No module named PyQt6: install the gui extra\')"]\n')
+    ext = extensions.load(folder / "insthub-extension.toml")
+    window.open_ui(gone, "sa", ext, ext.ui["quick"])
+    assert spin(20, lambda: "Quick look for sa ended with an error: No module named PyQt6: install the gui extra "
+                f"(its log: {inventory.ui_log('sa', 'quick')})" in said), said
+    warned = []
+    monkeypatch.setattr(qt.QtWidgets.QMessageBox, "warning", lambda *a: warned.append(a[2]))
+    window.open_ui(gone, "../sa", ext, ext.ui["quick"])                   # a name that must not fill a placeholder
+    assert warned and warned[0].startswith("Cannot open Quick look for ../sa.\n\nbad device name '../sa'")
 
 
 def test_pause_and_resume_from_the_window(window):
@@ -734,8 +913,9 @@ def test_restart_of_a_server_started_here_asks_runs_once_and_comes_back(window, 
             return 0
 
     spawned = []
-    monkeypatch.setattr(manager, "spawn", lambda *a: spawned.append(a) or Proc(4343))
-    window._spawned.append(Proc(4242))
+    log = inventory.server_log("x")
+    monkeypatch.setattr(manager, "spawn", lambda *a: spawned.append(a) or inventory.Launched(Proc(4343), log, "x"))
+    window._spawned.append(inventory.Launched(Proc(4242), log, "x"))
     s = type("S", (), {"service": None, "pid": 4242, "name": "x", "key": "local:x", "origin": "local"})()
     answers = [False, True, True]
     monkeypatch.setattr(window, "confirm", lambda *a: answers.pop(0))
@@ -749,7 +929,7 @@ def test_restart_of_a_server_started_here_asks_runs_once_and_comes_back(window, 
     window._detail = ("server", "local:x")                                 # its page, while it is gone ...
     window.pages.setCurrentWidget(window.server_page)
     window.render()
-    assert window.pages.currentWidget() is window.servers_page and window._follow == "local:x"
+    assert window.pages.currentWidget() is window.servers_page and window._follow == ("local:x", None)
     opened = []
     monkeypatch.setattr(window, "open_server", opened.append)
     monkeypatch.setattr(window, "servers", {"local:x": type("S", (), {**vars(type(s)), "pid": 4343})()})
@@ -927,6 +1107,13 @@ def _type(edit, text):
     edit.textEdited.emit(text)
 
 
+def _choose(dialog, offer: str):
+    """Choose a device an extension offers from the driver list, as a click on it does."""
+    row = next(r for r in range(dialog.offers.rowCount()) if dialog.offers.item(r).data(forms._OFFER)[1].name == offer)
+    dialog.driver.setCurrentIndex(row)
+    dialog.driver.activated.emit(row)
+
+
 KWARGS = """[devices.box]
 driver = "boxdriver:Box"
 path = "."
@@ -1078,10 +1265,10 @@ def test_renamed_and_added_under_the_old_name_and_other_small_things(window, tmp
 
     path.write_text('[devices.device_psu]\ndriver = "insthub.sim:Loopback"\n')
     dialog = forms.ServerDialog(window, path)
-    dialog.driver.setCurrentText("insthub.sim:SimSynth")                     # an existing device keeps its name
+    _choose(dialog, "synth")                                                  # an existing device keeps its name
     assert dialog.dev_name.text() == "device_psu"
     dialog._add()
-    dialog.driver.setCurrentText("insthub.sim:SimSynth")                     # a new device1 is named after it
+    _choose(dialog, "synth")                                                  # a new device1 is named after it
     assert dialog.dev_name.text() == "synth"
 
     path.write_text('[server]\nname = "bare"\n')                              # no devices, no [devices]
@@ -1172,8 +1359,8 @@ def test_editing_restarts_the_server_that_reads_the_config(window, tmp_path, mon
         assert insthub.device("scope").get_waveform().volts.shape == (64,)   # the new config is in effect
     finally:
         for proc in window._spawned:
-            proc.terminate()
-            proc.wait(10)
+            proc.process.terminate()
+            proc.process.wait(10)
 
 
 def test_editing_a_service_config_starts_it(window, monkeypatch, tmp_path):
@@ -1246,6 +1433,32 @@ def test_theme_follows_the_setting(window):
     assert window.settings.value("theme") == "dark"
     page.theme.setCurrentIndex(page.theme.findData("light"))
     assert ui.current() is ui.LIGHT and ui.LIGHT.window in window.styleSheet()
+
+
+def test_extension_folders_are_added_and_removed_in_settings(window, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("INSTHUB_EXTENSIONS")
+    good, broken = tmp_path / "good", tmp_path / "broken"
+    for folder, api in ((good, 1), (broken, 9)):
+        (folder / ".venv" / "bin").mkdir(parents=True)
+        (folder / ".venv" / "bin" / "python").write_text("")
+        (folder / "insthub-extension.toml").write_text(f'[extension]\nid = "{folder.name}"\ntitle = "The '
+                                                       f'{folder.name} one"\napi = {api}\n')
+    page = window.settings_page
+    rows = lambda: [(r.findChildren(qt.QtWidgets.QLabel)[0].text(), r.hint.text())
+                    for r in (page.ext_rows.itemAt(i).widget() for i in range(page.ext_rows.count()))]
+    window.show_page("settings")
+    assert spin(3, lambda: [t for t, _ in rows()] == ["Simulated instruments"])
+    assert "comes with insthub" in rows()[0][1]
+    for folder in (good, broken):
+        monkeypatch.setattr(qt.QtWidgets.QFileDialog, "getExistingDirectory", lambda *a, f=folder: str(f))
+        page._add_extension()
+    assert spin(3, lambda: [t for t, _ in rows()] == ["Simulated instruments", "The good one", "The broken one"])
+    assert "in your list" in rows()[1][1] and "written for a newer insthub" in rows()[2][1]  # broken: says why
+    remove = page.ext_rows.itemAt(1).widget().findChildren(qt.QtWidgets.QPushButton)[0]
+    remove.click()
+    assert spin(3, lambda: [t for t, _ in rows()] == ["Simulated instruments", "The broken one"])
+    assert extensions.listed_folders() == [str(broken)]
 
 
 def test_every_page_paints_in_both_themes(window, tmp_path):
@@ -1355,3 +1568,131 @@ def test_a_server_started_here_that_fails_says_why(window, monkeypatch):
     window.start_server([sys.executable, "-c", code], "broken")
     assert spin(10, lambda: any("broken ended with an error: error: [devices.psu] needs a driver" in t
                                 for t in said)), said
+
+
+def test_a_device_is_added_from_its_servers_page_and_tiles_say_where_they_are(window, monkeypatch, tmp_path):
+    path = tmp_path / "rig.toml"
+    path.write_text('# the rig\n[devices.echo]\ndriver = "insthub.sim:Loopback"\n')
+    unit = {"name": "rig", "state": "inactive", "sub": "dead", "pid": None, "enabled": False, "unit": "u",
+            "command": f'"python" "-m" "insthub" "serve" "{path}"'}
+    monkeypatch.setattr(service, "units", lambda: [unit])
+    started = []
+    monkeypatch.setattr(service, "start", lambda name: started.append(name))
+    opened = []
+    monkeypatch.setattr(forms.ServerDialog, "exec", lambda self: opened.append(self))
+    assert spin(5, lambda: "service:rig" in window.servers)
+    window.open_server("service:rig")
+    page = window.server_page
+    assert not page.add_tile.isHidden() and "rig.toml" in page.add_tile.detail
+    page.add_tile.clicked.emit()                                               # the tile ...
+    dialog, = opened
+    assert dialog.windowTitle() == "Add a device to rig.toml"
+    assert [d.name for d in dialog.devices] == ["echo", "device1"] and dialog.current().name == "device1"
+    dialog.driver.setCurrentText("insthub.sim:SimScope")
+    assert dialog.dev_name.text() == "scope"                                   # a new device1 is named after it
+    _type(dialog.dev_description, "the one on the optics table")
+    dialog.create.click()
+    doc = tomllib.loads(path.read_text())
+    assert path.read_text().startswith("# the rig\n") and doc["devices"]["echo"] == {"driver": "insthub.sim:Loopback"}
+    assert doc["devices"]["scope"] == {"driver": "insthub.sim:SimScope", "description": "the one on the optics table"}
+    assert spin(3, lambda: started == ["rig"])                                 # ... then it starts
+    window.add_device_dialog()                                                 # ... and the Add menu's item
+    assert len(opened) == 2 and opened[1].current().was is None
+    reopened = forms.ServerDialog(window, path)
+    assert reopened.dev_description.text() == "" and reopened.devices[1].description == "the one on the optics table"
+
+
+class Scpi:
+    """SCPI class used to access an instrument over the network."""
+
+    def __init__(self, host, port=5000):
+        pass
+
+
+def test_tiles_say_where_each_device_is_and_what_it_is(window):
+    rp = insthub.wrap(Scpi, "rp", kwargs={"host": "10.0.0.5"})
+    rp.description = "the one on the optics table"
+    with insthub.Server("t", [rp, insthub.wrap(Scpi, "rp2", kwargs={"host": "10.0.0.6"})]):
+        assert spin(5, lambda: "local:t" in window.servers and window.servers["local:t"].device("rp2"))
+        s = window.servers["local:t"]
+        view = pages.device_view(s, "rp")
+        assert view.subtitle == "Scpi · 10.0.0.5 · t" and view.message == "the one on the optics table"
+        assert pages.device_view(s, "rp", server_shown=False).subtitle == "Scpi · 10.0.0.5"   # on its server's page
+        assert pages.device_view(s, "rp2").message == Scpi.__doc__                # no description: its docstring
+        window.open_device("local:t", "rp")
+        assert "10.0.0.5" in window.device_page.header.subtitle.text()
+        window.show_page("devices")
+        window.devices_page.search.setText("10.0.0.6")                           # found by its address
+        tiles = window.devices_page.tiles
+        assert spin(3, lambda: not tiles["local:t", "rp2"].isHidden() and tiles["local:t", "rp"].isHidden())
+
+
+def test_the_dialog_warns_when_a_driver_has_a_python_of_its_own(window, monkeypatch, tmp_path):
+    drv = tmp_path / "drv"
+    (drv / ".venv" / "bin").mkdir(parents=True)
+    (drv / ".venv" / "bin" / "python").write_text("")
+    (drv / "box.py").write_text("class Box:\n    def __init__(self, port):\n        pass\n")
+    path = tmp_path / "rig.toml"
+    path.write_text('[devices.echo]\ndriver = "insthub.sim:Loopback"\n')
+    monkeypatch.setattr(service, "units", lambda: [{"name": "rig", "state": "inactive", "sub": "dead", "pid": None,
+                                                    "enabled": False, "unit": "u",
+                                                    "command": f'"/srv/py/bin/python" "-m" "insthub" "serve" "{path}"'}])
+    assert spin(5, lambda: "service:rig" in window.servers)
+    dialog = forms.ServerDialog(window, path, server=window.servers["service:rig"], add=True)
+    assert dialog.driver_note.isHidden()
+    dialog.dev_folder.setText(str(drv))
+    dialog.driver.setCurrentText("box:Box")
+    assert not dialog.driver_note.isHidden() and str(drv / ".venv" / "bin" / "python") in dialog.driver_note.text()
+    assert "/srv/py/bin/python" in dialog.driver_note.text() and "New server" in dialog.driver_note.text()
+
+
+def test_a_driver_without_arguments_does_not_get_the_last_ones(window):
+    dialog = forms.ServerDialog(window)                                       # New server: SimScope
+    _type(dialog._arg_edits["points"], "2")
+    dialog.driver.setCurrentText("insthub.sim:Loopback")                      # takes none: nothing of SimScope's
+    assert dialog._arg_edits == {} and "takes no arguments" in dialog.args_note.text()
+    assert "points" not in dialog.preview.toPlainText()
+
+
+def test_the_preview_marks_the_right_line_with_unusual_characters(window, tmp_path):
+    path = tmp_path / "odd.toml"
+    path.write_text('# a no-break space and a line separator\n[devices.box]\ndriver = "insthub.sim:SimScope"\n'
+                    'points = 100\n')
+    dialog = forms.ServerDialog(window, path)
+    _type(dialog._arg_edits["points"], "64")
+    marks = dialog.preview.extraSelections()
+    assert [m.cursor.block().text() for m in marks] == ["points = 64"]
+
+
+def test_a_restarted_server_is_followed_under_a_new_key(window, monkeypatch):
+    class S:
+        def __init__(self, key, pid, unit=None, devices=("echo",)):
+            self.key, self.name, self.pid, self.origin = key, key.split(":")[1], pid, key.split(":")[0]
+            self.service, self.devices = ({"name": unit} if unit else None), list(devices)
+            self.probe = self.error = None
+
+        def device_names(self):
+            return self.devices
+
+    for page in (window.sidebar, window.devices_page, window.servers_page):
+        monkeypatch.setattr(page, "sync", lambda *a, **kw: None)
+    shown = []
+    monkeypatch.setattr(window.server_page, "show_server", lambda s: shown.append(s.key))
+    window.restarting["service:rig"] = {"key": "service:rig", "old": None, "proc": None, "unit": "rig"}
+    window._detail = ("server", "service:rig")                               # Save and start of a stopped service
+    window.pages.setCurrentWidget(window.server_page)
+    monkeypatch.setattr(window, "servers", {"local:rig": S("local:rig", 99, unit="rig")})
+    window.render()
+    assert window._detail == ("server", "local:rig") and shown == ["local:rig"] and not window.restarting
+
+    opened = []                                                               # from a device's page: back to it
+    monkeypatch.setattr(window, "open_device", lambda key, name: opened.append((key, name)))
+    window.restarting["local:rig"] = {"key": "local:rig", "old": 99, "proc": None, "unit": "rig"}
+    window._detail = ("device", "local:rig", "echo")
+    window.pages.setCurrentWidget(window.device_page)
+    monkeypatch.setattr(window, "servers", {})
+    window.render()
+    assert window.pages.currentWidget() is window.devices_page and window._follow == ("local:rig", "echo")
+    monkeypatch.setattr(window, "servers", {"local:rig": S("local:rig", 100, unit="rig")})
+    window.render()
+    assert opened == [("local:rig", "echo")] and window._follow is None

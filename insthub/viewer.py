@@ -17,7 +17,7 @@ import time
 
 import numpy as np
 
-from .device import summarize
+from .device import busy_with, summarize
 from .qt import QtCore, QtGui, QtWidgets, application, deliver, run, watch  # isort: skip (binding before pyqtgraph)
 
 import pyqtgraph as pg  # isort: skip
@@ -270,7 +270,7 @@ class DevicePanel(QtWidgets.QWidget):
         else:
             text = f"<span style='color:{_CRITICAL}'>&#10005;</span> not connected: {st['error'] or 'not opened yet'}"
         if st["busy"]:
-            text += f"<br>running: {st['busy']}" + (f" (+{st['queued']} queued)" if st["queued"] else "")
+            text += f"<br>running: {busy_with(st)}" + (f" (+{st['queued']} queued)" if st["queued"] else "")
         self.title.setText(f"<b>{info['name']}</b> &nbsp; {info['type']}")
         self.status.setText(text)
         for name in sorted(info["streams"]):

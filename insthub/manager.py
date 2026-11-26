@@ -7,15 +7,18 @@ how each one is reached, and the controls to look after them and set them up.
     a device     is the instrument connected (and if not, why), what it is doing, which
                  programs watch it; its properties to read and change, its streams, its
                  periodic tasks (a switch each), its state, and its commands to run.
-                 Connect now / Release / Pause and Resume / Live view / Edit in its config.
+                 Connect now / Release / Pause and Resume / Live view / Open <a UI of its
+                 extension> / Edit in its config.
     Servers      a card per server: running here, installed as a service, or on another
                  computer (devices.toml)
     a server     its process, addresses, service, devices and the programs connected to it.
                  Start / Stop / Restart / Logs / Remove; Starts at login; Edit its config
                  (forms.ServerDialog, which changes the file in place, comments kept).
     AI agents    giving Claude Code or another agent the instruments; which are connected
-    Settings     appearance, previews, notifications, start at login, the files insthub uses
-    Add          a new server (its config file is written for you), a server file to keep
+    Settings     appearance, previews, notifications, start at login, the files insthub uses,
+                 your extensions (folders added and removed; what is wrong with each)
+    Add          a new server (its config file is written for you; the driver list offers
+                 the devices of your extensions), a server file to keep
                  running as a service (at login or not), devices on another computer
 
 It is made of four layers, each knowing only the ones below it:
@@ -29,15 +32,18 @@ The GUI thread never waits for a server: discovery, probes and actions run on
 worker threads and come back through `qt.deliver`.  The window is an ordinary
 client and needs only Qt.  It never subscribes to a stream: a tile's preview is
 the stream's last frame (`$latest`), so watching does not make an instrument
-acquire.  Live plots open as a separate `insthub view` process.  `insthub gui
---install` adds the window to the applications menu (see launcher.py).
+acquire.  Live plots open as a separate `insthub view` process, and a device's
+UIs (from its extension's manifest) as programs run with the extension's Python:
+the window never imports an extension's code.  Their output goes to log files,
+shown when one fails.  `insthub gui --install` adds the window to the
+applications menu (see launcher.py).
 """
 from __future__ import annotations
 
 import collections
 import importlib.util
+import math
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -46,9 +52,10 @@ from pathlib import Path
 
 import numpy as np
 
-from . import forms, launcher, pages, registry, service
+from . import extensions, forms, launcher, pages, registry, service
 from . import widgets as ui
 from .client import PROCESS_TOKEN
+from .device import busy_with
 from .inventory import (
     BAD,
     BUSY,
@@ -69,12 +76,14 @@ from .inventory import (
     spawn,
     tail,
     terminate,
+    ui_log,
 )
 from .qt import BINDING, QtCore, QtGui, QtWidgets, application, deliver, run
 
 REFRESH_MS = 1000
 HIDDEN_REFRESH_MS = 3000  #: while only the tray icon is watching
 HISTORY = 90  #: the values the preview of a number remembers
+UIS_FRESH = 30.0  #: seconds what a device's extension offers is believed before it is looked up again
 
 _ORIGIN_ORDER = {"local": 0, "service": 1, "remote": 2}
 QAction = getattr(QtGui, "QAction", None) or QtWidgets.QAction  # QtWidgets in Qt 5
@@ -140,13 +149,13 @@ class Manager(QtWidgets.QMainWindow):
         self._closed = False
         self._systemd = False
         self._remote_error: str | None = None  # devices.toml cannot be read
-        self._viewers: list = []
-        self._spawned: list = []  # servers this window started: Popen objects (cwd in .insthub_cwd)
+        self._spawned: list = []  # programs this window started: servers, windows for devices (inventory.Launched)
+        self._uis: dict[tuple, tuple] = {}  # (address, device, extension) -> (device_uis(), when it was asked)
         self._logs: dict[str, pages.LogDialog] = {}
         self._detail: tuple | None = None  # ("device", key, name) or ("server", key) while one is shown
         self.login_pending: dict[str, bool] = {}  # service -> the Starts at login asked, until it is done
         self.restarting: dict[str, dict] = {}  # server key -> a restart under way (see restart_server)
-        self._follow: str | None = None  # the key whose page to show again once its restart is over
+        self._follow: tuple | None = None  # (server key, device or None): the page to show again once its restart is over
         self._back: tuple | str = "devices"  # where the device page goes back to
 
         self.setWindowTitle("insthub")
@@ -206,6 +215,9 @@ class Manager(QtWidgets.QMainWindow):
 
         self.new_server = item("plus", "New server...", "Choose drivers for your instruments; insthub writes the "
                                "config file and starts the server", self.new_server_dialog)
+        self.add_to_server = item("chip", "Add a device to a server...", "Another instrument in a server that runs "
+                                  "from a .toml config: written into it, then the server restarts",
+                                  self.add_device_dialog)
         self.add_service = item("servers", "Keep a server running...", "Run an existing .toml config or .py "
                                 "server in the background, at login or only when you start it (systemd user "
                                 "service)", self.add_service_dialog)
@@ -299,14 +311,17 @@ class Manager(QtWidgets.QMainWindow):
 
     # -- looking -------------------------------------------------------------
     def refresh(self) -> None:
-        self._viewers = [p for p in self._viewers if p.poll() is None]  # reap closed viewers
-        for p in self._spawned:  # a server this window started that failed (at start, often) says why
-            if (p.poll() or 0) > 0 and not getattr(p, "insthub_stopping", False):
-                name = getattr(p, "insthub_name", "a server")
-                lines = [line for line in tail(server_log(name), 40).splitlines() if line.strip()]
-                self.say(f"{name} ended with an error: {lines[-1] if lines else f'exit code {p.returncode}'}"
-                         + (f" (its log: {server_log(name)})" if lines else ""), 15000)
-        self._spawned = [p for p in self._spawned if p.poll() is None]  # and servers that ended
+        for p in self._spawned:  # a server or a window this window started that failed (at start, often) says why
+            failure = p.failure()
+            if failure:
+                self.say(f"{p.title} ended with an error: {failure.splitlines()[-1]} (its log: {p.log})", 15000)
+                box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Icon.Warning, "insthub",
+                                            f"{p.title} ended with an error.", QtWidgets.QMessageBox.StandardButton.Ok,
+                                            self)  # all of what it said at the end (a config's every problem)
+                box.setInformativeText(f"{failure}\n\nIts log: {p.log}")
+                box.setModal(False)
+                box.show()
+        self._spawned = [p for p in self._spawned if p.running]  # and those that ended
         if not self._scanning:
             self._scanning = True
             self.submit(self.probes, self.backend.scan, self._on_scan, self._on_scan_failed)
@@ -389,6 +404,8 @@ class Manager(QtWidgets.QMainWindow):
             s.probe, s.probed_at, s.error = result, now, None
             if s.origin == "remote":
                 s.name = result["info"].get("server") or s.name
+            for dev in result["devices"]:  # its UIs found out before a right-click on its tile asks for them
+                self.device_uis(s, dev)
             self._fetch_previews(s)
             self._changed(s)
 
@@ -449,17 +466,24 @@ class Manager(QtWidgets.QMainWindow):
     def render(self) -> None:
         """Bring the sidebar and the page on show up to date (the others catch up when shown)."""
         servers = self._ordered()
+        page = self.pages.currentWidget()
         for key, mark in list(self.restarting.items()):  # a restart is over once its new process is seen
             proc, back = mark["proc"], self._restarted(mark)
-            if back is None and not (proc is not None and proc.poll() is not None):
+            if back is None and not (proc is not None and not proc.running):
                 continue
             del self.restarting[key]  # (a new process that ended at once: refresh() says why)
-            if back is not None and self._follow == key and self.pages.currentWidget() is self.servers_page:
-                self._follow = None
-                self.open_server(back)  # its page again, where the restart left it (renders)
+            if back is None:
+                continue
+            follow, self._follow = (self._follow, None) if self._follow and self._follow[0] == key else (None, self._follow)
+            if follow is not None and page is (self.servers_page if follow[1] is None else self.devices_page):
+                if follow[1] is not None and follow[1] in self.servers[back].device_names():
+                    self.open_device(back, follow[1])  # its page again, where the restart left it (renders)
+                else:
+                    self.open_server(back)
                 return
+            if self._detail and self._detail[1] == key and back != key:  # on show, under a new key (a service
+                self._detail = (self._detail[0], back, *self._detail[2:])  # started, a rename): it follows
         self.sidebar.sync(servers, len(self.agents()), self._scanned)
-        page = self.pages.currentWidget()
         if page is self.devices_page:
             self.devices_page.sync(servers, self._scanned, self.previews_on)
         elif page is self.servers_page:
@@ -467,7 +491,10 @@ class Manager(QtWidgets.QMainWindow):
         elif page is self.device_page:
             s = self.servers.get(self._detail[1])
             if s is None or self._detail[2] not in s.device_names():
+                key, name = self._detail[1], self._detail[2]
                 self.show_page("devices")
+                if key in self.restarting:  # it comes back on its own once the server is up again
+                    self._follow = (key, name)
             else:
                 self.device_page.show_device(s, self._detail[2])
         elif page is self.server_page:
@@ -476,7 +503,7 @@ class Manager(QtWidgets.QMainWindow):
                 key = self._detail[1]
                 self.show_page("servers")
                 if key in self.restarting:  # it comes back on its own once the server is up again
-                    self._follow = key
+                    self._follow = (key, None)
             else:
                 self.server_page.show_server(s)
         elif page is self.agents_page:
@@ -484,7 +511,7 @@ class Manager(QtWidgets.QMainWindow):
 
     def show_page(self, name: str) -> None:
         """One of the pages of the sidebar: "devices", "servers", "agents" or "settings"."""
-        self._detail = None
+        self._detail, self._follow = None, None  # (another page chosen: no restart takes it back)
         self.pages.setCurrentWidget({"devices": self.devices_page, "servers": self.servers_page,
                                      "agents": self.agents_page, "settings": self.settings_page}[name])
         self.sidebar.select(name)
@@ -498,6 +525,8 @@ class Manager(QtWidgets.QMainWindow):
         s = self.servers.get(key)
         if s is None:
             return
+        self._follow = None
+        self._uis = {k: (v[0], -math.inf) if k[1] == name else v for k, v in self._uis.items()}  # ask again
         from_server = self.pages.currentWidget() is self.server_page
         self._back = ("server", key) if from_server else "devices"
         self._detail = ("device", key, name)
@@ -520,6 +549,7 @@ class Manager(QtWidgets.QMainWindow):
     def open_server(self, key: str) -> None:
         if key not in self.servers:
             return
+        self._follow = None
         self._detail = ("server", key)
         self.pages.setCurrentWidget(self.server_page)
         self.sidebar.select("servers")
@@ -570,6 +600,11 @@ class Manager(QtWidgets.QMainWindow):
         item("forward", "Open", lambda: self.open_device(key, name))
         live_ok, why = self.can_view(s, d)
         item("live", "Live view", lambda: self.live_view(s, name), live_ok, why)
+        ext, uis, _ = self.device_uis(s, name) or (None, [], None)
+        open_ok, why = self.can_open(s)
+        for ui_ in uis:
+            item("window", f"Open {ui_.title}", lambda ui_=ui_: self.open_ui(s, name, ext, ui_), open_ok,
+                 why or f"Its extension's {'panel' if ui_.panel else 'app'}, in a window of its own")
         menu.addSeparator()
         can_pause, why = self.can_pause(d)
         if paused:
@@ -630,10 +665,10 @@ class Manager(QtWidgets.QMainWindow):
         if method == "$pause":
             users = sorted({c["program"] for c in (s.probe or {}).get("clients") or ()
                             if any(sub.startswith(device + "/") for sub in c.get("subscriptions", ()))})
-            busy = st.get("busy")
+            busy = busy_with(st) if st.get("busy") != "$pause" else None
             if (users or busy) and not self.confirm(
                     f"Pause {device}?", (f"{', '.join(users)} {'is' if len(users) == 1 else 'are'} watching it. "
-                                         if users else "") + (f"It is running {busy}; the pause waits for it. "
+                                         if users else "") + (f"It is busy with {busy}; the pause waits for it. "
                                                               if busy else "") +
                     "While it is paused, every program's calls to it fail. Pause it?", "Pause"):
                 return
@@ -648,9 +683,9 @@ class Manager(QtWidgets.QMainWindow):
 
         def result(status):
             if status is None:
-                running = st.get("busy") or "what it is doing (a periodic task, say)"
+                running = busy_with(st) or "what it is doing (a periodic task, say)"
                 return f"{device}: pausing; it is closed once {running} finishes" if method == "$pause" else \
-                    f"{device}: resuming once {running} finishes" if st.get("busy") else \
+                    f"{device}: resuming once {running} finishes" if busy_with(st) else \
                     f"{device}: resuming; opening the instrument takes a while"
             if status.get("paused"):
                 return f"{device}: paused; its commands fail until you resume it"
@@ -669,10 +704,18 @@ class Manager(QtWidgets.QMainWindow):
                  lambda: self.backend.call(address, device, "$task", task, on, None, timeout=10.0),
                  f"{device}.{task}: {'running' if on else 'stopped'}")
 
-    def can_view(self, s: Server, d: dict | None = None) -> tuple[bool, str]:
-        """Whether Live view makes sense, and if not, why (with `d`: for this device)."""
+    @staticmethod
+    def can_open(s: Server) -> tuple[bool, str]:
+        """Whether a program of its own (a live view, a UI) can reach the server, and if not, why."""
         if not s.address or s.address.startswith("inproc://"):
             return False, "Only for servers in other programs"
+        return True, ""
+
+    def can_view(self, s: Server, d: dict | None = None) -> tuple[bool, str]:
+        """Whether Live view makes sense, and if not, why (with `d`: for this device)."""
+        reachable, why = self.can_open(s)
+        if not reachable:
+            return False, why
         if importlib.util.find_spec("pyqtgraph") is None:
             return False, "Live plots need pyqtgraph: pip install 'insthub[gui]'"
         if d is not None and not any(n != "state" for n in d["streams"]):
@@ -691,13 +734,43 @@ class Manager(QtWidgets.QMainWindow):
 
     def live_view(self, s: Server, device: str) -> None:
         command = [sys.executable, "-m", "insthub", "-a", s.address, "view", device]
+        self._start(f"the live view of {device}",
+                    lambda: spawn(command, ui_log(device, "view"), f"The live view of {device}"))
+
+    def device_uis(self, s: Server, device: str) -> tuple | None:
+        """What a device can open here, as extensions.device_uis() says: (its extension, its UIs, why
+        it has none); None until a worker has found out (it reads manifests, and may ask systemd),
+        after which the window renders again.  Asked again after UIS_FRESH seconds, and when the
+        device's page opens, since manifests and your list of extensions change."""
+        d = s.device(device)
+        if d is None or not d.get("extension") or not s.address:
+            return None, [], None
+        key, address = (s.address, device, d["extension"]), s.address
+        known, asked = self._uis.get(key, (None, -math.inf))
+        if time.monotonic() - asked > UIS_FRESH:
+            self._uis[key] = known, time.monotonic()  # (what was known stays on show meanwhile)
+
+            def found(result):
+                self._uis[key] = result, self._uis.get(key, (None, 0.0))[1]
+                self.render()
+
+            self.submit(self.actions, lambda: extensions.device_uis(d, address), found,
+                        lambda exc: found((None, [], pages.error_text(exc))))
+        return known
+
+    def open_ui(self, s: Server, device: str, ext, ui_) -> None:
+        """Start a UI of a device's extension (extensions.launch), with the extension's Python."""
+        self._start(f"{ui_.title} for {device}", lambda: extensions.launch(ext, ui_.name, device, s.address))
+
+    def _start(self, what: str, start) -> None:
+        """Start a window for a device in a program of its own (`start()` -> inventory.Launched); if
+        it fails, refresh() shows what it said."""
         try:
-            self._viewers.append(subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                                  stderr=subprocess.DEVNULL, start_new_session=True))
-        except OSError as e:
-            QtWidgets.QMessageBox.warning(self, "insthub", f"Cannot open the live view.\n\n{e}")
+            self._spawned.append(start())
+        except (OSError, ValueError) as e:
+            QtWidgets.QMessageBox.warning(self, "insthub", f"Cannot open {what}.\n\n{e}")
             return
-        self.say(f"Opening the live view of {device}...", 4000)
+        self.say(f"Opening {what}...", 4000)
 
     def stop_server(self, s: Server) -> None:
         if not self.confirm(f"Stop {s.name}?",
@@ -755,23 +828,22 @@ class Manager(QtWidgets.QMainWindow):
     def start_server(self, command: list[str], name: str, cwd: str | Path | None = None) -> None:
         """Start a server in the background (it outlives the window; Stop on its page ends it)."""
         try:
-            proc = spawn(command, name, cwd)
+            proc = spawn(command, server_log(name), name, cwd)
         except OSError as e:
             QtWidgets.QMessageBox.warning(self, "insthub", f"Cannot start {name}.\n\n{e}")
             return
-        proc.insthub_cwd, proc.insthub_name = cwd, name
         self._spawned.append(proc)
         self.say(f"Starting {name}...", 4000)
         QtCore.QTimer.singleShot(800, self.refresh)
 
-    def restart_server(self, s: Server, after: str = "", ask: bool = False) -> None:
+    def restart_server(self, s: Server, after: str = "", ask: bool = False, name: str | None = None) -> None:
         """Start a server again, to use a changed config: its service, or one this window started.
         `ask`: confirm first (a click on Restart; not after Save, which asked already)."""
         done = f"{after}; " if after else ""
         if s.key in self.restarting:
             self.say(f"{s.name} is restarting", 4000)
             return
-        proc = next((p for p in self._spawned if p.pid == s.pid and p.poll() is None), None)
+        proc = next((p for p in self._spawned if p.pid == s.pid and p.running), None)
         if not s.service and proc is None:
             self.say(f"{done}restart {s.name} where you started it, to use the changes", 8000)
             return
@@ -803,15 +875,13 @@ class Manager(QtWidgets.QMainWindow):
             self.act(f"{'Restarting' if what == 'restart' else 'Starting'} {service.PREFIX}{name}", run,
                      f"{done}{service.PREFIX}{name} {what}ed", after=lambda: over() if failed else None)
             return
-        command, name, cwd = list(proc.args), s.name, getattr(proc, "insthub_cwd", None)
-        proc.insthub_stopping = True  # (its end is not news)
+        command, name, cwd = list(proc.process.args), name or s.name, proc.cwd
+        proc.quiet = True  # (its end is not news)
 
         def stop_and_start():  # all on the worker: if the window is quit meanwhile, the server still starts
-            proc.terminate()  # SIGTERM: the server closes its instruments, then ends
-            proc.wait(30)
-            new = spawn(command, name, cwd)
-            new.insthub_cwd, new.insthub_name = cwd, name
-            return new
+            proc.process.terminate()  # SIGTERM: the server closes its instruments, then ends
+            proc.process.wait(30)
+            return spawn(command, server_log(name), name, cwd)
 
         def started(new):
             self._spawned.append(new)
@@ -860,15 +930,33 @@ class Manager(QtWidgets.QMainWindow):
                  f"{service.PREFIX}{name} " + ("starts at every login" if on else "no longer starts at login"),
                  after=after)
 
-    def edit_config(self, key: str, select: str | None = None) -> None:
-        """Change a server's config file in the window (its comments are kept)."""
+    def add_device_dialog(self) -> None:
+        """Add a device to a server that runs from a .toml config (which one, if there are several)."""
+        editable = [(s, f) for s in self._ordered() if (f := server_file(s)) is not None and f.suffix == ".toml"]
+        if not editable:
+            QtWidgets.QMessageBox.information(
+                self, "Add a device", "No server here runs from a .toml config file that this window can change "
+                "(a .py server is changed in its code). New server... makes one.")
+            return
+        key = editable[0][0].key
+        if len(editable) > 1:
+            labels = [f"{s.name}   ({f})" for s, f in editable]
+            choice, ok = QtWidgets.QInputDialog.getItem(self, "Add a device", "To which server?", labels, 0, False)
+            if not ok:
+                return
+            key = editable[labels.index(choice)][0].key
+        self.edit_config(key, add=True)
+
+    def edit_config(self, key: str, select: str | None = None, add: bool = False) -> None:
+        """Change a server's config file in the window (its comments are kept); `add`: with a new
+        device in it already, to fill in."""
         s = self.servers.get(key)
         path = server_file(s) if s is not None else None
         if path is None or path.suffix != ".toml":
             self.say("Its server does not run from a .toml config file that this computer can open", 6000)
             return
         try:
-            dialog = forms.ServerDialog(self, path, server=s, select=select)
+            dialog = forms.ServerDialog(self, path, server=s, select=select, add=add)
         except (OSError, ValueError, TypeError, UnicodeDecodeError) as e:
             QtWidgets.QMessageBox.warning(self, "insthub", f"Cannot read {path}.\n\n{e}")
             return
@@ -876,7 +964,7 @@ class Manager(QtWidgets.QMainWindow):
 
     def started_here(self, pid: int | None) -> bool:
         """Whether this window started that process (and it still runs)."""
-        return pid is not None and any(p.pid == pid and p.poll() is None for p in self._spawned)
+        return pid is not None and any(p.pid == pid and p.running for p in self._spawned)
 
     def start_simulator(self) -> None:
         self.start_server([sys.executable, "-m", "insthub", "sim"], "sim")

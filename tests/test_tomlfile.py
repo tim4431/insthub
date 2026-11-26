@@ -279,10 +279,22 @@ def test_links_of_other_users_are_not_followed_and_a_read_only_file_system_says_
     link.symlink_to(real)
     tomlfile.update(link, {(): {"x": 2}})                                    # this user's link: followed
     assert link.is_symlink() and real.read_text() == "x = 2\n"
-    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)             # as if another user had made it
+    lstat = os.lstat
+
+    def made_by_another(path, *a, **kw):                                    # as if another user had made it
+        st = lstat(path, *a, **kw)
+        if os.path.abspath(path) != str(link):
+            return st
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 4242, st.st_gid,
+                               st.st_size, int(st.st_atime), int(st.st_mtime), int(st.st_ctime)))
+    monkeypatch.setattr(os, "lstat", made_by_another)
     with pytest.raises(PermissionError, match="made by another user"):
         tomlfile.update(link, {(): {"x": 3}})
     assert real.read_text() == "x = 2\n"
+    monkeypatch.undo()
+    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)             # made by the folder's owner: followed
+    tomlfile.update(link, {(): {"x": 3}})
+    assert real.read_text() == "x = 3\n"
     monkeypatch.undo()
 
     def read_only(*a, **kw):
@@ -290,3 +302,22 @@ def test_links_of_other_users_are_not_followed_and_a_read_only_file_system_says_
     monkeypatch.setattr(tomlfile.tempfile, "mkstemp", read_only)
     with pytest.raises(PermissionError, match="read-only file system"):
         tomlfile.write(tmp_path / "new.toml", "x = 1\n")
+
+
+def test_a_relative_link_through_a_folder_link_is_read_as_the_kernel_reads_it(tmp_path):
+    (tmp_path / "data" / "lab").mkdir(parents=True)
+    (tmp_path / "data" / "configs").mkdir()
+    real = tmp_path / "data" / "configs" / "lab.toml"
+    real.write_text("x = 1\n")
+    (tmp_path / "home").mkdir()
+    (tmp_path / "home" / "lab").symlink_to("../data/lab")                    # a folder link
+    (tmp_path / "data" / "lab" / "lab.toml").symlink_to("../configs/lab.toml")
+    tomlfile.update(tmp_path / "home" / "lab" / "lab.toml", {(): {"x": 2}})
+    assert real.read_text() == "x = 2\n" and not (tmp_path / "home" / "configs").exists()
+    assert sorted(p.name for p in real.parent.iterdir()) == ["lab.toml"]
+
+
+def test_removing_a_table_this_call_emptied_already():
+    assert tomlfile.edit("[a.b]\nk = 1\n", {("a", "b"): None, ("a",): None}) == ""
+    assert tomlfile.edit("[a.b]\nk = 1\n[c]\nz = 1\n", {("a",): None}, {("a", "b"): ("c", "d")}) == \
+        "[c.d]\nk = 1\n[c]\nz = 1\n"

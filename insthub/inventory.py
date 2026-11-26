@@ -11,7 +11,9 @@ that may block) or with what they returned (everything else), and shows it.
     shrink()         the last frame of a stream, made small enough for a tile
     program_name()   what to call a program connected to a server ('experiment.py',
                      'AI agent (Claude Code)')
-    spawn(), server_file(), find_python()    starting servers, and finding their files
+    spawn(), Launched    starting a server or a window for a device in the background, its output
+                         in a log file (server_log, ui_log); what it said if it failed
+    server_file(), find_python()    finding a server's files
 """
 from __future__ import annotations
 
@@ -32,8 +34,9 @@ import numpy as np
 
 from . import registry, service
 from .client import PROCESS_TOKEN, Client, _SocketTransport, connect, discover
-from .device import summarize
+from .device import busy_with, summarize
 from .errors import BusError
+from .extensions import venv_python
 
 PROBE_TIMEOUT = 3.0  #: seconds a server may take to answer before it is shown as unreachable
 ACTION_TIMEOUT = 120.0
@@ -210,15 +213,9 @@ def terminate(pid: int) -> None:
 
 
 def find_python(target: str | Path) -> str:
-    """The interpreter a server file most likely needs: a virtualenv in its folder or the one above, else ours."""
-    folder = Path(target).expanduser().resolve().parent
-    inside = ("Scripts", "python.exe") if os.name == "nt" else ("bin", "python")
-    for base in (folder, folder.parent):
-        for venv in (".venv", "venv", "env"):
-            python = base.joinpath(venv, *inside)
-            if python.is_file():
-                return str(python)
-    return sys.executable
+    """The interpreter a server file most likely needs: a virtualenv in its folder or the one above
+    (as for an extension: extensions.venv_python), else ours."""
+    return venv_python(Path(target).expanduser().resolve().parent) or sys.executable
 
 
 def server_log(name: str) -> Path:
@@ -226,12 +223,61 @@ def server_log(name: str) -> Path:
     return registry.runtime_dir() / f"{name}.log"
 
 
-def spawn(command: list[str], name: str, cwd: str | Path | None = None) -> subprocess.Popen:
-    """Start a server in the background, in a session of its own so that it outlives this
-    window; its output goes to server_log(name), which its Logs button shows."""
-    with open(server_log(name), "ab") as out:
-        return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                                cwd=cwd, start_new_session=True, env={**os.environ, "PYTHONUNBUFFERED": "1"})
+def ui_log(device: str, name: str) -> Path:
+    """Where the output of a window opened for a device goes: its live view ("view"), or a UI of its
+    extension (by its name).  In a folder of their own, beside the servers' logs."""
+    folder = registry.runtime_dir() / "ui"
+    folder.mkdir(exist_ok=True)
+    return folder / f"{device}-{name}.log"
+
+
+@dataclasses.dataclass(eq=False)
+class Launched:
+    """A program started in the background by spawn(): a server, or a window for a device.  Its
+    output goes to `log`; `title` names it in messages ("lab", "Scope panel for scope")."""
+
+    process: subprocess.Popen
+    log: Path
+    title: str
+    cwd: str | Path | None = None  #: the folder it runs in (a restart starts it there again)
+    quiet: bool = False  #: its end is not news: it is being stopped on purpose
+
+    @property
+    def pid(self) -> int:
+        return self.process.pid
+
+    @property
+    def running(self) -> bool:
+        return self.process.poll() is None
+
+    def failure(self, wait: float = 0.0) -> str | None:
+        """What it said last, if it ended with an error (an exit code above 0: an exception, or
+        `error: ...` from the insthub command), waiting up to `wait` seconds for it to end: the last
+        lines of its log, else its exit code.  None while it runs, once it ended well, or when quiet."""
+        try:
+            code = self.process.wait(wait) if wait else self.process.poll()
+        except subprocess.TimeoutExpired:
+            return None
+        if not code or code < 0 or self.quiet:  # (below 0: ended by a signal, as Stop and closing it do)
+            return None
+        try:
+            lines = [line for line in tail(self.log, 40).splitlines() if line.strip()]
+        except BusError:  # the log is gone (the runtime folder was cleaned up)
+            lines = []
+        return "\n".join(lines[-12:]) or f"exit code {code}"
+
+
+def spawn(command: list[str], log: Path, title: str, cwd: str | Path | None = None,
+          env: dict | None = None) -> Launched:
+    """Start a program in the background, in a session of its own so that it outlives the program
+    that starts it (the window, `insthub open`).  Its output goes to the file `log` (server_log,
+    ui_log), which a server's Logs button shows, and Launched.failure() reads when it fails.
+    `env`: its environment (default: this program's)."""
+    with open(log, "ab") as out:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, cwd=cwd,
+                                   start_new_session=True, env={**(os.environ if env is None else env),
+                                                                "PYTHONUNBUFFERED": "1"})
+    return Launched(process, Path(log), title, cwd)
 
 
 def tail(path: Path, lines: int = 500) -> str:
@@ -260,6 +306,25 @@ def served(argv: list[str]) -> str | None:
         if args and args[0].endswith(".py"):
             return args[0]
     return None
+
+
+def server_python(s: Server) -> Path | None:
+    """The Python a server runs in (from its service, else its command line), or None if unknown."""
+    argv: list[str] = []
+    if s.service:
+        try:
+            argv = shlex.split(s.service["command"])
+        except ValueError:
+            argv = []
+    elif s.origin == "local" and s.pid and s.pid != os.getpid():
+        argv = _cmdline(s.pid)
+    if not argv:
+        return None
+    first = Path(argv[0])
+    if first.name.startswith("python"):
+        return first
+    sibling = first.with_name("python")  # a script of a virtualenv (.venv/bin/insthub): its python
+    return sibling if sibling.is_file() else None
 
 
 def server_file(s: Server) -> Path | None:
@@ -489,18 +554,20 @@ def device_state(d: dict | None, local: bool = True) -> tuple[str, str, str]:
     paused = st.get("paused")  # None from a server older than this window
     if paused:
         who = paused_by(paused, local)
-        busy = st["busy"] if st["busy"] not in (None, "$pause") else None
-        if busy or st["connected"]:  # only the pause itself closes the session: until then, it is pausing
+        if st["busy"] == "$pause":  # the pause itself, closing the session (a slow close() shows here)
+            return BUSY, "pausing", f"Pausing (asked by {who}): closing the instrument session."
+        what = busy_with(st)
+        if what or st["connected"]:  # only the pause itself closes the session: until then, it is pausing
             return BUSY, "pausing", f"Pausing (asked by {who}): " + (
-                "the instrument is being opened; it is closed again once that is done." if busy == "$open" else
-                f"waiting for {busy} to finish." if busy else
+                f"waiting for {what} to finish." if what else
                 "the session is closed once what it is doing (a periodic task, say) has finished.")
         return PAUSED, "paused", (f"Paused since {clock(paused['since'])} by {who}: none of its commands, "
                                   "properties or periodic tasks run, and the instrument is left alone, until it "
                                   "is resumed.")
     if st["busy"]:
         queued = f" (+{st['queued']} waiting)" if st["queued"] else ""
-        word = "connecting" if st["busy"] in ("$open", "$resume") else f"busy: {st['busy']}"
+        word = "connecting" if st["busy"] in ("$open", "$resume") else \
+            "releasing" if st["busy"] == "$release" else f"busy: {st['busy']}"
         sentence = (f"Connected since {clock(st['since'])} ({ago(time.time() - st['since'])})."
                     if st["connected"] and st.get("since") else "Opening the instrument session...")
         return BUSY, word + queued, sentence
