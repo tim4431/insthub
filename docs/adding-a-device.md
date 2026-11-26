@@ -358,6 +358,9 @@ The server reads its config file only when it starts. To change a setting:
 
 - **Edit the file**, in any editor, then restart the server:
   `insthub service restart lab`, or Ctrl-C and `insthub serve lab.toml` again.
+  The same goes for the driver's code: the server loads it when it starts.
+  Until it restarts, `insthub list` and the window mark it out of date (see
+  [after changing code](running-servers.md#after-changing-code)).
 - **Or in the window:** on the server's page, **⋯ → Edit lab.toml...**, or
   on a device's page, **⋯ → Edit in lab.toml...** (each named after the
   server's config file; the same items are in the menu of its card and of

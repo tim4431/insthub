@@ -489,6 +489,10 @@ def _tables(devices: dict, advise: bool = False, problems: list[str] | None = No
     the rest of the file."""
     problems, unloadable, tables = list(problems or ()), [], []
     for name, spec in devices.items():
+        if not isinstance(spec, dict):  # (`a = 3` under [devices]): nothing in it to check
+            problems.append(f"[devices] {name}: should be a table, as [devices.{name}] with its driver = "
+                            f'"module:Class", not {_shown(spec)}')
+            continue
         try:
             cls, found = validate(name, spec, advise)
         except ImportError as e:  # said with what else is wrong with this table and the next ones
@@ -547,10 +551,14 @@ def _checked(path: str | Path, advise: bool = False) -> tuple[dict, list[tuple[s
     file."""
     path = Path(path).expanduser()
     config = _read(path)
-    server = {"name": path.stem, **config.get("server", {})}
-    problems = [f"[server] {key}: not one of {', '.join(_SERVER_KEYS)}" + did_you_mean(key, _SERVER_KEYS)
-                for key in server if key not in _SERVER_KEYS]
-    return server, _tables(_counted_from(config.get("devices", {}), path.resolve().parent), advise, problems)
+    tables = {key: config.get(key, {}) for key in ("server", "devices")}
+    problems = [f"{key}: should be a table, as [{key}{'.NAME' if key == 'devices' else ''}], not {_shown(table)}"
+                for key, table in tables.items() if not isinstance(table, dict)]  # (`devices = 3`)
+    tables = {key: table if isinstance(table, dict) else {} for key, table in tables.items()}
+    server = {"name": path.stem, **tables["server"]}
+    problems += [f"[server] {key}: not one of {', '.join(_SERVER_KEYS)}" + did_you_mean(key, _SERVER_KEYS)
+                 for key in server if key not in _SERVER_KEYS]
+    return server, _tables(_counted_from(tables["devices"], path.resolve().parent), advise, problems)
 
 
 def device_folder(spec, base: str | Path | None) -> Path | None:

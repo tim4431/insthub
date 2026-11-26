@@ -436,6 +436,7 @@ class Server:
         self._done = threading.Event()
         self.addresses: list[str] = []
         self.started_at: float | None = None
+        self._modules = 0  #: how many modules this process had when its registry entry was last written
         for dev in devices:
             self.add(dev)
 
@@ -610,6 +611,7 @@ class Server:
             try:
                 sock, peer = lsock.accept()
             except TimeoutError:
+                self._loaded_more()  # (each second no one connects)
                 continue
             except OSError:
                 break
@@ -618,6 +620,22 @@ class Server:
             conn = _Conn(self, sock, peer)
             self._conns.add(conn)
             threading.Thread(target=conn.run, name="insthub:conn", daemon=True).start()
+            self._loaded_more()
+
+    def _loaded_more(self) -> None:
+        """Write its registry entry again if this process has loaded modules since it was last
+        written (a helper that a driver imports inside a command, or when it connects), so that
+        its "code" lists them too, timed within about a second of their loading.  The threads
+        that accept connections call it, about every second."""
+        if len(sys.modules) == self._modules:
+            return
+        with self._lock:
+            if not self._running or len(sys.modules) == self._modules:  # (stopped, or written meanwhile)
+                return
+            try:
+                self._register()
+            except Exception:  # noqa: BLE001  (never the end of accepting connections)
+                _log.warning("could not write the registry entry of server %r", self.name, exc_info=True)
 
     def _close_listeners(self) -> None:
         listeners, self._listeners = self._listeners, []
@@ -635,13 +653,21 @@ class Server:
 
     def _entry(self) -> dict:
         """What its registry file says: its hello, and what only this user's programs on this
-        computer need, so what the hello never carries: the Python it runs in, and for each
-        device the folders of its code, from which its extension is found (see
-        docs/design.md#how-a-device-finds-its-extension)."""
-        return {**self._hello(), "python": sys.executable,
-                "folders": {name: dev._insthub_folders() for name, dev in list(self._devices.items())}}
+        computer need, so what the hello never carries: the Python it runs in, for each device
+        the folders of its code, from which its extension is found (see
+        docs/design.md#how-a-device-finds-its-extension), and the files of the code it runs,
+        from which they tell that it runs older code than the disk holds (_code; left out if
+        they cannot be listed: a notice is never a reason not to start or not to be found)."""
+        folders = {name: dev._insthub_folders() for name, dev in list(self._devices.items())}
+        entry = {**self._hello(), "python": sys.executable, "folders": folders}
+        try:
+            entry["code"] = _code(folder for listed in folders.values() for folder in listed)
+        except Exception:  # noqa: BLE001
+            _log.warning("could not list the files of the code server %r runs", self.name, exc_info=True)
+        return entry
 
     def _register(self) -> None:
+        self._modules = len(sys.modules)  # what its entry's "code" was listed from (see _loaded_more)
         if not self.addresses:  # in-process only: nothing for another process to find
             return
         try:
@@ -698,6 +724,69 @@ class Server:
     def __repr__(self) -> str:
         state = ", ".join(self.addresses) if self._running else "stopped"
         return f"<insthub.Server {self.name!r} [{state}] devices={list(self._devices)}>"
+
+
+#: Folders that hold a Python environment's libraries, not the code of a project: a project's
+#: folder usually holds its virtualenv, whose numpy is no part of what its server is (see _code).
+_ENVIRONMENTS = frozenset({"site-packages", "dist-packages", ".venv", "venv"})
+_PACKAGE = os.path.dirname(os.path.abspath(__file__))  #: insthub's own folder
+#: module -> (its __spec__, the st_mtime_ns of its file) when _code first listed it (None: no file
+#: on disk).  By module, not by file: a script run as __main__ that is also imported by name is
+#: loaded twice.  With its spec: importlib.reload (IPython's %autoreload) runs a module's code
+#: anew in the same module object, and gives it a new spec, so it is timed again then.
+_first_listed: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _code(folders) -> dict[str, int]:
+    """The source files of the modules this process has loaded that make up what its servers run,
+    as {absolute path: st_mtime_ns}: each module of insthub's own package, and each module whose
+    file lies in one of `folders` (its devices'), but not in a Python environment below that
+    folder (_ENVIRONMENTS, or this Python's own installation, as in a home folder).  Each file's
+    time is the one it had when this process first listed its module (the module loaded first,
+    for a file loaded twice; again after the module is reloaded), so a file changed since stays
+    changed in every later entry, also after a device is added.  A program on this computer
+    compares them with the files on disk (extensions.outdated)."""
+    roots = {os.path.join(os.path.normcase(folder), "") for folder in (_PACKAGE, *folders)}
+    pythons = {os.path.join(os.path.normcase(prefix), "") for prefix in (sys.prefix, sys.base_prefix)}
+    found = {}
+    for module in list(sys.modules.values()):  # (in the order they were loaded)
+        listed = _listed(module, roots, pythons)
+        if listed is not None:
+            found.setdefault(*listed)
+    return found
+
+
+def _listed(module, roots: set[str], pythons: set[str]) -> tuple[str, int] | None:
+    """(its file, the time _code lists for it) for a module of what the servers run (in one of
+    `roots`, see _inside), else None, also for what cannot be told.  It runs none of the module's
+    code: a module that importlib.util.LazyLoader put in sys.modules loads, and may fail to (an
+    optional dependency missing), when one of its attributes is read, so its own are read from
+    its __dict__."""
+    try:
+        attrs = object.__getattribute__(module, "__dict__")
+        file, spec = attrs.get("__file__"), attrs.get("__spec__")
+        if not isinstance(file, str) or not os.path.isabs(file) or \
+                not any(_inside(os.path.normcase(file), root, pythons) for root in roots):
+            return None
+        first = _first_listed.get(module)
+        if first is None or first[0] is not spec:  # not listed yet, or loaded anew since
+            try:
+                mtime = os.stat(file).st_mtime_ns
+            except OSError:  # no file on disk (one inside a zip archive)
+                mtime = None
+            first = _first_listed[module] = (spec, mtime)
+    except Exception:  # noqa: BLE001  an object in place of a module (one that cannot be referred to weakly)
+        return None
+    return None if first[1] is None else (file, first[1])
+
+
+def _inside(file: str, root: str, pythons: set[str]) -> bool:
+    """Whether a file lies in the folder `root` but not in a Python environment below it (both
+    normcased, `root` and each of `pythons` ending in a separator)."""
+    if not file.startswith(root):
+        return False
+    return not _ENVIRONMENTS.intersection(file[len(root):].split(os.sep)[:-1]) and \
+        not any(python != root and python.startswith(root) and file.startswith(python) for python in pythons)
 
 
 # -- bus-level commands every device answers ("$name"; cannot clash with Python names)

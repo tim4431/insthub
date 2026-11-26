@@ -1,7 +1,8 @@
 """Command line.
 
     insthub list                                   servers and devices on this machine, and on the other
-                                                  computers devices.toml names
+                                                  computers devices.toml names; a server here that runs
+                                                  older code than its folders hold says why
     insthub states [DEVICE ...] [--json]           what every device is like now: its state, whether it is
                                                   connected (to save next to a data file); with -a, the
                                                   devices of that server; exit code 1 if a device named,
@@ -160,6 +161,7 @@ def _device(args):
 def _cmd_list(args) -> int:
     import insthub
     from insthub.device import busy_with
+    from insthub.extensions import outdated
 
     servers = [insthub.connect(args.address).info()] if args.address else insthub.discover(remote=True)
     unread = [s for s in servers if s.get("error") and not s.get("address")]  # devices.toml cannot be read
@@ -181,6 +183,9 @@ def _cmd_list(args) -> int:
         except insthub.BusError as e:
             print(f"    unreachable: {e}")
             continue
+        reasons = outdated(None if info.get("remote") else info, described)  # (with -a: info(), no entry)
+        if reasons:
+            print(f"    out of date: {'; '.join(reasons)}; a restart loads the new code")
         for name, d in sorted(described.items()):
             st = d["status"]
             state = _status_text(st)

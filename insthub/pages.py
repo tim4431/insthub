@@ -37,6 +37,7 @@ from .errors import BusError
 from .inventory import (
     ACTION_TIMEOUT,
     BAD,
+    BUSY,
     GOOD,
     PAUSED,
     Server,
@@ -63,6 +64,7 @@ RESUME_TIP = "End the pause: its commands run again, and it reconnects if it was
 RELEASE_TIP = ("Close the instrument session for other software for a moment; the next command, or the next run "
                "of a periodic task, opens it again (Pause keeps it closed)")
 SIM_TIP = "Simulated: it talks to a simulator, not to an instrument, so its data is not a measurement."
+OUTDATED = "OUT OF DATE"  #: the mark of a server that runs older code than its folders hold
 
 
 def open_path(path: str | Path) -> bool:
@@ -73,6 +75,12 @@ def open_path(path: str | Path) -> bool:
 def _badge(status: str, text: str) -> str:
     """Rich text: a dot in the colour of a status, then the text."""
     return f"<span style='color:{ui.STATUS[status]}'>&#9679;</span>&nbsp;{ui.esc(text)}"
+
+
+def outdated_text(s: Server, restart: str = "A restart loads the new code.") -> str:
+    """Why a server runs older code than its folders hold, in a sentence, then `restart`: what
+    loads the new code ("" when it runs what they hold)."""
+    return f"Out of date: {'; '.join(s.outdated)}. {restart}".rstrip() if s.outdated else ""
 
 
 # ---------------------------------------------------------------- what tiles show
@@ -175,6 +183,8 @@ def server_view(s: Server) -> ui.TileView:
     via = routes(s) if s.origin == "local" else ""
     view = ui.TileView(title=s.name, subtitle=f"{where} · {via}" if via else where,
                        icon="globe" if s.origin == "remote" else "servers", status=status, word=word, tip=sentence)
+    if s.outdated:
+        view.badge, view.tip = OUTDATED, f"{sentence}\n{outdated_text(s)}"
     if s.probe:
         devices = list(s.probe["devices"].values())
         connected = sum(1 for d in devices if d["status"]["connected"])
@@ -362,6 +372,8 @@ class _Section(QtWidgets.QWidget):
         self.window, self.key = window, key
         self.name = ui.button("", kind="section", tip="Show this server", slot=lambda: window.open_server(key))
         self.pill = ui.Pill()
+        self.outdated = ui.Tag(OUTDATED)  #: shown while the server runs older code than its folders hold
+        self.outdated.hide()
         self.detail = ui.label("", "muted")
         self.start = ui.button("Start", "start", tip="Start the service",
                                slot=lambda: window.service_action(window.servers[key], "start"))
@@ -369,6 +381,7 @@ class _Section(QtWidgets.QWidget):
         head.setSpacing(10)
         head.addWidget(self.name)
         head.addWidget(self.pill)
+        head.addWidget(self.outdated)
         head.addWidget(self.detail, 1)
         head.addWidget(self.start)
         self.grid_host = QtWidgets.QWidget()
@@ -387,6 +400,8 @@ class _Section(QtWidgets.QWidget):
         status, word, sentence = server_state(s)
         self.name.setText(s.name)
         self.pill.set(status, word)
+        self.outdated.setVisible(bool(s.outdated))
+        self.outdated.setToolTip(outdated_text(s))
         self.detail.setText(_where(s))
         names = s.device_names()
         _sync_tiles(self.window, self.grid, self.tiles, s, names)
@@ -583,6 +598,10 @@ class ServerPage(_Page):
 
         self.facts = _Facts()
         self.state = self.facts.row("State")
+        self.code = self.facts.row("Code")  #: shown while it runs older code than its folders hold
+        self.code.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
+                                          | Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.code.linkActivated.connect(lambda *_: self._restart())
         self.process = self.facts.row("Process")
         self.reach = self.facts.row("Reached at")
         self.latency = self.facts.row("Answers in")
@@ -684,20 +703,28 @@ class ServerPage(_Page):
         elif s.declared:
             f.show_row(self.devices, ", ".join(ui.esc(n) for n in s.declared))
         else:  # a service that does not run: what its config holds
-            names = []
+            devices = {}
             if editable:
                 try:
-                    names = list(tomllib.loads(tomlfile.read(config)).get("devices", {}))
+                    devices = tomllib.loads(tomlfile.read(config)).get("devices", {})
                 except (OSError, ValueError, UnicodeDecodeError):
-                    names = []
+                    pass
+            names = list(devices) if isinstance(devices, dict) else []  # (`devices = 3`: the service says why)
             f.show_row(self.devices, (", ".join(ui.esc(n) for n in names) + " " + ui.muted("(from its config)"))
                        if names else None)
 
         running = s.origin == "local"
         mine = s.pid == os.getpid()
+        restartable = running and self._restartable(s)
         self.start.setVisible(bool(u) and not running)
         self.stop.setVisible((bool(u) and running) or (running and not u and bool(s.pid) and not mine))
-        self.restart.setVisible((bool(u) and running) or (running and self.window.started_here(s.pid)))
+        self.restart.setVisible(restartable)
+        if not s.outdated:
+            f.show_row(self.code, None)
+        elif restartable:  # (the link restarts it, as Restart above does)
+            f.show_row(self.code, _badge(BUSY, outdated_text(s, "")) + " <a href='restart'>Restart</a> loads the new code.")
+        else:
+            f.show_row(self.code, _badge(BUSY, outdated_text(s, "Restart it where you started it to load the new code.")))
         self.logs.setVisible(self.window.log_source(s) is not None)
         self.open_file.setVisible(config is not None)
         self.edit_file.setVisible(editable)
@@ -914,7 +941,9 @@ class DevicePage(_Page):
             f.show_row(self.requests, None)
         how = route(s.address, s.origin) if s.address else ""
         pid = f" (pid {s.pid})" if s.origin == "local" and s.pid else ""
-        f.show_row(self.via, f"{ui.esc(s.name)}{pid} · {ui.muted(how)}")
+        f.show_row(self.via, f"{ui.esc(s.name)}{pid} · {ui.muted(how)}" + (
+            f"<br>{_badge(BUSY, outdated_text(s, f'A restart of {s.name} loads the new code.'))}"
+            if s.outdated else ""))
         why = self._show_uis(s, name)
         f.show_row(self.extension, ui.esc(f"{d['extension']} {d.get('extension_version') or ''}".rstrip())
                    + (f"<br>{ui.muted(ui.esc(why))}" if why else "") if d and d.get("extension") else None)

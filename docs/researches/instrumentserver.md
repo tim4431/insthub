@@ -228,8 +228,8 @@ The check found every claim of the first reading about both codebases
 accurate. It corrected these conclusions:
 
 - **A read-back option after a set** is not needed: insthub's device page
-  already reads a property again after setting it (`_Properties` in
-  `pages.py`).
+  already reads a property again after setting it (`Settings.write` in
+  `controls.py`, which the device page and panels share).
 - **A hook on `prop.__set__`** cannot work for wrapped drivers, whose
   properties are plain `property` objects, and it would publish twice.
 - **Better MCP argument schemas** do not follow from richer metadata:

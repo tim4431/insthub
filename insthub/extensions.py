@@ -31,6 +31,7 @@ module; the command line and the window do.
     for_device(described, folders)  the extension of a device, from its describe()
     device_uis(described, address)  the UIs a device can open here, or why it has none
     server_uis(devices, address)    the same for each device of a server, all at once
+    outdated(entry, devices)        why a server here runs older code than its folders hold, if it does
     launch(ext, ui, device, address)  start one, in a program of its own, with the extension's Python
     add_folder(), remove_folder()   your list of extension folders (extensions.toml)
     check(path, import_=False)      what is wrong with an extension, or with a server file's
@@ -665,6 +666,76 @@ def server_uis(devices: dict[str, dict], address: str) -> dict[str, tuple[Extens
         else:
             found[name] = ext, [ui for ui in ext.ui.values() if ui.fits(described)], None
     return found
+
+
+NAMED = 3  #: how many files outdated() names before "and N more"
+
+
+def outdated(entry: dict | None, devices: dict[str, dict] | None = None) -> list[str]:
+    """Why a server on this computer runs older code than its folders hold, one reason each, for
+    people ("demolaser_insthub/device.py changed since it started", "the folder has demo-laser
+    0.2, it runs 0.1"); none when it runs what they hold, or when that cannot be told.  The one
+    rule for this, which the window and `insthub list` show.  `entry`: the server's registry entry
+    (as discover() gives it; None for a server on another computer, which is never judged);
+    `devices`: name -> describe() of its devices, if known.  Two signals:
+
+    - a file of its code ("code" in its entry: see server._code) whose modification time is not
+      the one it had when the server loaded it, or that is gone.  An entry without "code" (from an
+      older insthub) gives none of these;
+    - a device that states its extension_version, whose extension (found from the device's own
+      folders, as for_device finds it, but nowhere else: another copy says nothing of what this
+      server runs) has another version in its manifest, a manifest changed since the server
+      started ("started" in its entry).  Versions that disagreed already then (a class and its
+      manifest that disagree on disk, which `insthub check` warns about, or an
+      extension_version in a server file) would disagree again after a restart, so they are no
+      sign of older code.
+
+    It reads files (their times, manifests), so the window calls it on a worker thread."""
+    if not isinstance(entry, dict):
+        return []
+    reasons, changed, gone = [], [], []
+    code = entry.get("code")
+    for path, mtime in (code.items() if isinstance(code, dict) else ()):
+        if not isinstance(path, str) or not os.path.isabs(path) or not isinstance(mtime, int):
+            continue  # (a damaged entry: no reason to believe anything changed)
+        try:
+            if os.stat(path).st_mtime_ns != mtime:
+                changed.append(path)
+        except FileNotFoundError:
+            gone.append(path)
+        except OSError:  # it cannot be looked at now: nothing is known
+            continue
+    if changed:
+        reasons.append(f"{_files(changed)} changed since it started")
+    if gone:
+        reasons.append(f"{_files(gone)} {'was' if len(gone) == 1 else 'were'} deleted since it started")
+    folders, started = _entry_folders(entry), entry.get("started")
+    for name, described in sorted((devices or {}).items() if isinstance(started, (int, float)) else ()):
+        runs = described.get("extension_version") if isinstance(described, dict) else None
+        if not isinstance(runs, str) or not runs:
+            continue
+        ext = _for_device(described, folders.get(name, []), list)[0]  # (list: no other copy is looked for)
+        if ext is not None and ext.version and ext.version != runs and _changed_since(ext.manifest, started):
+            reasons.append(f"the folder has {ext.id} {ext.version}, it runs {runs}")
+    return list(dict.fromkeys(reasons))
+
+
+def _changed_since(path: Path, when: float) -> bool:
+    """Whether a file was modified after the time `when` (seconds, as time.time() gives them)."""
+    try:
+        return os.stat(path).st_mtime > when
+    except OSError:
+        return False
+
+
+def _files(paths: list[str]) -> str:
+    """Files as a person reads them: each as its folder's name and its own ("insthub/server.py"),
+    the first few (NAMED) in order, then how many more."""
+    names = sorted(f"{os.path.basename(os.path.dirname(path))}/{os.path.basename(path)}" for path in paths)
+    shown, more = (names, 0) if len(names) <= NAMED else (names[:NAMED], len(names) - NAMED)
+    if more:
+        return f"{', '.join(shown)} and {more} more"
+    return shown[0] if len(shown) == 1 else f"{', '.join(shown[:-1])} and {shown[-1]}"
 
 
 def add_folder(path: str | Path) -> Extension:

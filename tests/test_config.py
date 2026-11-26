@@ -297,6 +297,32 @@ def test_a_file_that_is_no_toml_is_named(tmp_path):
         config.check(tmp_path / "missing.toml")
 
 
+def test_a_table_that_is_not_one_is_a_problem_of_the_file(tmp_path, capsys):
+    """`devices = 3`, `a = 3` under [devices] or `server = "lab"`: said with the file's other problems, by
+    each command that reads the file, not an AttributeError."""
+    from insthub import cli, service
+
+    cfg = tmp_path / "lab.toml"
+    for text, said in (
+            ("devices = 3\n", ["devices: should be a table, as [devices.NAME], not 3"]),
+            ('server = "lab"\n\n[devices.echo]\ndriver = "insthub.sim:Loopback"\n',
+             ['server: should be a table, as [server], not "lab"']),
+            ('[devices]\na = 3\n\n[devices.b]\ndriver = "insthub.sim:Loopback"\nlazy = "yes"\n',
+             ['[devices] a: should be a table, as [devices.a] with its driver = "module:Class", not 3',
+              '[devices.b] lazy: should be true or false, not "yes"'])):
+        cfg.write_text(text)
+        for do in (config.check, config.load):
+            with pytest.raises(config.ConfigError) as e:
+                do(cfg)
+            assert str(e.value).splitlines() == said
+    assert cli.main(["serve", str(cfg)]) == 1                                   # insthub serve
+    assert capsys.readouterr().err.splitlines() == [f"error: {said[0]}", said[1]]
+    assert cli.main(["check", str(cfg), "--import"]) == 1                     # insthub check
+    assert capsys.readouterr().out.splitlines() == [f"{cfg}: {line}" for line in said]
+    report = service.check_report(cfg, sys.executable)                        # what insthub service install asks
+    assert report["problem"].splitlines() == said and report["fixes"] == ["file"]
+
+
 def test_two_folders_with_a_module_of_one_name(tmp_path, imports):
     one, two = module(tmp_path / "one", "clashdrv"), module(tmp_path / "two", "clashdrv")
     config.build_device("a", table(one, "clashdrv", port=1))

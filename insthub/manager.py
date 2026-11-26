@@ -345,6 +345,7 @@ class Manager(QtWidgets.QMainWindow):
             s.pid, s.started = info.get("pid"), info.get("started")
             s.addresses, s.declared = list(info.get("addresses", ())), list(info.get("devices", ()))
             s.python = info["python"] if isinstance(info.get("python"), str) else None  # (another insthub's: none)
+            s.entry = info
             s.service = by_pid.get(s.pid)
             if s.service:
                 taken.add(s.service["name"])
@@ -383,7 +384,11 @@ class Manager(QtWidgets.QMainWindow):
 
     def _probe(self, s: Server) -> None:
         s.probing = True
-        address = s.address
+        address, entry = s.address, s.entry
+
+        def ask():  # (on a worker) what it says, and why it runs older code than its folders hold, if it does
+            result = self.backend.probe(address)
+            return {**result, "outdated": extensions.outdated(entry, result["devices"])}
 
         def done(result):
             s.probing = False
@@ -424,7 +429,7 @@ class Manager(QtWidgets.QMainWindow):
             s.probe, s.error, s.rates = None, str(exc) or type(exc).__name__, {}
             self._changed(s)
 
-        self.submit(self.probes, lambda: self.backend.probe(address), done, failed)
+        self.submit(self.probes, ask, done, failed)
 
     def _fetch_previews(self, s: Server) -> None:
         """Fetch the last frame of each device's first stream, where a new one was published."""
