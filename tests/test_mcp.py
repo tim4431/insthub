@@ -424,3 +424,13 @@ def test_a_device_is_listed_where_the_other_tools_find_it(tmp_path):
         for proc, _ in started:
             proc.terminate()
             proc.wait(10)
+
+
+def test_list_devices_says_when_this_program_runs_older_code(tools, monkeypatch):
+    """So that the agent can ask its user to reconnect it; there is no tool that restarts anything."""
+    assert "notes" not in ok(tools.list_devices())
+    monkeypatch.setattr(mcp.extensions, "outdated_here", lambda: ["insthub/mcp.py changed since it started"])
+    [note] = ok(tools.list_devices())["notes"]
+    assert note == ("this insthub mcp runs older insthub code than the disk holds (insthub/mcp.py changed since it "
+                    "started): ask the user to reconnect it, which starts it anew (in Claude Code: /mcp)")
+    assert not any("restart" in t["name"] or "update" in t["name"] for t in mcp.TOOLS)

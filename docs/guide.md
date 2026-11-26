@@ -632,10 +632,15 @@ edited a driver or updated insthub after it started) is marked **OUT OF
 DATE** on its card and above its devices. Its page says what changed, with a
 **Restart** link when the window can restart it (a service, or a server the
 window started), and its devices' pages say it too (see [after changing
-code](running-servers.md#after-changing-code)). A service can be started,
-stopped, restarted and removed there, and **Starts at login** switched on or
-off; its page says how often
-systemd restarted it after a crash. A server started by hand can be
+code](running-servers.md#after-changing-code)). Such a server, where the
+window can restart it, and a service whose unit an older insthub wrote (its
+page says what is old about it) get **Update**, beside **Restart** and in
+their card's menu, and the Servers page then has **Update all**, which asks
+once and says what restarts (see [updating](running-servers.md#updating)).
+The window also says when it runs older insthub code itself, in its sidebar
+and on its Settings page. A service can be started, stopped, restarted and
+removed there, and **Starts at login** switched on or off; its page says how
+often systemd restarted it after a crash. A server started by hand can be
 stopped. **Logs** shows what a server logged: a service's journal, the
 output of a server the window started, or, for any other server (one
 started in a terminal, one on another computer), the last lines it keeps
@@ -779,7 +784,7 @@ seconds and, if it ended with an error by then, prints the log's last lines.
 ## Command line
 
 ```
-insthub list                                   servers and devices on this computer, and on the computers
+insthub list [--json]                          servers and devices on this computer, and on the computers
                                                devices.toml names; which servers here run older code
 insthub states [DEVICE ...] [--json]           what every device is like now (to save next to a data file);
                                                with -a, one server's; exit code 1 if what you asked for is missing
@@ -805,6 +810,9 @@ insthub check PATH [--import]                  what is wrong with an extension, 
                                                --import also imports the drivers and the UIs, in its Python
 insthub service install | list | start | stop | restart | enable | disable | remove | logs
                                                keep servers running in the background
+insthub service update [NAME ...] [--check]    after a git pull or an edited driver: write old units anew,
+                                               restart the services that run older code; --check only says
+                                               what it would do (exit code 1 if anything would change)
 insthub sim [--gui]                            simulated instruments to try things on
 insthub bench                                  speed on this computer
 insthub mcp                                    the bus for AI agents, see agents.md

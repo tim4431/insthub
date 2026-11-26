@@ -1,4 +1,5 @@
 """The manager window (`insthub gui`) and its launcher, run without a display."""
+import dataclasses
 import json
 import logging
 import math
@@ -6,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -1920,3 +1922,153 @@ def test_a_restarted_server_is_followed_under_a_new_key(window, monkeypatch):
     monkeypatch.setattr(window, "servers", {"local:rig": S("local:rig", 100, unit="rig")})
     window.render()
     assert opened == [("local:rig", "echo")] and window._follow is None
+
+
+STALE = "RestartSec=2, now 5; without StartLimitIntervalSec=300, StartLimitBurst=5"  #: what an old unit says
+
+
+def _units(*extra, stale=STALE):
+    """service.units() for a running service "t" (this process: the server of the test), and `extra`."""
+    unit = {"enabled": True, "command": '"python" "-m" "insthub" "serve" "t.toml"', "unit": "u", "restarts": 0,
+            "unchecked": None}
+    return lambda: [{**unit, "name": "t", "state": "active", "sub": "running", "pid": os.getpid(), "stale": stale},
+                    *({**unit, "pid": None, "stale": stale, **u} for u in extra)]
+
+
+def test_update_on_a_service_s_page_and_card_runs_service_update(monkeypatch):
+    """Its page says what is old about its unit, even while its code is current; Update (beside Restart,
+    and in its card's menu) asks, then runs service.update on a worker, and says what came of it."""
+    monkeypatch.setattr(service, "units", _units())
+    updated = []
+
+    def update(names, **kwargs):
+        updated.append((names, threading.current_thread() is threading.main_thread()))  # (never the GUI thread)
+        return [service.Update("t", "active", STALE, plan=["rewrite", "restart"], done=["rewrite", "restart"],
+                               pid=4242)]
+
+    monkeypatch.setattr(service, "update", update)
+    qt.application()
+    with insthub.Server("t", [sim.Loopback()]):
+        window = manager.Manager(refresh_ms=150)
+        asked, said = [], []
+        monkeypatch.setattr(window, "confirm", lambda *a: asked.append(a) or True)
+        monkeypatch.setattr(window, "say", lambda text, ms=5000: said.append(text))
+        try:
+            assert spin(5, lambda: "local:t" in window.servers and window.servers["local:t"].probe)
+            window.open_server("local:t")
+            page = window.server_page
+            assert spin(3, lambda: not page.update_button.isHidden()) and not page.restart.isHidden()
+            assert page.update_button.toolTip() == "Write its unit anew and restart it (it asks first)"
+            assert f"Its unit is out of date: {STALE}." in page.unit.text() and "and restarts it." in page.unit.text()
+            assert page.code.isHidden()                                       # (its code is current)
+            assert pages.server_view(window.servers["local:t"]).badge == pages.OUTDATED
+            shown = []
+            monkeypatch.setattr(qt.QtWidgets.QMenu, "exec", lambda self, *a: shown.extend(a.text() for a in self.actions()))
+            window.server_menu("local:t", None)
+            assert "Update" in shown
+            s = window.servers["local:t"]                                     # its code older too: one Update does
+            page.show_server(dataclasses.replace(s, probe={**s.probe, "outdated": ["t.py changed since it started"]}))
+            assert "<a href='update'>Update</a> loads the new code and writes its unit anew." in page.code.text()
+            with pytest.MonkeyPatch.context() as mp:                          # both, with one restart
+                mp.setattr(window, "update_servers", lambda servers: asked.append([x.name for x in servers]))
+                page.code.linkActivated.emit("update")
+            assert asked == [["t"]]
+            asked.clear()
+            page.show_server(s)
+            page.update_button.click()
+            question = (f"t: write its unit anew and restart it (its unit: {STALE})\n\nPrograms using a server that "
+                        "restarts get an error for calls under way, then reconnect by themselves.")
+            assert asked == [("Update t?", question, "Update")]
+            assert spin(3, lambda: updated == [(["t"], False)] and any("insthub-t: wrote" in t for t in said))
+            assert "insthub-t: wrote its unit anew and restarted it (pid 4242)" in said
+            assert "local:t" in window.restarting                             # its page comes back after the restart
+            page.update_button.click()                                        # meanwhile: not again
+            assert len(asked) == 1
+            del window.restarting["local:t"]
+            warned = []
+            monkeypatch.setattr(manager.QtWidgets.QMessageBox, "warning", lambda *a: warned.append(a[2]))
+            monkeypatch.setattr(service, "update", lambda names, **kw: [service.Update(
+                "t", "active", STALE, plan=["rewrite", "restart"], error="its Python, /old/python, is gone")])
+            page.unit.linkActivated.emit("update")                            # the Unit row's link does the same
+            assert spin(3, lambda: warned) and "t: its unit is out of date" in warned[0]
+            assert "error: its Python, /old/python, is gone" in warned[0] and "local:t" not in window.restarting
+        finally:
+            window.close()
+            spin(0.1)
+
+
+def test_update_all_asks_once_and_says_what_restarts(monkeypatch):
+    monkeypatch.setattr(service, "units", _units({"name": "lab", "state": "failed", "sub": "failed"},
+                                                 {"name": "hand", "state": "inactive", "sub": "dead", "stale": None,
+                                                  "unchecked": "insthub did not write it"}))
+    updated = []
+    monkeypatch.setattr(service, "update", lambda names, **kw: updated.append(names) or
+                        [service.Update(n, plan=["rewrite"], done=["rewrite"]) for n in names])
+    qt.application()
+    with insthub.Server("t", [sim.Loopback()]):
+        window = manager.Manager(refresh_ms=150)
+        asked = []
+        monkeypatch.setattr(window, "confirm", lambda *a: asked.append(a) or True)
+        try:
+            window.show_page("servers")
+            update_all = window.servers_page.update_all
+            assert spin(5, lambda: "service:lab" in window.servers and not update_all.isHidden())
+            window.open_server("service:lab")                                 # stopped: written anew, not started
+            assert "it does not run, so it is not started." in window.server_page.unit.text()
+            window.open_server("service:hand")                                # not judged: it says so, no Update
+            assert "Not checked: insthub did not write it, so Update leaves it as it is." in \
+                window.server_page.unit.text() and window.server_page.update_button.isHidden()
+            window.show_page("servers")
+            update_all.click()
+            question = (f"t: write its unit anew and restart it (its unit: {STALE})\nlab: write its unit anew (its "
+                        f"unit: {STALE})\n\nPrograms using a server that restarts get an error for calls under way, "
+                        "then reconnect by themselves.")
+            assert asked == [("Update 2 servers?", question, "Update")]
+            assert spin(3, lambda: updated == [["t", "lab"]])                 # one service.update for both
+            monkeypatch.setattr(service, "units", _units(stale=None))         # all up to date
+            assert spin(3, lambda: update_all.isHidden())
+        finally:
+            window.close()
+            spin(0.1)
+
+
+def test_update_restarts_a_server_the_window_started(window, monkeypatch, tmp_path):
+    """A server started in a terminal keeps its sentence, and gets no Update."""
+    (tmp_path / "upddev.py").write_text("import insthub\n\nclass Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("upddev:Dev", str(tmp_path))
+    with insthub.Server("u", [dev("box")]):
+        assert spin(5, lambda: "local:u" in window.servers and window.servers["local:u"].probe)
+        s = window.servers["local:u"]
+        window.open_server("local:u")
+        page = window.server_page
+        st = (tmp_path / "upddev.py").stat()
+        os.utime(tmp_path / "upddev.py", ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        assert spin(5, lambda: "Restart it where you started it to load the new code." in page.code.text())
+        assert page.update_button.isHidden() and window.update_plan(s) == []
+        monkeypatch.setattr(window, "started_here", lambda pid: True)
+        assert spin(3, lambda: not page.update_button.isHidden()) and window.update_plan(s) == ["restart"]
+        restarted, asked = [], []
+        monkeypatch.setattr(window, "restart_server", lambda s, ask=False, **_: restarted.append((s.name, ask)))
+        monkeypatch.setattr(window, "confirm", lambda *a: asked.append(a[1]) or True)
+        page.update_button.click()
+        question = ("u: restart it\n\nPrograms using a server that restarts get an error for calls under way, then "
+                    "reconnect by themselves.")
+        assert asked == [question] and restarted == [("u", False)]          # (asked once, above)
+
+
+def test_the_window_says_when_it_runs_older_code_itself(window, monkeypatch):
+    """Found out on a worker with each look, in the sidebar (a link to Settings) and on the Settings page."""
+    assert spin(3, lambda: window._scanned) and window.outdated_here == []
+    assert window.settings_page.outdated.isHidden()
+    monkeypatch.setattr(extensions, "outdated_here", lambda: ["insthub/pages.py changed since it started"])
+    assert spin(3, lambda: "This window runs older code" in window.sidebar.summary.text())
+    notice = window.settings_page.outdated
+    assert not notice.isHidden() and "This window runs older insthub code: insthub/pages.py changed since it " \
+        "started." in notice.text() and "quit it (close it) and start it again" in notice.text()
+    page = window.settings_page
+    assert page.body.itemAt(0).widget() is page.outdated_card and not page.outdated_card.isHidden()  # first on it
+    window.sidebar.summary.linkActivated.emit("settings")
+    assert window.pages.currentWidget() is page and page.scroll.verticalScrollBar().value() == 0
+    monkeypatch.setattr(extensions, "outdated_here", list)
+    assert spin(3, lambda: notice.isHidden() and "older code" not in window.sidebar.summary.text())
+    assert page.outdated_card.isHidden()

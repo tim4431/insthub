@@ -1,6 +1,6 @@
 """Command line.
 
-    insthub list                                   servers and devices on this machine, and on the other
+    insthub list [--json]                          servers and devices on this machine, and on the other
                                                   computers devices.toml names; a server here that runs
                                                   older code than its folders hold says why
     insthub states [DEVICE ...] [--json]           what every device is like now: its state, whether it is
@@ -46,6 +46,12 @@
                                                   --no-login: started only by `insthub service start NAME`
     insthub service list | start NAME | stop NAME | restart NAME | remove NAME | logs NAME [-f]
     insthub service enable NAME | disable NAME     start it at every login, or no longer
+    insthub service update [NAME ...] [--check] [--json]
+                                                  after a git pull or an edited driver: write units of an
+                                                  older insthub anew (same file, same Python) and restart
+                                                  the services that run older code; never starts one that
+                                                  is stopped.  --check only says what it would do, with exit
+                                                  code 1 if anything would change
 
 Values are parsed as JSON when possible (1e3, true, [1,2], "text"), else taken
 as text.  `-a ADDRESS` talks to a server by address instead of looking the
@@ -161,38 +167,61 @@ def _device(args):
 def _cmd_list(args) -> int:
     import insthub
     from insthub.device import busy_with
-    from insthub.extensions import outdated
 
     servers = [insthub.connect(args.address).info()] if args.address else insthub.discover(remote=True)
     unread = [s for s in servers if s.get("error") and not s.get("address")]  # devices.toml cannot be read
     for info in unread:
         print(f"error: {info['error']}", file=sys.stderr)
-    servers = [s for s in servers if s not in unread]
-    if not servers:
+    listed = [_listing(info, args.address) for info in servers if info not in unread]
+    if args.json:
+        print(json.dumps(_plain(listed), indent=2, default=str))
+        return 0 if listed else 1
+    if not listed:
         print("no insthub server is running on this machine" + ("" if unread else ", and devices.toml names "
                                                                 "none on another"))
         return 1
-    for info in servers:
-        if info.get("error"):  # a server on another computer that does not answer
-            print(f"{info['address']}  (on another computer)\n    unreachable: {info['error']}")
+    for s in listed:
+        if s["server"] is None:  # a server on another computer that does not answer
+            print(f"{s['address']}  (on another computer)\n    unreachable: {s['error']}")
             continue
-        where = " on another computer" if info.get("remote") else ""
-        print(f"{info['server']}  (pid {info['pid']}{where})  {'  '.join(info['addresses'])}")
-        try:  # (with -a, info() has no "address": it is the one given)
-            described = insthub.connect(args.address or info["address"]).describe()
-        except insthub.BusError as e:
-            print(f"    unreachable: {e}")
+        where = " on another computer" if s["remote"] else ""
+        print(f"{s['server']}  (pid {s['pid']}{where})  {'  '.join(s['addresses'])}")
+        if "error" in s:
+            print(f"    unreachable: {s['error']}")
             continue
-        reasons = outdated(None if info.get("remote") else info, described)  # (with -a: info(), no entry)
-        if reasons:
-            print(f"    out of date: {'; '.join(reasons)}; a restart loads the new code")
-        for name, d in sorted(described.items()):
+        if s["outdated"]:
+            print(f"    out of date: {'; '.join(s['outdated'])}; a restart loads the new code")
+        for name, d in s["devices"].items():
             st = d["status"]
             state = _status_text(st)
             busy = f", busy: {busy_with(st)}" if busy_with(st) and not st.get("paused") else ""  # (pausing says it)
             print(f"    {name:16s} {d['type']:16s} {state}{busy}; {len(d['commands'])} commands, "
-                  f"{len(d['properties'])} properties, streams: {', '.join(sorted(d['streams'])) or '-'}")
+                  f"{len(d['properties'])} properties, streams: {', '.join(d['streams']) or '-'}")
     return 0
+
+
+def _listing(info: dict, address: str | None) -> dict:
+    """What `insthub list` says of one server (`info`: its discover() entry; with -a, the info() of
+    the server at `address`): who it is and where; if it answers, why it runs older code
+    (extensions.outdated, judged only for a server of this computer, by its registry entry) and its
+    devices in brief; else "error" (and "server" None for one on another computer)."""
+    import insthub
+    from insthub.extensions import outdated
+
+    s = {"server": info.get("server"), "pid": info.get("pid"), "remote": bool(info.get("remote")),
+         "address": address or info.get("address"), "addresses": list(info.get("addresses") or ()),
+         "version": info.get("version")}
+    if info.get("error"):
+        return {**s, "error": info["error"]}
+    try:
+        described = insthub.connect(s["address"]).describe()
+    except insthub.BusError as e:
+        return {**s, "error": str(e)}
+    s["outdated"] = outdated(None if info.get("remote") or address else info, described)  # (with -a: no entry)
+    s["devices"] = {name: {"type": d["type"], "status": d["status"], "commands": sorted(d["commands"]),
+                           "properties": sorted(d["properties"]), "streams": sorted(d["streams"])}
+                    for name, d in sorted(described.items())}
+    return s
 
 
 def _cmd_states(args) -> int:
@@ -631,15 +660,29 @@ def _cmd_service(args) -> int:
         print(f"{service.PREFIX}{args.name}: " + ("starts at every login" if args.action == "enable" else
                                                   "no longer starts at login (start it by hand)"))
         return 0
+    if args.action == "update":
+        records = service.update(args.names or None, check=args.check)
+        if args.json:
+            print(json.dumps([dataclasses.asdict(r) for r in records], indent=2))
+        else:
+            print("\n".join(r.text() for r in records) or "no insthub services installed")
+        if args.check:  # for scripts: 1 when anything would change (or is wrong)
+            return 1 if any(r.plan or r.error for r in records) else 0
+        return 1 if any(r.error for r in records) else 0
     units = service.units()
     if not units:
         print("no insthub services installed (insthub service install TARGET)")
+    old = False
     for unit in units:
         boot = "at login" if unit["enabled"] else "by hand"
         print(f"{unit['name']:16s} {unit['state']:10s} {boot:9s} {unit['command']}")
         told = service.restarts_text(unit)
-        if told:
-            print(f"{'':16s} {told}")
+        found = service.Update(unit["name"], stale=unit.get("stale"), outdated=service.outdated(unit)).found
+        for line in ([told] if told else []) + found:
+            print(f"{'':16s} {line}")
+        old = old or bool(found)
+    if old:
+        print("insthub service update brings them up to date (--check: what it would do)")
     return 0
 
 
@@ -689,8 +732,9 @@ def main(argv=None) -> int:
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("list", help="servers and devices, here and on the computers devices.toml names"
-                   ).set_defaults(fn=_cmd_list)
+    s = sub.add_parser("list", help="servers and devices, here and on the computers devices.toml names")
+    s.add_argument("--json", action="store_true", help="as JSON, with why each server here is out of date")
+    s.set_defaults(fn=_cmd_list)
     s = sub.add_parser("states", help="what every device is like now (to save next to a data file)")
     s.add_argument("devices", nargs="*", metavar="DEVICE",
                    help="only these (default: every device, or with -a every device of that server)")
@@ -801,7 +845,13 @@ def main(argv=None) -> int:
                    help="the Python the service runs (default: that of the devices' extensions, else a "
                         "virtualenv next to the file or its drivers, else the one running this command); it "
                         "needs insthub and the drivers' packages")
-    actions.add_parser("list", help="installed services and their state")
+    actions.add_parser("list", help="installed services and their state, and what is out of date")
+    a = actions.add_parser("update", help="bring services up to date after a git pull or an edited driver: "
+                                          "write old units anew, restart what runs older code")
+    a.add_argument("names", nargs="*", metavar="NAME", help="only these services (default: every one)")
+    a.add_argument("--check", action="store_true", help="only say what it would do; exit code 1 if anything "
+                                                        "would change")
+    a.add_argument("--json", action="store_true", help="as JSON: a record per service")
     for action, text in (("start", "start a service"),
                          ("stop", ("stop a service (until `start`, or the next start of your services if it "
                                    "starts at login)")),

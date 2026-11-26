@@ -32,6 +32,7 @@ module; the command line and the window do.
     device_uis(described, address)  the UIs a device can open here, or why it has none
     server_uis(devices, address)    the same for each device of a server, all at once
     outdated(entry, devices)        why a server here runs older code than its folders hold, if it does
+    outdated_here()                 the same for this program's own insthub code (the window, `insthub mcp`)
     launch(ext, ui, device, address)  start one, in a program of its own, with the extension's Python
     add_folder(), remove_folder()   your list of extension folders (extensions.toml)
     check(path, import_=False)      what is wrong with an extension, or with a server file's
@@ -718,6 +719,18 @@ def outdated(entry: dict | None, devices: dict[str, dict] | None = None) -> list
         if ext is not None and ext.version and ext.version != runs and _changed_since(ext.manifest, started):
             reasons.append(f"the folder has {ext.id} {ext.version}, it runs {runs}")
     return list(dict.fromkeys(reasons))
+
+
+def outdated_here() -> list[str]:
+    """Why this program runs older insthub code than the disk holds: outdated() of the files of
+    insthub's own modules as this process loaded them (server._code, the listing a server writes
+    into its registry entry).  For a client that has no entry, such as the window or `insthub mcp`.
+    Each file keeps the time it had when it was first listed, so a program calls this once when it
+    starts (it then finds nothing), and again whenever it wants to know.  It reads the files'
+    times, so the window calls it on a worker thread."""
+    from .server import _code
+
+    return outdated({"code": _code(())})
 
 
 def _changed_since(path: Path, when: float) -> bool:

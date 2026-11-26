@@ -12,11 +12,14 @@ how each one is reached, and the controls to look after them and set them up.
     Servers      a card per server: running here, installed as a service, or on another
                  computer (devices.toml)
     a server     its process, addresses, service, devices and the programs connected to it.
-                 Start / Stop / Restart / Logs / Remove; Starts at login; Edit its config
+                 Start / Stop / Restart / Update / Logs / Remove; Starts at login; Edit its config
                  (forms.ServerDialog, which changes the file in place, comments kept).
+                 Update (and Update all, on Servers) loads new code: service.update for a
+                 service, a restart for a server the window started.
     AI agents    giving Claude Code or another agent the instruments; which are connected
     Settings     appearance, previews, notifications, start at login, the files insthub uses,
-                 your extensions (folders added and removed; what is wrong with each)
+                 your extensions (folders added and removed; what is wrong with each), and
+                 whether this window runs older insthub code than the disk holds
     Add          a new server (its config file is written for you; the driver list offers
                  the devices of your extensions), a server file to keep
                  running as a service (at login or not), devices on another computer
@@ -56,6 +59,7 @@ from . import extensions, forms, launcher, pages, registry, service
 from . import widgets as ui
 from .client import PROCESS_TOKEN, log_text
 from .device import busy_with
+from .errors import BusError
 from .inventory import (
     BAD,
     BUSY,
@@ -157,7 +161,8 @@ class Manager(QtWidgets.QMainWindow):
         self._logs: dict[str, pages.LogDialog] = {}
         self._detail: tuple | None = None  # ("device", key, name) or ("server", key) while one is shown
         self.login_pending: dict[str, bool] = {}  # service -> the Starts at login asked, until it is done
-        self.restarting: dict[str, dict] = {}  # server key -> a restart under way (see restart_server)
+        self.restarting: dict[str, dict] = {}  # server key -> a restart under way (see _restarting)
+        self.outdated_here: list[str] = []  # why this window runs older insthub code (extensions.outdated_here)
         self._follow: tuple | None = None  # (server key, device or None): the page to show again once its restart is over
         self._back: tuple | str = "devices"  # where the device page goes back to
 
@@ -323,7 +328,12 @@ class Manager(QtWidgets.QMainWindow):
                 box.show()
         if not self._scanning:
             self._scanning = True
-            self.submit(self.probes, self.backend.scan, self._on_scan, self._on_scan_failed)
+            self.submit(self.probes, self._scan, self._on_scan, self._on_scan_failed)
+
+    def _scan(self) -> dict:
+        """(On a worker) the servers and services, and why this window runs older code, if it does
+        (the first look notes the times of its code: see extensions.outdated_here)."""
+        return {**self.backend.scan(), "here": extensions.outdated_here()}
 
     def _on_scan_failed(self, exc) -> None:
         self._scanning = False
@@ -332,6 +342,9 @@ class Manager(QtWidgets.QMainWindow):
     def _on_scan(self, found: dict) -> None:
         self._scanning, self._scanned = False, True
         self._remote_error = found["remote_error"]
+        if found["here"] != self.outdated_here:
+            self.outdated_here = found["here"]
+            self.settings_page.show_outdated(self.outdated_here)
         units = found["services"]
         self._systemd = units is not None
         by_pid = {u["pid"]: u for u in units or () if u["pid"]}
@@ -496,7 +509,7 @@ class Manager(QtWidgets.QMainWindow):
                 return
             if self._detail and self._detail[1] == key and back != key:  # on show, under a new key (a service
                 self._detail = (self._detail[0], back, *self._detail[2:])  # started, a rename): it follows
-        self.sidebar.sync(servers, len(self.agents()), self._scanned)
+        self.sidebar.sync(servers, len(self.agents()), self._scanned, self.outdated_here)
         if page is self.devices_page:
             self.devices_page.sync(servers, self._scanned, self.previews_on)
         elif page is self.servers_page:
@@ -647,6 +660,8 @@ class Manager(QtWidgets.QMainWindow):
         if running and (u or self.started_here(s.pid)):  # a service, or a server this window started
             menu.addAction(ui.icon("refresh"), "Restart").triggered.connect(
                 lambda *_: self.restart_server(s, ask=True))
+        if self.update_plan(s):
+            menu.addAction(ui.icon("up"), "Update").triggered.connect(lambda *_: self.update_servers([s]))
         if u and running:
             menu.addAction(ui.icon("stop"), "Stop").triggered.connect(lambda *_: self.service_action(s, "stop"))
         elif running and s.pid and s.pid != os.getpid():
@@ -900,16 +915,7 @@ class Manager(QtWidgets.QMainWindow):
         if ask and not self.confirm(f"Restart {s.name}?", f"Restart {s.name}?\n\nPrograms using it get an error "
                                     "for calls under way, then reconnect by themselves.", "Restart"):
             return
-        key = s.key
-        mark = {"key": key, "old": s.pid, "proc": None, "unit": (s.service or {}).get("name")}
-        self.restarting[key] = mark  # one restart at a time; the page comes back once it is over
-
-        def over():
-            if self.restarting.get(key) is mark:  # (not a later restart's)
-                del self.restarting[key]
-                self.render()
-
-        QtCore.QTimer.singleShot(30_000, over)  # it did not come back in time: stop waiting for it
+        mark, over = self._restarting(s)
         if s.service:
             name = s.service["name"]
             what = "restart" if s.origin == "local" else "start"
@@ -945,6 +951,76 @@ class Manager(QtWidgets.QMainWindow):
 
         self.say(f"Restarting {name}...", 0)
         self.submit(self.actions, stop_and_start, started, failed)
+
+    def _restarting(self, s: Server) -> tuple[dict, object]:
+        """Note that a server restarts: one restart at a time, and the page on show comes back once a
+        scan sees its new process (see render).  Returns (the mark, `over`: what forgets it, when the
+        restart failed); it is forgotten by itself after 30 s, if the server did not come back."""
+        key = s.key
+        mark = {"key": key, "old": s.pid, "proc": None, "unit": (s.service or {}).get("name")}
+        self.restarting[key] = mark
+
+        def over():
+            if self.restarting.get(key) is mark:  # (not a later restart's)
+                del self.restarting[key]
+                self.render()
+
+        QtCore.QTimer.singleShot(30_000, over)
+        return mark, over
+
+    def update_plan(self, s: Server) -> list[str]:
+        """What Update does for a server, as steps of service.plan: for a service, what that rule says
+        (its unit written anew when it is stale; a restart when it runs and its unit or its code
+        changed); for a server this window started that runs older code, a restart; else nothing (a
+        server started in a terminal is restarted there)."""
+        if s.service:
+            return service.plan(s.service, s.outdated)
+        return ["restart"] if s.outdated and s.origin == "local" and self.started_here(s.pid) else []
+
+    def update_servers(self, servers: list[Server]) -> None:
+        """Update on a server's page or card, and Update all on the Servers page: after one question
+        that lists what each server gets (what restarts, and what is old about a unit written anew), a
+        service is brought up to date by service.update on a worker (which looks again and decides by
+        the same rule), and a server this window started is restarted as Restart does."""
+        plans = [(s, steps) for s in servers if (steps := self.update_plan(s)) and s.key not in self.restarting]
+        if not plans:
+            return
+        title = f"Update {plans[0][0].name}?" if len(plans) == 1 else f"Update {len(plans)} servers?"
+
+        def told(s: Server, steps: list[str]) -> str:
+            stale = (s.service or {}).get("stale")
+            return f"{s.name}: {service.plan_text(steps)}" + (f" (its unit: {stale})" if stale else "")
+
+        text = "\n".join(told(s, steps) for s, steps in plans)
+        if any("restart" in steps for _, steps in plans):
+            text += "\n\nPrograms using a server that restarts get an error for calls under way, then reconnect by themselves."
+        if not self.confirm(title, text, "Update"):
+            return
+        for s, _ in plans:
+            if not s.service:
+                self.restart_server(s)  # (asked above)
+        names = [s.service["name"] for s, _ in plans if s.service]
+        if not names:
+            return
+        overs = {s.service["name"]: self._restarting(s)[1] for s, steps in plans if s.service and "restart" in steps}
+        records = []
+
+        def run():
+            records.extend(service.update(names))
+            if any(r.error for r in records):
+                raise BusError("\n\n".join(r.text() for r in records))
+            return records
+
+        def after():  # a restart that did not happen: its page need not wait for it
+            restarted = {r.name for r in records if "restart" in r.done}
+            for name, over in overs.items():
+                if name not in restarted:
+                    over()
+
+        units = ", ".join(f"{service.PREFIX}{name}" for name in names)
+        self.act(f"Updating {units}", run,
+                 lambda done: "; ".join(f"{service.PREFIX}{r.name}: {r.outcome or 'up to date'}" for r in done),
+                 after=after)
 
     def set_login(self, s: Server, on: bool) -> None:
         """Start a service at every login, or no longer."""
