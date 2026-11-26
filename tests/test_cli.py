@@ -30,6 +30,14 @@ def test_list_info_call_get_set(server, capsys, tmp_path):
     target = tmp_path / "wf.npz"
     assert run(capsys, "-a", address, "call", "scope", "get_waveform", "--save", str(target))[0] == 0
     assert np.load(target)["volts"].shape == (1000,)
+    code, out, _ = run(capsys, "-a", address, "call", "loopback", "echo", '{"file": [1, 2], "allow_pickle": 3}',
+                       "--save", str(tmp_path / "keys"))  # (keys that np.savez(**it) takes as its own)
+    assert code == 0 and out == f"saved to {tmp_path / 'keys.npz'} (file, allow_pickle)\n"
+    with np.load(tmp_path / "keys.npz") as saved:
+        assert saved["file"].tolist() == [1, 2] and saved["allow_pickle"] == 3
+    code, out, err = run(capsys, "-a", address, "call", "loopback", "echo", "[1, 2]", "--save",
+                         str(tmp_path / "missing" / "x.txt"))
+    assert code == 1 and json.loads(out) == [1, 2] and "error: cannot save it to " in err  # (printed instead)
     code, _, err = run(capsys, "-a", address, "call", "synth", "sweep", "1", "2")
     assert code == 1 and "error:" in err
     code, _, err = run(capsys, "-a", address, "info", "nope")

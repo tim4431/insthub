@@ -14,7 +14,7 @@ change and do not know it exists.
 ```mermaid
 flowchart TB
     agent["AI agent<br/>(Claude Code, ...)"]
-    mcp["<b>insthub mcp</b><br/>seven tools; results made cheap to read"]
+    mcp["<b>insthub mcp</b><br/>eight tools; results made cheap to read"]
     servers["servers<br/>(unchanged)"]
     inst(["instruments"])
     agent -->|"MCP, on stdin/stdout"| mcp
@@ -122,22 +122,48 @@ agent's manual; see [writing devices that agents use well](#writing-devices-that
 
 ## The tools
 
-There are seven, whatever the number of instruments, because every device
+There are eight, whatever the number of instruments, because every device
 describes itself. There is no separate tool for each command.
 
 | Tool | Does | Like |
 |---|---|---|
 | `list_devices()` | every device: server, type, connected or not, its extension, `"simulated": true` for a simulator, names of its commands, properties and streams | `insthub list` |
-| `describe(device)` | signature and docstring of each command, with its parameters' units, limits and choices (`params`); properties (settable or read-only, with `meta`); what is `dangerous`; streams with their last frame, periodic tasks, status, state | `insthub info` |
+| `describe(device)` | signature and docstring of each command, with its parameters' units, limits and choices (`params`); properties (settable or read-only, with `meta`); what is `dangerous`; streams with their last frame, periodic tasks, status, state; the [recipes](guide.md#recipes) that use the device, with their parameters | `insthub info` |
 | `get(device, property)` | read a property | `dev.power` |
 | `set(device, property, value)` | write a property, unless it is marked dangerous | `dev.power = -10` |
 | `call(device, command, args, kwargs)` | run a command, unless it is marked dangerous; also the bus commands `$release`, `$open`, `$task`, `$pause` and `$resume` | `dev.measure("VPP", channel=2)` |
 | `snapshot(device, stream, fresh)` | one frame of a stream, published after the call started | `dev.subscribe("trace").get()` |
 | `call_dangerous(device, command, args, kwargs)` | run a command marked dangerous, or write a property marked dangerous with `"$set"` and `[property, value]` | `dev.fire()` |
+| `run_recipe(name, params, timeout)` | run a [recipe](guide.md#recipes), a Python function the user keeps, by the name `describe` lists, in a program of its own, and return what it returns. One whose check finds a problem, or that uses something marked dangerous, is refused | `insthub run comb start=5000` |
 
 `get`, `call`, `call_dangerous` and `snapshot` take `plot=true` to add a
-picture of the result, and `get`, `set`, `call` and `call_dangerous` take a
-`timeout` in seconds.
+picture of the result, and `get`, `set`, `call`, `call_dangerous` and
+`run_recipe` take a `timeout` in seconds.
+
+Recipes let you tell an agent "set up the comb" and have it run the code the
+window's **Recipes** tab runs, instead of working out the calls again.
+`run_recipe` checks the recipe against its devices first, as the window does,
+and refuses it if a device is not on the bus or is paused, or lacks a command
+or property the recipe uses. It also refuses a recipe that uses something
+marked dangerous, or that says `@recipe(dangerous=True)`: only you run such a
+recipe, from the window or with `insthub run`. Otherwise it runs the recipe
+in a program of its own, so one that hangs or crashes never takes `insthub
+mcp` with it. It stops the recipe, as **Stop** does, once `timeout` has
+passed, when your client cancels the request, and when `insthub mcp` exits,
+so none is left running with nobody to stop it. What it returns comes back
+as any result does, large arrays as files.
+
+`run_recipe` runs only your recipes: those of your recipes folder and of
+your extensions. A name with a path (`file.py:function`) is accepted only
+for one of those files, to tell apart two files of the same name. It never
+runs a function of any other file, such as a script in the agent's project
+or a module of Python's own.
+
+A recipe is your own code, run with values the agent chooses, and the check
+sees only what insthub can read from the file (see [what insthub
+checks](guide.md#what-insthub-reads-and-what-it-checks)). Allow `run_recipe`
+without being asked only if you trust your recipes with any parameters an
+agent might pick.
 
 ### Dangerous commands
 
@@ -157,14 +183,18 @@ PermissionError: laser: its command 'fire' is marked dangerous, so this tool ref
 exactly this, use call_dangerous('laser', 'fire', ...); they may be asked first.
 ```
 
-So you can allow every tool except `call_dangerous` in Claude Code, and the
-agent works without asking you, except before anything dangerous. With
-`/permissions`, or in `.claude/settings.json`:
+So you can allow every tool except `call_dangerous` and `run_recipe` in
+Claude Code, and the agent works without asking you, except before anything
+dangerous and before running one of your recipes. With `/permissions`, or in
+`.claude/settings.json`:
 
 ```json
 {"permissions": {"allow": ["mcp__insthub__list_devices", "mcp__insthub__describe", "mcp__insthub__get",
                            "mcp__insthub__snapshot", "mcp__insthub__set", "mcp__insthub__call"]}}
 ```
+
+Add `"mcp__insthub__run_recipe"` to the list only if you trust your recipes
+with any values an agent picks (see [the tools](#the-tools)).
 
 The tool's MCP annotations mark it destructive, for clients that look at
 them. The other bus commands (`$release`, `$open`, `$task`, `$pause`,
@@ -349,7 +379,8 @@ There are two ways:
   to every client; metadata (`max=`) is advice and is not enforced. Claude
   Code asks before each tool call unless you allow the tools: allow the
   read-only ones (`list_devices`, `describe`, `get`, `snapshot`), or every
-  tool except `call_dangerous`.
+  tool except `call_dangerous` (and `run_recipe`, unless you trust your
+  recipes with any values an agent picks).
 - **It cannot stop a command once it has started.** If a call outlasts its
   timeout, the agent is told the command may still be running, and later
   calls to that device wait behind it (see
@@ -358,7 +389,7 @@ There are two ways:
 
 ## Why it is built this way
 
-**Why seven generic tools and not one per command?** An agent reads the
+**Why eight generic tools and not one per command?** An agent reads the
 description of every tool it has at the start of every session. One tool per
 command would be hundreds of descriptions for a modest lab, most of them
 irrelevant to the task at hand. Generic tools plus `describe` cost the same

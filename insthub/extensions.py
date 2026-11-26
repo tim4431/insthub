@@ -7,6 +7,7 @@
     version = "0.3"
     api = 1                            # the version of this file's format
     # python = ".venv/bin/python"      # default: a virtualenv in this folder or the one above
+    # recipes = ["recipes.py"]         # files (or folders) of recipes: Python functions (see recipes.py)
 
     [devices.analyzer]                 # a ready-made [devices.x] table for a server file
     driver = "hp8562a_insthub.device:SpectrumAnalyzer"
@@ -93,7 +94,9 @@ class Extension:
     own), "added" (your list), "service:NAME" (the folder of a device of an installed service),
     "server:NAME" (of a server running here) or "device" (found from a device's own folders).
     One that cannot be used says why in `error`; one whose id an earlier one has names that
-    one's manifest in `hidden_by`.  Its attributes `devices` and `ui` hold what it adds, by name."""
+    one's manifest in `hidden_by`.  Its attributes `devices` and `ui` hold what it adds, by name;
+    `recipes`, the files of its recipes (recipes.py reads them; one that cannot be read leaves the
+    extension usable)."""
 
     manifest: Path  #: the file it is read from (for a place without one: where it was looked for)
     source: str = ""
@@ -104,6 +107,7 @@ class Extension:
     python: str | None = None  #: the Python its code runs in
     devices: dict[str, DeviceOffer] = dataclasses.field(default_factory=dict)
     ui: dict[str, UI] = dataclasses.field(default_factory=dict)
+    recipes: tuple = ()  #: Path of each file of recipes, as [extension] recipes names them (folders: their files)
     error: str | None = None
     hidden_by: str | None = None
 
@@ -149,7 +153,8 @@ _FUNCTION = _Kind('text as "module:function"', config._DRIVER.test)
 #: The keys of [extension] and of a [ui.NAME] that insthub reads, with the kind of value each
 #: takes.  Others are left alone, since a newer insthub may read them (check() warns about them).
 _EXTENSION = {"id": config._TEXT, "title": config._TEXT, "version": config._TEXT, "api": _WHOLE,
-              "python": config._TEXT}
+              "python": config._TEXT,
+              "recipes": _Kind('a list of files or folders, as ["recipes.py"]', config._strings)}
 _UI = {"title": config._TEXT, "run": _ARGS, "panel": _FUNCTION, "types": config._NAMES}
 #: Keys of a server file's device table that insthub writes there, not a manifest: why.
 _WRITTEN = {"path": "insthub writes the manifest's folder",
@@ -250,6 +255,9 @@ def _read(manifest: str | Path, source: str = "") -> tuple[Extension, list[str],
     if _own(manifest):  # its code comes with (that copy of) insthub, whose version it has
         python = sys.executable
         version = about.get("version") or _assigned(manifest.with_name("_version.py"), "__version__") or ""
+    elif not doc.get("devices") and not doc.get("ui") and not about.get("python"):
+        # recipes only: they run in its folder's virtualenv if it has one, else in insthub's Python
+        python, version = venv_python(manifest.parent), about.get("version", "")
     else:
         python, version = _python(about.get("python"), manifest.parent, problems), about.get("version", "")
     adds = {}
@@ -264,8 +272,25 @@ def _read(manifest: str | Path, source: str = "") -> tuple[Extension, list[str],
             if item is not None:
                 adds[kind][name] = item
     ext = Extension(manifest, source, ext_id, about.get("title", ext_id), version, api, python, **adds,
+                    recipes=_recipe_files(about.get("recipes", ()), manifest.parent, notes),
                     error="; ".join(problems) or None)
     return ext, problems, notes
+
+
+def _recipe_files(named: list, folder: Path, notes: list) -> tuple:
+    """The files of recipes that [extension] recipes names (relative to the manifest's folder): a
+    folder gives its .py files.  One that is neither is a note, not a problem: it never makes the
+    extension unusable."""
+    files = []
+    for entry in named:
+        path = folder / Path(entry).expanduser()
+        if path.is_dir():
+            files += sorted(p for p in path.glob("*.py") if not p.name.startswith(("_", ".")))
+        elif path.suffix == ".py" and path.is_file():
+            files.append(path)
+        else:
+            notes.append(f"[extension] recipes: {path} is neither a .py file nor a folder")
+    return tuple(dict.fromkeys(files))  # (a file named twice, or also through its folder, is read once)
 
 
 def load(manifest: str | Path, source: str = "") -> Extension:
@@ -583,13 +608,26 @@ def check(path: str | Path, import_: bool = False) -> list[str]:
         return [f"{path}: no such file or folder"]
     elif path.name == MANIFEST:
         manifest = path
+    elif path.suffix == ".py":
+        return _check_recipes(path)
     elif path.suffix == ".toml":
         return _check_server(path, import_)
     else:
-        return [f"{path}: expected an extension's folder, its {MANIFEST}, or a server's .toml"]
+        return [f"{path}: expected an extension's folder, its {MANIFEST}, a server's .toml or a file of recipes"]
     ext, problems = _check_manifest(manifest)
     if import_ and ext.python and ext.devices:
         problems += _import(ext, list(ext.devices.values()))
+    return problems
+
+
+def _check_recipes(path: Path) -> list[str]:
+    """check() of a file of recipes (recipes.check_file): what makes it, or one of its recipes,
+    unusable; warns about what is probably a mistake."""
+    from . import recipes
+
+    problems, notes = recipes.check_file(path)
+    for note in notes:
+        _warn(note)
     return problems
 
 
@@ -600,6 +638,7 @@ def _check_manifest(manifest: Path) -> tuple[Extension, list[str]]:
     ext, problems, notes = _read(manifest)
     for note in notes:
         _warn(f"{ext.manifest}: {note}")
+    recipe_problems = [p for path in ext.recipes for p in _check_recipes(path)]  # (they leave it usable)
     for offer in ext.devices.values():
         module, _, cls = offer.driver.partition(":")
         file = module_file(module, ext.root)
@@ -608,7 +647,7 @@ def _check_manifest(manifest: Path) -> tuple[Extension, list[str]]:
             _warn(f"{ext.manifest}: [devices.{offer.name}] {offer.driver} says extension_version = "
                   f"{config._shown(said)}, but the manifest's version is {config._shown(ext.version)}: is one of "
                   "them out of date? (see docs/design.md#versions)")
-    return ext, [f"{ext.manifest}: {p}" for p in problems]
+    return ext, [f"{ext.manifest}: {p}" for p in problems] + recipe_problems
 
 
 def _assigned(path: Path, attr: str, cls: str | None = None):

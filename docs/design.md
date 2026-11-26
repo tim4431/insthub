@@ -12,6 +12,7 @@ rest describe insthub as it is.
 - [The three rules](#the-three-rules)
 - [Where code lives](#where-code-lives)
 - [Extensions](#extensions) (manifests; finding, checking and starting them)
+- [Recipes](#recipes) (snippets kept as Python functions, run by name)
 - [A generic UI good enough for most devices](#a-generic-ui-good-enough-for-most-devices)
 - [Keeping the core light](#keeping-the-core-light)
 - [The plan, in order](#the-plan-in-order)
@@ -71,7 +72,7 @@ flowchart TB
     end
     subgraph opt["Optional parts of insthub: loaded only by the programs that use them"]
         gui["qt, viewer, sim_ui, manager, pages,<br/>forms, widgets, inventory"]
-        rest["cli, config, service, launcher, sim, bench,<br/>mcp, render, extensions"]
+        rest["cli, config, service, launcher, sim, bench,<br/>mcp, render, extensions, recipes"]
     end
     subgraph core["The core: what import insthub loads"]
         c["device, server, client, codec,<br/>wire, registry, errors<br/>needs only numpy and msgpack"]
@@ -118,6 +119,9 @@ holds:
 - optionally a **UI**, in one of two forms. A *panel* is one widget, and
   insthub puts it in a window. An *app* is a whole program with its own
   window.
+- optionally **recipes**: files of Python functions that use its devices,
+  which insthub runs by name (see [Recipes](#recipes)). A folder whose
+  manifest names only recipes is an experiment's, not an instrument's.
 - one small file, **`insthub-extension.toml`**, the *manifest*, that names all
   of the above.
 
@@ -197,8 +201,8 @@ dialog offers its devices (step 7); `insthub open` and the device page's
 
 `insthub-extension.toml` is data. insthub reads it with `tomllib` and never
 runs it, so listing extensions never imports a vendor library. A manifest
-lists what the extension adds to insthub, in two kinds of table: `devices`
-and `ui`.
+lists what the extension adds to insthub, in two kinds of table, `devices`
+and `ui`; its `[extension]` table can also name files of recipes.
 
 ```toml
 [extension]
@@ -207,6 +211,7 @@ title = "HP 8562A spectrum analyzer"
 version = "0.3"
 api = 1                               # the version of this file's format
 # python = ".venv/bin/python"         # default: a .venv in this folder or the one above
+# recipes = ["recipes.py", "more/"]   # files (and folders of files) of recipes: Python functions
 
 [devices.analyzer]                    # offered by the window's New server dialog
 driver = "hp8562a_insthub.device:SpectrumAnalyzer"
@@ -231,6 +236,7 @@ types = ["HP8562A", "SimHP8562A"]     # only for devices of these types (default
 |---|---|---|
 | `[devices.NAME]` | the window's **New server** dialog, `insthub ext list`, `insthub check` | a ready-made `[devices.x]` table for a server file. `driver` names a `Device` subclass or a plain driver class to wrap, exactly as in a server's `.toml`. `doc` describes it. Every other key (constructor arguments, `exclude`, `link_errors`, `lazy`, ...) is copied into the server file as it is; insthub's own keys among them are checked as in a server file (what `link_errors` names is imported, so it is loaded by `insthub check --import`, in the extension's Python). The dialog reads the constructor's arguments from the source without importing it, as it already does, and adds `path` and `extension`, so a manifest never gives those (nor `extension_version`, see [versions](#versions)). The server it creates runs with the extension's Python. A server runs in one Python, so the dialog says so when the extensions of two of its devices run in different ones (as `insthub check` warns about a server file), and keeps a Python you chose yourself. Typing another driver in place of the one chosen takes away the keys the choice brought, `extension` among them. |
 | `[ui.NAME]` | the device page's **Open** buttons and its tile's menu, `insthub open DEVICE [NAME]` | with `run`, an app, started as `<python> <run...>`; with `panel`, a panel, put in a window of its own (see [writing the UI half](#writing-the-ui-half)). Offered for every device that belongs to this extension, or with `types` only for the devices whose `type` (in `describe()`: the class name, which for a wrapped driver is the driver's) is listed. insthub's own manifest offers its scope panel this way, for its simulated scope only. |
+| `[extension] recipes` | the window's **Recipes** page and the device pages' **Recipes** tabs, `insthub run`, `insthub recipes`, the agents' `describe` and `run_recipe` | files of [recipes](#recipes), relative to the manifest's folder; a folder gives its `.py` files. They are read without running them, and run in the extension's Python. An entry that is neither a `.py` file nor a folder is a warning, and a recipe that cannot be used is listed with its error: neither makes the extension unusable. A manifest with only recipes needs no Python of its own: they run in a virtualenv in its folder, else in insthub's Python. |
 
 Each module name in a manifest is found with the manifest's folder first on
 the module search path. An app or panel starts with that folder as its
@@ -406,6 +412,7 @@ its devices' extensions.
 | the manifest | the window, `insthub ext`, `insthub check` | to list extensions; it is data, nothing runs |
 | the driver and device | the server that hosts the device | when the server builds it (`config.load_object`, as today) |
 | the app or panel | the program started for it, with the extension's Python | when someone clicks **Open** or runs `insthub open` |
+| a file of recipes | the program started to run one of its recipes (`recipes.start()`), with its Python, or a script that calls `recipes.run()` or `load()`; the window, `insthub recipes`, `insthub check` and `insthub mcp` only read it, with `ast` | when someone runs a recipe of it |
 | `insthub.extensions` itself | the window and the command line | never by `import insthub` |
 
 Unlike VS Code, insthub has no list of events that wake an extension up, and
@@ -551,6 +558,234 @@ one.
 | `m8195a_ripa` | Two manifests, one per instrument: `m8195a` in the project folder and `redpitaya` in `tools/redpitaya/`. Each device in `bus.toml` gets its `extension` key. `accessors = true` turns the AWG driver's ~40 argument-free `get_X`/`set_X` pairs into properties; its ~30 per-channel pairs stay commands. Its raw I/O methods are excluded or marked dangerous. |
 | `oscilloscopes` | Already a package. It ships its manifest inside the installed package and is the first candidate for finding extensions through entry points. |
 
+## Recipes
+
+*Status: implemented (step 12): `insthub/recipes.py`; your recipes folder
+and `[extension] recipes` in manifests; `insthub run`, `insthub recipes` and
+`insthub check FILE.py`; the window's **Recipes** page, the device page's
+**Recipes** tab and **Save as recipe...**; recipes in the agents' `describe`,
+and `run_recipe`. [Recipes](guide.md#recipes) in the guide is the how-to.*
+
+A lab keeps snippets: set the Red Pitaya to a square wave; arm it, wait for a
+trigger and read its buffer; start the SynthHD's comb and take a trace at
+each step. They lived in a notes file and were pasted into a terminal. A
+*recipe* is such a snippet as a Python function in a file, so that the
+window, the command line, a script and an agent all find it by name and run
+it the same way:
+
+```python
+# ~/.config/insthub/recipes/comb_scan.py
+import insthub
+
+def comb(start: float = 4000, stop: float = 9000, step: float = 1, dbm: float = 0):
+    """SynthHD frequency comb, stepped by the trigger."""
+    return insthub.device("synthhd").arm_comb("A", start, stop, step, dbm=dbm)
+```
+
+### Python functions, not data
+
+A data format came first: `[recipes.NAME]` tables of steps (call a command,
+set a property, wait) with `{placeholder}` parameters, in a `recipes.toml`
+and in manifests. It was dropped before it was released. It was a small
+language of its own, and too small for the snippets people keep: they loop,
+wait for a trigger, and read a value back to decide what to do next (an
+armed Red Pitaya is asked until it answers `TD`, triggered). Each such
+need would have added a keyword, toward a scripting language worse than
+Python. A function:
+
+- is the code people already have, with its values turned into parameters.
+  There is nothing new to learn.
+- can loop, wait, read back, use numpy, and return data.
+- says its parameters in its signature: defaults, annotations, and the
+  choices of a `Literal[...]`. `@recipe(params=...)` adds units and limits
+  for the window and for agents, in the vocabulary of a device's metadata,
+  and `@recipe(dangerous=True)` asks first.
+
+What the data format gave (a check before running, dangers in sight,
+nothing of the user's code in the window) is kept as far as reading code
+allows. The next sections say how, and what it cannot see.
+
+It is not the experiment runner we [decided
+against](#ideas-we-decided-against): there is no queue, no schedule and no
+datasets. A recipe runs when someone asks, and what it returns goes back to
+whoever asked. It is not called an *app*, which a manifest already uses for a
+whole program with its own window. A *preset* suggests values without logic,
+a *macro* recorded keystrokes, and *task* is taken by periodic tasks.
+
+### Read without running
+
+insthub reads a file of recipes with `ast` and never imports it to list or
+check its recipes. Listing therefore runs none of the user's code, so the
+window can list recipes in its own process, and a file whose top cannot run
+now (a device that is off, a library missing from insthub's environment) is
+still listed. From each public top-level function it reads:
+
+- its name, and its docstring (the first line is its title);
+- its parameters: each default as written, the annotation, the values of a
+  `Literal[...]` as choices, and what `@recipe(params=..., dangerous=...)`
+  says, read as literals;
+- the devices it uses: `insthub.device("name")` with the name written out, in
+  the function, in a function of the same file that it calls, or in a
+  function of a `.py` file beside it that it imports (`import redpitaya`,
+  `from redpitaya import acquire`) and calls;
+- the devices the top of its file names, and the top of each file beside it
+  that runs when it does (one it imports): that code runs whenever any
+  recipe of the file starts, so every recipe of the file needs them
+  (`at_import`), and the check asks for them too ("the top of redpitaya.py
+  asks for it"). A device named there and imported from that file (`from
+  _devices import laser`) is followed;
+- what it uses of them (`Use(device, name, kind, line, file)`): a command or
+  method called, a property read, a property written. `dev.call("cmd")`,
+  `dev.bus.call("cmd")` and `dev.bus.set("prop", v)` count when the name is
+  written out, and so do uses through `dev.with_timeout(s)` and through
+  other names for the device (`a, b = ...` included). Uses at the top of the
+  file count for every recipe of the file. A block under `if __name__ ==
+  "__main__":` is not read: it never runs when a recipe does.
+
+A recipe that cannot be used (an `async def`, a decorator not written as
+literals, anything else insthub cannot read in it) has its own error and
+leaves the other recipes of its file usable. What each file says is kept
+until it changes, so the window can ask again cheaply; what a recipe uses
+across the files beside it is put together each time, so a change there, or
+a file that appears, is seen at once.
+
+### Checked before running
+
+`recipes.check(recipe)` asks each device the recipe uses, and each the top
+of its file names, for its `describe()`, and finds what would stop it: a
+device not on the bus or paused, a command or property it does not have
+(with a "did you mean"), a read-only property written. It also lists what
+the recipe uses that is marked dangerous, and which of its devices are
+simulated. Nothing runs. The window, `insthub run` (and `--dry-run`, which
+stops there) and `run_recipe` check before they start a recipe, and refuse
+one with a problem.
+
+Reading code has limits, and the check is a guard against the usual
+mistakes (the wrong server, a misspelled command, a renamed property), not a
+proof. It does not see a device named only when the recipe runs
+(`insthub.device(name)` with a variable, in the function or at the top of
+the file), or a command or property named so (`dev.call(name)` with a
+variable): the check says so, as `named_later`. Nor does it see a name
+reached through `getattr`, a function of a module that is not a `.py` file
+beside the recipe's file, what a function returns (`rp = connect()`), or a
+device handed to a helper as an argument. It does not judge values either:
+whether 30000 MHz is too high is for the driver to say when it runs, as for
+any client. What it does not see fails where it is, as in a script. There
+is no undo: what a recipe did before it failed stays done, and its `finally`
+blocks are where it puts things back.
+
+### A process of its own
+
+The window and the agents' MCP server never run the user's code in their own
+process. It is the rule that keeps extension UIs out of the window (see [two
+halves](#two-halves-each-where-its-libraries-are)), and for the same
+reasons: a recipe can wait for a trigger that never comes, crash, or import
+a library that insthub's environment does not have.
+
+So `recipes.start(recipe, values)` runs a recipe in a program of its own,
+with the recipe's Python: a virtualenv in your recipes folder, or the
+extension's Python, else the one running insthub. That program is `python
+-c` with a line that calls `insthub.recipes._child(FILE, FUNCTION, VALUES,
+RESULT)`. A recipe reaches its instruments over the bus, so that Python
+needs no driver. `start()` returns a `Run`: what the recipe has printed so
+far (the window streams it), `stop()`, and `wait()`, which returns what the
+recipe returned, packed with the bus's own codec (numpy arrays, dicts,
+dataclasses), or raises `RecipeError`, whose `output` holds what it printed,
+the traceback too, starting in the recipe's own code. `insthub run` uses the
+same, with the output going to its terminal.
+
+The program has the recipe's folder on `sys.path`, so the recipe imports the
+files beside it, but not the folder insthub was started from: a `json.py` or
+an `insthub/` there would otherwise replace what the recipe and insthub
+import. The recipe's file is compiled from its source each time it runs,
+never from bytecode, so an edit made a moment before is never missed, and
+the program writes no bytecode.
+
+**Stop** sends the program SIGTERM once, which it turns into a
+`KeyboardInterrupt` in the recipe, so its `finally` blocks run, as after
+Ctrl-C. If it is still running 3 seconds later, it is killed. Stop pressed
+again sends nothing: a second `KeyboardInterrupt` would land in the
+`finally` blocks it is running. A recipe that returns all the same (it
+caught the interrupt, or had just finished) gives what it returned. A
+command the recipe was waiting for keeps running on its device: Stop ends
+the recipe, not the instrument's work, as a timeout does. The agents'
+`run_recipe` stops its recipe the same way when its timeout passes, when the
+agent's request is cancelled and when `insthub mcp` exits, so none is left
+running with nobody to stop it.
+
+Scripts and notebooks call `recipes.run(name, **values)` or `load(name)`
+instead, which run the recipe in their own process with no check and no
+question: the same as calling the function, which they could do anyway.
+They add the recipe's folder to the end of `sys.path` and leave it there, so
+the recipe can import the files beside it and never hides a module of the
+script's.
+
+### Dangerous
+
+The marks of the devices reach recipes as far as insthub can read them. The
+window asks before running a recipe whose check found something marked
+dangerous, or that says `@recipe(dangerous=True)`. `insthub run` asks on a
+terminal, and needs `--yes` where there is nobody to ask. The agents'
+`run_recipe` refuses such a recipe: only the user runs it.
+
+A recipe can still reach a dangerous command through code insthub cannot
+read, and the instrument will do it. As for scripts, the marks prevent
+accidents; they do not stop code written to get around them. So allowing an
+agent to run recipes without asking means trusting them with any values the
+agent picks, and [agents](agents.md#the-tools) says so.
+
+### Where recipes live
+
+| Place | For |
+|---|---|
+| your folder, `~/.config/insthub/recipes/*.py` (`$INSTHUB_RECIPES`) | your snippets, and what **Save as recipe...** writes (into `DEVICE.py`, replacing a function of that name and keeping the rest). Files whose names start with `_` or `.` are skipped, so helpers can live beside them. |
+| `[extension] recipes = ["recipes.py", "more/"]` in a manifest | the recipes of one experiment, kept in git beside its code and added with `insthub ext add`. Such a manifest needs no Python of its own: its recipes run in a virtualenv in its folder, else in insthub's Python. An instrument's extension can name recipes too. |
+
+A recipe is stored in one place and shown wherever it is used: it belongs to
+no device, since one often uses several. The window's **Recipes** page lists
+them all, and each device's page those that use it, as read from the file.
+
+This is not the central store of settings we decided against: nothing is
+saved unless someone saves it, nothing is shared through a service, and a
+file of recipes is its owner's, edited in an editor and kept in git if they
+like, as `devices.toml` is.
+
+### Names
+
+A recipe is called by its function's name (`square`); by its file's name and
+its own (`redpitaya.square`) when two files have one; and by a path
+(`path/to/file.py:square`) for one in any file. Of several recipes with one
+name, yours is used before an extension's; otherwise the error lists each
+by the shortest name that runs it (`recipes.runs_as()`). Two folders can
+each hold a file of one name (two experiments' `recipes.py`): their recipes
+then share a full name too, and only the path says which file. Short names
+for typing, files for grouping, and no list of names to keep up to date.
+
+`find(name, any_file=False)` accepts a path only to a file `available()`
+lists (your folder, a usable extension's). The agents' `run_recipe` finds
+recipes that way, so an agent can tell two such recipes apart, but cannot
+run a function of any other file: a script in its project, or a module of
+Python's own.
+
+### Recipe, command or app
+
+| | A driver command | A recipe | An app or a panel |
+|---|---|---|---|
+| for | what anyone with the instrument would want: load a bitfile, a square wave, wait for a trigger | what is about your setup: this comb, with this trigger and this acquisition, often across devices | something you work in while it stays open: live traces while you adjust the trigger |
+| lives in | the device class, in its extension | your recipes folder, or an experiment's folder | an extension's `[ui.NAME]` |
+| runs | in the server, on the device's thread | in a program of its own, as a client, and finishes | in a program of its own, until you close it |
+| found as | the **Commands** tab, `insthub info`, `call` | the **Recipes** tab and page, `insthub run`, `run_recipe` | **Open ...** on the device's page, `insthub open` |
+
+What should happen by itself, such as loading a bitfile whenever the server
+starts, belongs in the driver's `open()` or in a periodic task, not in a
+recipe.
+
+### Later, when a need shows up
+
+- A recipe that **saves the current settings** of a device (its settable
+  properties) to run again later, next to `insthub.states()` (step 10).
+- **Save as recipe** for several calls in a row, kept as one function.
+
 ## A generic UI good enough for most devices
 
 *Status: implemented (plan steps 5 and 6), as described below.*
@@ -624,7 +859,7 @@ What `import insthub` may load:
 
 What it must not load: Qt in any binding, pyqtgraph, matplotlib,
 `importlib.metadata`, `asyncio`, or any of insthub's optional modules
-(`config`, `extensions`, `qt`, `viewer`, `sim_ui`, `manager`, `pages`,
+(`config`, `extensions`, `recipes`, `qt`, `viewer`, `sim_ui`, `manager`, `pages`,
 `forms`, `widgets`, `inventory`, `render`, `mcp`, `sim`, `bench`, `service`,
 `launcher`, `cli`, `tomlfile`). It must not write a file or open a connection
 either.
@@ -685,6 +920,7 @@ so they are built on guard rails.
 | 9 | The reference extension: a skeleton in `examples/extension/`, and `hp_8562a_gpib` converted | `examples/`, the project | medium |
 | 10 | Operations: a server keeps its last log lines, and `insthub logs SERVER` shows them from any computer; `service install` waits until the server answers, and shows the journal if it does not; a limit on restart loops; `insthub.states()` collects every device's state for saving next to a data file; remote addresses in one place for `locate`, `list`, the window and MCP; a public `insthub.connect(address, timeout=...)` | `server.py`, `service.py`, `client.py`, `registry.py` | small each |
 | 11 | Qt helpers for panels: `qt.coalesce` (one request in flight, later values merged into it), and the device page's settings as a widget a panel can embed | `qt.py`, `pages.py` | medium |
+| 12 | **Done.** Recipes as Python functions (a TOML format of steps was tried first and dropped): your recipes folder and `[extension] recipes` in manifests (a recipe that cannot be used leaves the rest usable; a manifest with only recipes needs no Python), read with `ast` and never imported to list or check them; every device asked before a recipe runs; each run in a program of its own, with its Python, its output streamed, and Stop; `insthub run` (with `--dry-run`, and asking before what is dangerous), `insthub recipes`, and `insthub check FILE.py`; the window's **Recipes** page, the device page's **Recipes** tab and **Save as recipe...**; recipes in the agents' `describe`, and an eighth tool, `run_recipe`, which refuses a recipe with a problem or something dangerous; `examples/sim_recipes.py` for the simulated instruments | new module, `extensions.py`, `cli.py`, `pages.py`, `manager.py`, `mcp.py` | medium |
 
 Only when a real need shows up:
 

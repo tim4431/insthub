@@ -13,6 +13,12 @@
     insthub view DEVICE                            live plots of its streams (needs insthub[gui])
     insthub open DEVICE [UI]                       a UI of its extension (a window made for it), run with the
                                                   extension's Python; without UI, the one there is, or a list
+    insthub run RECIPE [NAME=VALUE ...] [--dry-run] [--yes] [--timeout S] [--save FILE]
+                                                  run a recipe (a function of yours, kept in a .py file) in a
+                                                  process of its own, once its devices are checked; RECIPE is
+                                                  its name, FILE.function, or path/to/file.py:function.
+                                                  --dry-run only checks it; Ctrl-C stops it
+    insthub recipes [DEVICE] [--json]              the recipes this computer knows of (those that use DEVICE)
     insthub panel DEVICE MODULE:FUNCTION [--title TITLE]
                                                   a panel, make(device, parent=None) -> QWidget, in a window
     insthub gui [--tray | --install | --uninstall] the manager window: every server and device, how each is
@@ -26,9 +32,10 @@
     insthub ext list [--json]                      the extensions this computer knows of, and what is wrong with
                                                   them (an extension: a folder with an insthub-extension.toml)
     insthub ext add PATH | ext remove PATH         add an extension's folder to your list, or take it off
-    insthub check PATH [--import]                  what is wrong with an extension (its folder or manifest), or
-                                                  with the extensions of a server's .toml; --import also imports
-                                                  the drivers, in the extension's Python
+    insthub check PATH [--import]                  what is wrong with an extension (its folder or manifest), with
+                                                  the extensions of a server's .toml, or with a file of recipes
+                                                  (.py, read without running it); --import also imports the
+                                                  drivers, in the extension's Python
 
     insthub service install TARGET [--name NAME] [--python PATH] [--no-login]
                                                   keep a server running in the background (systemd user service);
@@ -189,23 +196,81 @@ def _cmd_call(args) -> int:
     start = time.perf_counter()
     result = dev.bus.call(args.command, *positional, **keyword)
     elapsed = time.perf_counter() - start
-    if args.save:
-        path = Path(args.save)
-        if isinstance(result, (bytes, bytearray)):
-            path.write_bytes(result)
-        elif isinstance(result, np.ndarray):
-            np.save(path, result)
-        elif dataclasses.is_dataclass(result) or isinstance(result, dict):
-            fields = result if isinstance(result, dict) else \
-                {f.name: getattr(result, f.name) for f in dataclasses.fields(result)}
-            np.savez(path, **fields)
-        else:
-            path.write_text(_show(result) + "\n")
-        print(f"saved to {path}")
+    code = _print_result(result, args.save)
+    print(f"({elapsed * 1e3:.2f} ms)", file=sys.stderr)
+    return code
+
+
+def _print_result(result, save: str | None = None) -> int:
+    """Print what a command or a recipe returned (nothing for None), arrays and bytes in brief; or,
+    with `save`, write it to that file (see _save).  Returns the exit code: 1 if it could not be
+    saved, and then it is printed instead, so that it is not lost."""
+    if save:
+        try:
+            saved = _save(result, Path(save).expanduser())
+        except Exception as e:  # noqa: BLE001 - whatever it is, what ran must not be lost
+            print(_show(result))
+            print(f"error: cannot save it to {save}: {type(e).__name__}: {e} (it is printed above)", file=sys.stderr)
+            return 1
+        print(f"saved to {saved}")
     elif result is not None:
         print(_show(result))
-    print(f"({elapsed * 1e3:.2f} ms)", file=sys.stderr)
     return 0
+
+
+def _save(result, path: Path) -> str:
+    """Write a result to a file, and say where: bytes as they are; an array as .npy; a dict or a
+    dataclass as .npz, an array per key (as np.savez(**it) would, whatever the keys); a list or a
+    tuple that holds arrays as .npz, an array per item (arr_0, arr_1, ..., as np.savez(*it)
+    would); anything else as text.  numpy adds .npy or .npz to a name that has not; a value
+    that is no plain array (None, a dict) is pickled, so np.load(file, allow_pickle=True) reads it."""
+    if isinstance(result, (bytes, bytearray)):
+        path.write_bytes(result)
+        return str(path)
+    if isinstance(result, np.ndarray):
+        path = path if path.suffix == ".npy" else path.with_name(path.name + ".npy")
+        np.save(path, result)
+        return str(path)
+    if dataclasses.is_dataclass(result) and not isinstance(result, type):
+        items = [(f.name, getattr(result, f.name)) for f in dataclasses.fields(result)]
+    elif isinstance(result, dict):
+        items = [(str(k), v) for k, v in result.items()]
+    elif isinstance(result, (list, tuple)) and any(isinstance(v, np.ndarray) for v in result):
+        items = [(f"arr_{i}", v) for i, v in enumerate(result)]
+    else:
+        path.write_text(_show(result) + "\n")
+        return str(path)
+    names = [name for name, _ in items]
+    twice = next((name for name in names if names.count(name) > 1), None)
+    if twice is not None:
+        raise ValueError(f"two of its keys are both {twice!r} as text")
+    path = path if path.suffix == ".npz" else path.with_name(path.name + ".npz")
+    _savez(path, items)
+    return f"{path} ({', '.join(names)})" if names else str(path)
+
+
+def _savez(path: Path, items: list) -> None:
+    """np.savez, without keyword arguments: no key ("file", "allow_pickle", 1) can clash with its own."""
+    import zipfile
+
+    def array(value):
+        try:
+            return np.asanyarray(value)
+        except ValueError:  # arrays of several lengths: kept as they are
+            return np.array(value, dtype=object)
+
+    z = zipfile.ZipFile(path, "w", zipfile.ZIP_STORED, allowZip64=True)
+    try:
+        with z:
+            for name, value in items:
+                with z.open(f"{name}.npy", "w", force_zip64=True) as f:
+                    np.lib.format.write_array(f, array(value), allow_pickle=True)
+    except BaseException:
+        try:
+            path.unlink()  # (not half a file)
+        except OSError:
+            pass
+        raise
 
 
 def _cmd_get(args) -> int:
@@ -554,19 +619,233 @@ def _cmd_ext(args) -> int:
         uis = [f"{ui.name} ({'app' if ui.run else 'panel'}{', for ' + ', '.join(ui.types) if ui.types else ''})"
                for ui in ext.ui.values()]
         for what, text in (("folder", str(ext.folder)), ("devices", ", ".join(ext.devices)), ("ui", ", ".join(uis)),
-                           ("error", ext.error), ("hidden", ext.hidden_by and f"by {ext.hidden_by}")):
+                           ("recipes", ", ".join(_recipe_file_text(path, ext.folder) for path in ext.recipes)),
+                           ("error", ext.error),
+                           ("hidden", ext.hidden_by and f"by {ext.hidden_by}")):
             if text:
                 print(f"    {what:8s} {text}")
     return 0
 
 
-def _cmd_check(args) -> int:
+def _recipe_file_text(path: Path, folder: Path) -> str:
+    """A file of an extension's recipes, as `insthub ext list` shows it: "recipes/lab.py (setup, scan)"."""
+    from . import recipes
+
+    shown = path.relative_to(folder) if path.is_relative_to(folder) else path
+    found, problems = recipes.read_file(path)
+    if problems:
+        return f"{shown} (cannot be read: insthub check {path} says why)"
+    return f"{shown} ({', '.join(r.name + (' (cannot be used)' if r.error else '') for r in found) or 'no recipe'})"
+
+
+def _strict_json(value) -> bool:
+    """Whether strict JSON holds `value` as it is (not inf or nan, no key that is not text, ...)."""
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        return False
+    return True
+
+
+def _as_json(value):
+    """`value` as strict JSON can hold it: as it is when it can; else dicts with their keys as text,
+    lists for tuples, and the text of anything else (inf, nan, a set, bytes)."""
+    if _strict_json(value):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _as_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_as_json(v) for v in value]
+    return repr(value) if isinstance(value, float) else str(value)
+
+
+def _param_json(param) -> dict:
+    """A recipe's parameter in `insthub recipes --json`: its default if the file writes it as a literal
+    that JSON can hold (inf, a set or a dict with keys that are not text it cannot), and as the file
+    writes it."""
+    out = {}
+    if not param.required:
+        if param.literal and _strict_json(param.default):
+            out["default"] = param.default
+        out["default_text"] = param.default_text
+    return {**out, "required": param.required, "annotation": param.annotation, "doc": param.doc,
+            "meta": _as_json(param.meta)}
+
+
+def _cmd_recipes(args) -> int:
+    from . import recipes
+
+    found, problems = recipes.available()
+    listed = [r for r in found if args.device in r.devices] if args.device else found
+    if args.json:
+        for problem in problems:
+            print(f"error: {problem}", file=sys.stderr)
+        print(json.dumps(_as_json([{"name": r.name, "full_name": r.full_name, "title": r.title, "doc": r.doc,
+                                    "file": str(r.file), "line": r.line, "origin": r.origin,
+                                    "devices": list(r.devices),
+                                    "params": {p.name: _param_json(p) for p in r.params.values()},
+                                    "dangerous": r.dangerous, "error": r.error} for r in listed]),
+                         indent=2, allow_nan=False))
+        return 0
+    if not listed:
+        print((f"no recipe uses {args.device}" if args.device else "no recipes") +
+              f": write one in {recipes.folder()} (a function in a .py file; see docs/guide.md#recipes), or run a "
+              "command on a device's page in insthub gui, then Save as recipe")
+    file = None
+    for r in listed:
+        if r.file != file:
+            file = r.file
+            print(f"{r.where()}: {r.file}")
+        title = " ".join(filter(None, [r.title if r.title != r.name else "", r.dangerous and "(marked dangerous)"]))
+        # (what to type to run it: its name; FILE.function when another has its name; its path when
+        # another has its FILE.function too and is the one that name runs)
+        print(f"    {recipes.runs_as(r, found):16s} {title}".rstrip())
+        devices = ", ".join(r.devices) + (" and one named only when it runs" if r.named_later else "")
+        for what, text in (("params", ", ".join(p.text() for p in r.params.values())), ("devices", devices),
+                           ("error", r.error)):
+            if text:
+                print(f"        {what:8s} {text}")
+    if problems:
+        print("not listed:")
+        for problem in problems:
+            print(f"    {problem}")
+    return 0
+
+
+_STOP_GRACE = 3.0  #: seconds a recipe that Ctrl-C reached has to end by itself before `insthub run` stops it
+
+
+def _cmd_run(args) -> int:
+    from . import recipes
+
+    recipe = recipes.find(args.recipe)
+    positional, values = parse_params(args.values)
+    if positional:
+        print(f"error: give each value with its parameter's name, as NAME=VALUE (recipe {recipe.full_name} takes "
+              f"{', '.join(recipe.params) or 'none'})", file=sys.stderr)
+        return 2
+    recipes.check_values(recipe, values)
+    checked = recipes.check(recipe)
+    name = recipe.full_name
+    title = f": {recipe.title}" if recipe.title != recipe.name else ""
+    simulated = f" (simulated: {', '.join(checked.simulated)})" if checked.simulated else ""
+    print(f"{name}{title} ({recipe.where()}){simulated}", flush=True)
+    if checked.problems:
+        for problem in checked.problems:
+            print(f"error: {problem}", file=sys.stderr)
+        print("nothing ran", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        _print_check(recipe, values, checked)
+        print("(checked; nothing ran)")
+        return 0
+    if checked.dangers and not args.yes:
+        what = "; ".join(checked.dangers)
+        if not _can_ask():
+            print(f"error: it uses what is marked dangerous ({what}): add --yes to run it", file=sys.stderr)
+            return 1
+        # (on stderr: stdout is what the recipe prints and returns, perhaps into a file)
+        print(f"It uses what is marked dangerous ({what}). Run it? [y/N] ", end="", file=sys.stderr, flush=True)
+        try:
+            answer = input()
+        except EOFError:  # (Ctrl-D: no)
+            answer = ""
+            print(file=sys.stderr)
+        if answer.strip().lower() not in ("y", "yes"):
+            print("nothing ran", file=sys.stderr)
+            return 1
+    run = recipes.start(recipe, values, capture=False)  # (what it prints, and its traceback, go to this terminal)
+    why = None
+    try:
+        try:
+            result = run.wait(args.timeout)
+        except TimeoutError:
+            why = "--timeout"
+            print(f"stopping {name}: it is still running after {args.timeout:g} s (--timeout)", file=sys.stderr,
+                  flush=True)
+            result = _stop(run, 0.0)
+        except KeyboardInterrupt:
+            why = "Ctrl-C"
+            print(f"\nstopping {name} (Ctrl-C)", file=sys.stderr, flush=True)
+            result = _stop(run, _STOP_GRACE)
+    except recipes.RecipeError as e:
+        if why == "Ctrl-C":
+            print(f"{name} was stopped before it finished", file=sys.stderr)
+            return 130
+        print(f"error: {name} was stopped before it finished" if why else f"error: {e}", file=sys.stderr)
+        return 1
+    code = _print_result(result, args.save)  # (one stopped that returned all the same: what it returned)
+    print(f"({run.elapsed:.2f} s" + (f"; it returned this once {why} stopped it)" if why else ")"), file=sys.stderr)
+    return code
+
+
+def _can_ask() -> bool:
+    """Whether `insthub run` can ask its question: someone at a terminal reads stderr and types on stdin."""
+    return all(stream is not None and stream.isatty() for stream in (sys.stdin, sys.stderr))
+
+
+def _stop(run, grace: float):
+    """End a recipe that `insthub run` started, and return what run.wait() returns: what the recipe
+    returned, if it did (one that catches KeyboardInterrupt can); else it raises RecipeError, as the
+    recipe was stopped.  The recipe first has `grace` seconds to end by itself:
+    Ctrl-C in this terminal reaches it too, as KeyboardInterrupt, and its finally blocks are running,
+    which run.stop() would interrupt.  Ctrl-C while this waits stops it at once."""
+    try:
+        return run.wait(grace)
+    except (TimeoutError, KeyboardInterrupt):
+        pass
+    run.stop()  # (killed if it is still running 3 s later)
+    while True:
+        try:
+            return run.wait()
+        except KeyboardInterrupt:
+            run.stop()
+
+
+def _print_check(recipe, values: dict, checked) -> None:
+    """What `insthub run --dry-run` shows: where the recipe is, the values it would run with, the
+    devices it uses and what of them (with the line), what of it is dangerous, and what check() could
+    not see."""
+    given = [f"{k}={json.dumps(v, default=str)}" for k, v in values.items()]
+    kept = [f"{p.name}={p.default_text}" for p in recipe.params.values() if p.name not in values]
+    devices = ", ".join(recipe.devices) or "none that insthub sees in its code"
+    rows = [("file", f"{recipe.file}:{recipe.line}"), ("values", ", ".join(given + kept)),
+            ("devices", devices + (" (and one named only when it runs)" if recipe.named_later else ""))]
+    rows += [("uses" if i == 0 else "", f"{use.text()}  ({use.where()})") for i, use in enumerate(recipe.uses)]
+    rows += [("dangerous", danger) for danger in checked.dangers] + [("note", note) for note in checked.notes]
+    for what, text in rows:
+        if text:
+            print(f"  {what:9s} {text}")
+
+
+def _imports_drivers(path: Path) -> bool:
+    """Whether `insthub check PATH --import` would import drivers: a server's .toml, or an extension
+    that adds devices (not a file of recipes, nor an extension of recipes only)."""
     from . import extensions
 
-    problems = extensions.check(args.path, import_=args.import_)
-    print("\n".join(problems) or f"{args.path}: no problems found" +
-          ("" if args.import_ else " (--import also imports the drivers)"))
-    return 1 if problems else 0
+    if path.suffix == ".py":
+        return False
+    if path.suffix == ".toml" and path.name != extensions.MANIFEST:
+        return True
+    manifest = extensions.find_manifest(path) if path.is_dir() else path
+    return manifest is not None and bool(extensions.load(manifest).devices)
+
+
+def _cmd_check(args) -> int:
+    from . import extensions, recipes
+
+    path = Path(args.path).expanduser()
+    problems = extensions.check(path, import_=args.import_)
+    if problems:
+        print("\n".join(problems))
+        return 1
+    if path.suffix == ".py":
+        found = ", ".join(r.name for r in recipes.read_file(path)[0])
+        print(f"{args.path}: no problems found" + (f"; its recipes: {found}" if found else ""))
+    else:
+        hint = not args.import_ and _imports_drivers(path)
+        print(f"{args.path}: no problems found" + (" (--import also imports the drivers)" if hint else ""))
+    return 0
 
 
 def main(argv=None) -> int:
@@ -584,7 +863,8 @@ def main(argv=None) -> int:
     s.add_argument("device")
     s.add_argument("command")
     s.add_argument("params", nargs="*", help="positional values and key=value pairs")
-    s.add_argument("--save", metavar="FILE", help="write the result to a file (bytes raw, arrays as .npy/.npz)")
+    s.add_argument("--save", metavar="FILE", help="write the result to a file (bytes raw, an array as .npy; a dict, "
+                                                  "or a tuple of arrays, as .npz; else as text)")
     s.set_defaults(fn=_cmd_call)
     s = sub.add_parser("get", help="read a property")
     s.add_argument("device")
@@ -619,6 +899,22 @@ def main(argv=None) -> int:
     s.add_argument("device")
     s.add_argument("ui", nargs="?", help="which one, when there are several (without it, they are listed)")
     s.set_defaults(fn=_cmd_open)
+    s = sub.add_parser("run", help="run a recipe, a function of yours kept in a .py file, in a process of its own: "
+                                   "insthub run square freq=2e3")
+    s.add_argument("recipe", help="its name, FILE.function (as insthub recipes lists it), or path/to/file.py:function")
+    s.add_argument("values", nargs="*", metavar="NAME=VALUE", help="its parameters; the others keep their defaults")
+    s.add_argument("-n", "--dry-run", action="store_true",
+                   help="check its devices and show what it uses of them; run nothing")
+    s.add_argument("-y", "--yes", action="store_true", help="run it without asking when it uses what is marked "
+                                                            "dangerous")
+    s.add_argument("--timeout", type=float, metavar="S", help="stop it if it is still running after S seconds")
+    s.add_argument("--save", metavar="FILE", help="write what it returns to a file (bytes raw, an array as .npy; a "
+                                                  "dict, or a tuple of arrays, as .npz; else as text)")
+    s.set_defaults(fn=_cmd_run)
+    s = sub.add_parser("recipes", help="the recipes this computer knows of; with DEVICE, those that use it")
+    s.add_argument("device", nargs="?")
+    s.add_argument("--json", action="store_true", help="as JSON")
+    s.set_defaults(fn=_cmd_recipes)
     s = sub.add_parser("panel", help="show a panel for a device in a window of its own (insthub open runs this)")
     s.add_argument("device")
     s.add_argument("panel", metavar="MODULE:FUNCTION", help="the panel: make(device, parent=None) -> QWidget")
@@ -655,8 +951,10 @@ def main(argv=None) -> int:
                        ).add_argument("--json", action="store_true", help="as JSON")
     actions.add_parser("add", help="add an extension's folder to your list").add_argument("path")
     actions.add_parser("remove", help="take a folder off your list").add_argument("path")
-    s = sub.add_parser("check", help="what is wrong with an extension, or with the extensions of a server file")
-    s.add_argument("path", help="an extension's folder, its insthub-extension.toml, or a server's .toml")
+    s = sub.add_parser("check", help="what is wrong with an extension, with the extensions of a server file, or "
+                                     "with a file of recipes")
+    s.add_argument("path", help="an extension's folder, its insthub-extension.toml, a server's .toml, or a .py "
+                                "file of recipes")
     s.add_argument("--import", dest="import_", action="store_true",
                    help="also import the drivers, in the extension's Python (for a server file: the checks of "
                         "`insthub service install`)")

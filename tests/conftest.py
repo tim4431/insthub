@@ -12,11 +12,13 @@ from insthub import registry, sim
 @pytest.fixture(autouse=True)
 def _isolated_bus(tmp_path_factory, monkeypatch):
     """Each test gets its own runtime directory: no interference with real servers.  Of the
-    extensions, only insthub's own: not those this computer's user, services and servers have."""
+    extensions, only insthub's own: not those this computer's user, services and servers have.
+    Your recipes: a folder of the test's own, which does not exist until a test writes in it."""
     path = tmp_path_factory.mktemp("bus")
     monkeypatch.setenv("INSTHUB_DIR", str(path))
     monkeypatch.setenv("INSTHUB_DEVICES", str(path / "devices.toml"))
     monkeypatch.setenv("INSTHUB_EXTENSIONS", "none")
+    monkeypatch.setenv("INSTHUB_RECIPES", str(path / "recipes"))
     yield
     insthub.close_all()
     for server in insthub.server.local_servers():
