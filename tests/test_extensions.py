@@ -2,6 +2,8 @@
 says its devices come from, and `insthub ext` / `insthub check` (see docs/design.md#extensions)."""
 import json
 import os
+import shlex
+import stat
 import sys
 import textwrap
 from pathlib import Path
@@ -113,13 +115,16 @@ def test_a_manifest_is_read_as_data(tmp_path):
     (("[devices.analyzer]", "[devices.'my analyzer']"), "bad [devices.NAME] name 'my analyzer'"),
     (('panel = "hpdrv_ui:make"', ""), "[ui.quick] needs one of run = [...] (an app) and panel ="),
     (('title = "Spectrum analyzer"', 'panel = "x:y"'), "[ui.analyzer] needs one of run"),
-    (('run = ["-m"', 'run = [1, "-m"'), "[ui.analyzer] run: should be a list of arguments"),
+    (('run = ["-m"', 'run = [1, "-m"'), "[ui.analyzer] run: should be a list of one or more arguments"),
+    (('run = ["-m", "hpdrv_ui", "--address", "{address}", "--name", "{device}"]', "run = []"),
+     '[ui.analyzer] run: should be a list of one or more arguments, as ["-m", "mypackage.ui"], not []'),
 ])
 @pytest.mark.filterwarnings("ignore::insthub.config.ConfigWarning")  # (what it does not read: tested below)
 def test_what_makes_a_manifest_unusable_is_its_error(tmp_path, change, error):
     folder = extension(tmp_path / "hp", HP.replace(*change))
     ext = extensions.load(folder / extensions.MANIFEST)  # never raises
     assert not ext.usable and error in ext.error, ext.error
+    assert all(ui.run or ui.panel for ui in ext.ui.values())  # a UI that names nothing to start is none
     problems = extensions.check(folder)
     assert problems and all(p.startswith(f"{folder / extensions.MANIFEST}: ") for p in problems)
     assert any(error in p for p in problems)
@@ -457,8 +462,9 @@ def test_launch_starts_an_app_or_a_panel_with_the_extension_s_python(tmp_path, m
     ext = extensions.load(folder / extensions.MANIFEST)
     app = extensions.launch(ext, "analyzer", "sa", "tcp://labpc:8700")
     assert app.failure(wait=20) is None and not app.running and app.title == "Spectrum analyzer for sa"
-    said = app.log.read_text().splitlines()
-    assert app.log == insthub.registry.runtime_dir() / "ui" / "sa-analyzer.log"
+    started, *said = app.log.read_text().splitlines()
+    assert app.log == insthub.registry.runtime_dir() / "ui" / "sa" / "analyzer.log"
+    assert started.startswith("--- ") and started.endswith(f": {shlex.join(app.process.args)}")  # when, and what ran
     assert said == ["args ['--address', 'tcp://labpc:8700', '--name', 'sa', '{other}', '{\"a\": 1}']",
                     f"cwd {folder}", f"path {folder}"]  # in its folder, which is first on its PYTHONPATH
     monkeypatch.setenv("APP_EXIT", "3")
@@ -495,6 +501,78 @@ def test_a_program_started_in_the_background_says_why_it_failed(tmp_path):
     slow.process.kill()
     slow.process.wait(10)
     assert slow.failure() is None and not slow.running                   # ended by a signal: by whoever sent it
+
+
+def test_what_a_program_said_is_its_own_not_an_earlier_run_s():
+    from insthub import inventory
+
+    log = inventory.ui_log("sa", "quick")                                # a log keeps every run of what writes to it
+    first = inventory.spawn([sys.executable, "-c", "import sys; sys.exit('No module named PyQt6')"], log, "a")
+    assert first.failure(wait=20) == "No module named PyQt6"
+    again = inventory.spawn([sys.executable, "-c", "import sys; sys.exit(3)"], log, "b")
+    assert again.failure(wait=20) == "exit code 3"                      # it said nothing: not what the first said
+    runs = [line for line in log.read_text().splitlines() if line.startswith("--- ")]
+    assert len(runs) == 2 and runs[1].endswith("sys.exit(3)'")           # each run says when it started, and what
+
+
+def test_the_logs_of_a_device_s_windows_are_in_a_folder_of_its_own():
+    from insthub import inventory
+
+    ui = insthub.registry.runtime_dir() / "ui"
+    assert inventory.ui_log("a-b", "c") == ui / "a-b" / "c.log" != inventory.ui_log("a", "b-c")
+    assert inventory.ui_log("scope") == ui / "scope" / "_view.log" != inventory.ui_log("scope", "view")  # live view
+    for device, name in (("../x", None), ("sa", "../x"), ("sa/x", "q"), ("", None), ("sa", "_view")):
+        with pytest.raises(ValueError, match="bad (device|UI) name"):  # a device's name came over the network
+            inventory.ui_log(device, name)
+
+
+def test_the_uis_of_a_server_s_devices_are_found_all_at_once(home, tmp_path, monkeypatch):
+    listed = extension(tmp_path / "listed")
+    extensions.add_folder(listed)
+    calls = []
+    real = extensions.discover
+    monkeypatch.setattr(extensions, "discover", lambda: calls.append(1) or real())
+    devices = {f"sa{i}": {"name": f"sa{i}", "type": "Analyzer", "extension": "hp8562a"} for i in range(5)}
+    found = extensions.server_uis({**devices, "box": {"type": "Box", "extension": ["a", "list"]}}, "tcp://labpc:8700")
+    assert len(calls) == 1                                               # a server elsewhere: one discovery for all
+    assert all(found[name][0].folder == listed and len(found[name][1]) == 2 for name in devices)
+    assert found["box"] == (None, [], None)                              # what came over the network is only compared
+    mine = extension(tmp_path / "mine")
+    registered("here", {name: [str(mine)] for name in devices})
+    calls.clear()
+    found = extensions.server_uis(devices, "ipc:///nowhere.sock")         # a server here: its devices' own folders ...
+    assert {found[name][0].folder for name in devices} == {mine} and calls == []  # ... and no discovery at all
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="Unix permissions")
+def test_an_extension_that_other_users_may_change_runs_nothing(tmp_path, monkeypatch):
+    import grp
+
+    folder = extension(tmp_path / "hp", HP.replace("api = 1", f'api = 1\npython = "{sys.executable}"'))
+    manifest = folder / extensions.MANIFEST
+    assert extensions.load(manifest).usable                              # yours (also with a umask of 002): fine
+    manifest.chmod(manifest.stat().st_mode | stat.S_IWOTH)
+    ext = extensions.load(manifest)
+    assert ext.error.startswith(f"every user may change {manifest} (chmod o-w {manifest}): insthub runs nothing it "
+                                "names") and ext.python is None
+    with pytest.raises(ValueError, match="cannot be used"):
+        extensions.launch(ext, "analyzer", "sa", "tcp://labpc:8700")
+    assert any("every user may change" in p for p in extensions.check(folder, import_=True))  # nor imports anything
+    manifest.chmod(0o644)
+    folder.chmod(folder.stat().st_mode | stat.S_IWOTH)                   # its folder, as /tmp: anyone may put a
+    assert f"every user may change {folder} " in extensions.load(manifest).error  # module, or a manifest, in it
+    folder.chmod(folder.stat().st_mode & ~stat.S_IWOTH | stat.S_IWGRP)
+    with monkeypatch.context() as m:
+        m.setattr(extensions, "_shared_group", lambda gid: "lab")       # a group with others in it
+        assert f"the users of group lab may change {folder} (chmod g-w {folder})" in extensions.load(manifest).error
+        m.setattr(extensions, "_shared_group", lambda gid: None)        # a group of your own alone (a umask of 002
+        assert extensions.load(manifest).usable                          # makes files writable for it): fine
+    uid = os.getuid()
+    if uid != 0:
+        assert extensions._shared_group(0) == grp.getgrgid(0).gr_name    # root's group is not this user's alone
+        with monkeypatch.context() as m:
+            m.setattr(extensions.os, "getuid", lambda: uid + 1)          # as another user sees it
+            assert extensions.load(manifest).error.startswith(f"{manifest} belongs to another user: insthub runs")
 
 
 def test_insthub_open_opens_the_ui_of_a_device(home, tmp_path, monkeypatch, capsys):

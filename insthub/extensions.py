@@ -27,6 +27,7 @@ module; the command line and the window do.
     discover()                      the extensions this computer knows of; of one id, the first usable
     for_device(described, folders)  the extension of a device, from its describe()
     device_uis(described, address)  the UIs a device can open here, or why it has none
+    server_uis(devices, address)    the same for each device of a server, all at once
     launch(ext, ui, device, address)  start one, in a program of its own, with the extension's Python
     add_folder(), remove_folder()   your list of extension folders (extensions.toml)
     check(path, import_=False)      what is wrong with an extension, or with a server file's
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import functools
 import json
 import os
 import re
@@ -50,6 +52,8 @@ from .config import ConfigWarning, _Kind
 from .errors import BusError, did_you_mean
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .inventory import Launched
 
 API = 1  #: the newest manifest format this insthub reads
@@ -81,6 +85,11 @@ class UI:
     run: tuple | None = None
     panel: str | None = None
     types: tuple = ()
+
+    @property
+    def kind(self) -> str:
+        """What it is: an "app" (it has `run`) or a "panel"."""
+        return "app" if self.run is not None else "panel"
 
     def fits(self, described: dict) -> bool:
         """Whether it is for that device (its describe())."""
@@ -142,8 +151,8 @@ class Extension:
 
 # ---------------------------------------------------------------- reading a manifest
 _WHOLE = _Kind("a whole number", lambda v: isinstance(v, int) and not isinstance(v, bool))
-_ARGS = _Kind('a list of arguments, as ["-m", "mypackage.ui"]',
-              lambda v: isinstance(v, list) and all(isinstance(a, str) for a in v))
+_ARGS = _Kind('a list of one or more arguments, as ["-m", "mypackage.ui"]',
+              lambda v: isinstance(v, list) and len(v) > 0 and all(isinstance(a, str) for a in v))
 _FUNCTION = _Kind('text as "module:function"', config._DRIVER.test)
 
 #: The keys of [extension] and of a [ui.NAME] that insthub reads, with the kind of value each
@@ -191,13 +200,15 @@ def _offer(name: str, table: dict, problems: list, notes: list) -> DeviceOffer |
     return DeviceOffer(name, table["driver"], doc, {k: v for k, v in table.items() if k not in ("driver", "doc")})
 
 
-def _ui(name: str, table: dict, problems: list, notes: list) -> UI:
-    """A [ui.NAME] table: an app or a panel."""
+def _ui(name: str, table: dict, problems: list, notes: list) -> UI | None:
+    """A [ui.NAME] table: an app or a panel; None if it names neither (a problem says so)."""
     where = f"[ui.{name}]"
     found = _fields(table, _UI, where, problems)
     notes += _unread(table, _UI, where)
     if ("run" in table) == ("panel" in table):
         problems.append(f'{where} needs one of run = [...] (an app) and panel = "module:make" (a panel)')
+    if "run" not in found and "panel" not in found:  # (one of the wrong kind, such as run = [], is a problem)
+        return None
     run = found.get("run")
     return UI(name, found.get("title", name), None if run is None else tuple(run), found.get("panel"),
               tuple(found.get("types", ())))
@@ -247,11 +258,16 @@ def _read(manifest: str | Path, source: str = "") -> tuple[Extension, list[str],
                         f"api = {API}): update insthub")
     elif api < 1:
         problems.append(f"[extension] api: should be 1 or more, not {api}")
+    shared = None if manifest == OWN else _shared(manifest)
+    if shared:
+        problems.append(f"{shared}: insthub runs nothing it names, since its manifest and its folder must be yours (or "
+                        "root's), and no one else's to change")
     if _own(manifest):  # its code comes with (that copy of) insthub, whose version it has
-        python = sys.executable
+        python = None if shared else sys.executable
         version = about.get("version") or _assigned(manifest.with_name("_version.py"), "__version__") or ""
     else:
-        python, version = _python(about.get("python"), manifest.parent, problems), about.get("version", "")
+        python = None if shared else _python(about.get("python"), manifest.parent, problems)
+        version = about.get("version", "")
     adds = {}
     for kind, read in _ADDS.items():
         tables = doc.get(kind, {})
@@ -271,9 +287,52 @@ def _read(manifest: str | Path, source: str = "") -> tuple[Extension, list[str],
 def load(manifest: str | Path, source: str = "") -> Extension:
     """The extension of a manifest file.  Never raises: one that cannot be used (it is not valid
     TOML, its api is too new, its id is not a valid name, an entry lacks what it needs, it has no
-    Python) says why in its `error`.  Keys that this insthub does not read are left alone, so
-    that a manifest written for a newer insthub still works (check() warns about them)."""
+    Python, another user may change it: see _shared) says why in its `error`.  Keys that this
+    insthub does not read are left alone, so that a manifest written for a newer insthub still
+    works (check() warns about them)."""
     return _read(manifest, source)[0]
+
+
+def _shared(manifest: Path) -> str | None:
+    """Who other than this user may change an extension's manifest (what it says is run) or its
+    folder (where a manifest may be put, and whose modules its UIs and checks import first): the
+    user who owns one, every user, or a group with others in it; None if no one but this user (or
+    root) may.  A manifest found in a folder above a device's code, such as /tmp, may have been put
+    there by anyone.  None on Windows, whose folders are their user's."""
+    if not hasattr(os, "getuid"):
+        return None
+    for path in (manifest, manifest.parent):
+        try:
+            st = os.stat(path)
+        except OSError as e:
+            return f"cannot tell who may change {path}: {e.strerror}"
+        if st.st_uid not in (os.getuid(), 0):
+            return f"{path} belongs to another user"
+        if st.st_mode & 0o002:
+            return f"every user may change {path} (chmod o-w {path})"
+        group = _shared_group(st.st_gid) if st.st_mode & 0o020 else None
+        if group is not None:
+            return f"the users of group {group} may change {path} (chmod g-w {path})"
+    return None
+
+
+def _shared_group(gid: int) -> str | None:
+    """The name of a group that users other than this one may be in: any but this user's primary
+    group with no one else listed in it (a user private group, which a umask of 002 makes files
+    writable for); None for that one."""
+    import grp
+    import pwd
+
+    try:
+        group = grp.getgrgid(gid)
+    except KeyError:
+        return str(gid)
+    try:
+        me = pwd.getpwuid(os.getuid())
+    except KeyError:
+        return group.gr_name
+    alone = gid == me.pw_gid and all(member == me.pw_name for member in group.gr_mem)
+    return None if alone else group.gr_name
 
 
 def _python(declared: str | None, folder: Path, problems: list) -> str | None:
@@ -388,11 +447,11 @@ def _entry_folders(entry: dict) -> dict[str, list[str]]:
             for name, listed in (folders.items() if isinstance(folders, dict) else ()) if isinstance(listed, list)}
 
 
-def device_folders(device: str, address: str) -> list[str] | None:
-    """The folders of a device's code, from the registry file of its server if that runs on this
-    computer (as one of its addresses says); None for a device on another computer."""
-    return next((_entry_folders(entry).get(device, []) for entry in registry.find(device)
-                 if address in entry.get("addresses", ())), None)
+def server_folders(address: str) -> dict[str, list[str]] | None:
+    """The folders of the code of each device of the server at `address`, from its registry file
+    if it runs on this computer (as one of its addresses says); None for one on another computer."""
+    return next((_entry_folders(entry) for entry in registry.servers() if address in entry.get("addresses", ())),
+                None)
 
 
 def _code_folders(path: Path) -> list[Path]:
@@ -453,7 +512,8 @@ def discover() -> list[Extension]:
     return found
 
 
-def for_device(described: dict, folders: list[str] | None = None) -> Extension | None:
+def for_device(described: dict, folders: list[str] | None = None,
+               discovered: Callable[[], list[Extension]] | None = None) -> Extension | None:
     """The extension of a device, from its describe(): the manifest found from the device's own
     folders (`folders`, from the registry file of its server on this computer) whose id is the
     one the device announces, so that the very copy its server runs is the one used; else the
@@ -461,7 +521,8 @@ def for_device(described: dict, folders: list[str] | None = None) -> Extension |
     says why).  A device of insthub's own extension gets this insthub's, whichever copy of
     insthub its server runs (see _own): its code comes with insthub, and runs where insthub
     does.  None if the device names no extension, or none here has its id.  Only the id is
-    compared: a name that came over the network runs nothing."""
+    compared: a name that came over the network runs nothing.  `discovered`: what gives the
+    discovered extensions (default: discover), for looking up several devices with one."""
     wanted = described.get("extension")
     if not isinstance(wanted, str) or not wanted:
         return None
@@ -472,7 +533,7 @@ def for_device(described: dict, folders: list[str] | None = None) -> Extension |
         ext = load(OWN, "insthub") if _own(manifest) else load(manifest, "device")
         if ext.id == wanted:
             return ext
-    same = [ext for ext in discover() if ext.id == wanted]
+    same = [ext for ext in (discovered or discover)() if ext.id == wanted]
     return next((ext for ext in same if ext.usable), same[0] if same else None)
 
 
@@ -481,14 +542,28 @@ def device_uis(described: dict, address: str) -> tuple[Extension | None, list[UI
     extension, as for_device() finds it from the device's own folders when its server runs here;
     the UIs of it that are for this device; why there are none when that is not up to the
     extension: it is not on this computer, or cannot be used)."""
-    wanted = described.get("extension")
-    ext = for_device(described, device_folders(described.get("name", ""), address))
-    if ext is None:
-        why = f"extension {wanted} is not installed on this computer: insthub ext add FOLDER" if wanted else None
-        return None, [], why
-    if ext.error:
-        return ext, [], f"extension {wanted} cannot be used: {ext.error}"
-    return ext, [ui for ui in ext.ui.values() if ui.fits(described)], None
+    name = described.get("name", "")
+    return server_uis({name: described}, address)[name]
+
+
+def server_uis(devices: dict[str, dict], address: str) -> dict[str, tuple[Extension | None, list[UI], str | None]]:
+    """device_uis() of each of a server's devices (`devices`: name -> its describe(); `address`: the
+    server's), by name.  It reads the server's registry file once, and discovers the extensions of
+    this computer once at most, when a device's own folders do not give its extension."""
+    folders = server_folders(address)
+    discovered = functools.cache(discover)
+    found = {}
+    for name, described in devices.items():
+        wanted = described.get("extension")
+        ext = for_device(described, None if folders is None else folders.get(name, []), discovered)
+        if ext is None:
+            found[name] = None, [], (f"extension {wanted} is not installed on this computer: insthub ext add FOLDER"
+                                     if isinstance(wanted, str) and wanted else None)
+        elif ext.error:
+            found[name] = ext, [], f"extension {wanted} cannot be used: {ext.error}"
+        else:
+            found[name] = ext, [ui for ui in ext.ui.values() if ui.fits(described)], None
+    return found
 
 
 def add_folder(path: str | Path) -> Extension:
@@ -548,7 +623,7 @@ def launch(ext: Extension, ui_name: str, device: str, address: str) -> Launched:
     values = {"device": registry.check_name(device, "device name"), "address": address}
     if wire.parse_address(address)[0] == "inproc":
         raise ValueError(f"{address}: only the program that hosts it can reach it")
-    if ui.run:  # (a placeholder it does not know stays as it is)
+    if ui.kind == "app":  # (a placeholder it does not know stays as it is)
         args = [re.sub(r"\{(\w+)\}", lambda m: values.get(m[1], m[0]), arg) for arg in ui.run]
     else:
         args = ["-m", "insthub", "-a", address, "panel", device, ui.panel, f"--title={ui.title}"]

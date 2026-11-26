@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 
 from . import registry, service
-from .client import PROCESS_TOKEN, Client, _SocketTransport, connect, discover
+from .client import PROCESS_TOKEN, Client, connect, discover
 from .device import busy_with, summarize
 from .errors import BusError
 from .extensions import venv_python
@@ -56,11 +56,12 @@ class Backend:
         self._lock = threading.Lock()
 
     def scan(self) -> dict:
-        """Running servers, the hand-written table of remote devices, installed services."""
+        """Running servers, the servers on other computers that devices.toml names (with the
+        devices it lists there: registry.remote_addresses), installed services."""
         try:
-            remote, remote_error = registry.static_devices(), None
-        except (OSError, ValueError) as e:
-            remote, remote_error = {}, f"devices.toml: {e}"
+            remote, remote_error = registry.remote_addresses(), None
+        except BusError as e:  # (it names the file)
+            remote, remote_error = {}, str(e)
         try:
             units = service.units()
         except BusError:
@@ -72,10 +73,7 @@ class Backend:
             client = self._clients.get(address)
         if client is not None and not client.closed:
             return client
-        if address.startswith("inproc://"):
-            client = connect(address)
-        else:
-            client = Client(_SocketTransport(address, connect_timeout=2.0))
+        client = connect(address, connect_timeout=2.0)
         with self._lock:
             other = self._clients.get(address)
             if other is not None and not other.closed:  # another worker was quicker
@@ -223,24 +221,33 @@ def server_log(name: str) -> Path:
     return registry.runtime_dir() / f"{name}.log"
 
 
-def ui_log(device: str, name: str) -> Path:
-    """Where the output of a window opened for a device goes: its live view ("view"), or a UI of its
-    extension (by its name).  In a folder of their own, beside the servers' logs."""
-    folder = registry.runtime_dir() / "ui"
-    folder.mkdir(exist_ok=True)
-    return folder / f"{device}-{name}.log"
+VIEW_LOG = "_view"  #: the log of a device's live view: no UI is named so (their names start with a letter or digit)
+
+
+def ui_log(device: str, ui: str | None = None) -> Path:
+    """Where the output of a window opened for a device goes: a UI of its extension (by its name),
+    else its live view.  A folder for each device, beside the servers' logs: ui/DEVICE/UI.log, and
+    ui/DEVICE/_view.log.  Raises ValueError for a name that is not one (a device's name may have
+    come over the network)."""
+    registry.check_name(device, "device name")
+    name = VIEW_LOG if ui is None else registry.check_name(ui, "UI name")
+    folder = registry.runtime_dir() / "ui" / device
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{name}.log"
 
 
 @dataclasses.dataclass(eq=False)
 class Launched:
     """A program started in the background by spawn(): a server, or a window for a device.  Its
-    output goes to `log`; `title` names it in messages ("lab", "Scope panel for scope")."""
+    output goes to `log`, from `offset` on (before it: earlier runs'); `title` names it in messages
+    ("lab", "Scope panel for scope")."""
 
     process: subprocess.Popen
     log: Path
     title: str
     cwd: str | Path | None = None  #: the folder it runs in (a restart starts it there again)
     quiet: bool = False  #: its end is not news: it is being stopped on purpose
+    offset: int = 0  #: where its output starts in the log
 
     @property
     def pid(self) -> int:
@@ -253,7 +260,8 @@ class Launched:
     def failure(self, wait: float = 0.0) -> str | None:
         """What it said last, if it ended with an error (an exit code above 0: an exception, or
         `error: ...` from the insthub command), waiting up to `wait` seconds for it to end: the last
-        lines of its log, else its exit code.  None while it runs, once it ended well, or when quiet."""
+        lines of its own output in the log, else its exit code.  None while it runs, once it ended
+        well, or when quiet."""
         try:
             code = self.process.wait(wait) if wait else self.process.poll()
         except subprocess.TimeoutExpired:
@@ -261,7 +269,7 @@ class Launched:
         if not code or code < 0 or self.quiet:  # (below 0: ended by a signal, as Stop and closing it do)
             return None
         try:
-            lines = [line for line in tail(self.log, 40).splitlines() if line.strip()]
+            lines = [line for line in tail(self.log, 40, self.offset).splitlines() if line.strip()]
         except BusError:  # the log is gone (the runtime folder was cleaned up)
             lines = []
         return "\n".join(lines[-12:]) or f"exit code {code}"
@@ -271,21 +279,25 @@ def spawn(command: list[str], log: Path, title: str, cwd: str | Path | None = No
           env: dict | None = None) -> Launched:
     """Start a program in the background, in a session of its own so that it outlives the program
     that starts it (the window, `insthub open`).  Its output goes to the file `log` (server_log,
-    ui_log), which a server's Logs button shows, and Launched.failure() reads when it fails.
+    ui_log), which a server's Logs button shows, and Launched.failure() reads when it fails.  The
+    log keeps what earlier runs wrote: each run starts with a line that says when, and what ran.
     `env`: its environment (default: this program's)."""
     with open(log, "ab") as out:
+        out.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}: {shlex.join(map(str, command))}\n".encode())
+        out.flush()
+        offset = out.tell()
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, cwd=cwd,
                                    start_new_session=True, env={**(os.environ if env is None else env),
                                                                 "PYTHONUNBUFFERED": "1"})
-    return Launched(process, Path(log), title, cwd)
+    return Launched(process, Path(log), title, cwd, offset=offset)
 
 
-def tail(path: Path, lines: int = 500) -> str:
-    """The last lines of a text file."""
+def tail(path: Path, lines: int = 500, start: int = 0) -> str:
+    """The last lines of a text file (of what comes after the first `start` bytes)."""
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - 256_000))
+            f.seek(max(start, f.tell() - 256_000))
             text = f.read().decode(errors="replace")
     except OSError as e:
         raise BusError(f"cannot read {path}: {e}") from None
@@ -503,17 +515,20 @@ def server_state(s: Server) -> tuple[str, str, str]:
     """(status, word, sentence) of a server."""
     if s.origin == "service":
         state, sub = s.service["state"], s.service.get("sub")
+        restarts = service.restarts_text(s.service)
+        told = f" ({restarts})" if restarts else ""
         if state == "active":
             return BUSY, "no server yet", ("The service runs, but no insthub server has announced itself from it "
                                            "yet. Logs shows its output.")
         if state == "activating":
             if sub == "auto-restart":
-                return BUSY, "restarting", "It stopped with an error; systemd starts it again in a moment."
+                return BUSY, "restarting", (f"It stopped with an error{told}; systemd starts it again in a "
+                                            "moment.")
             return BUSY, "starting", "Starting."
         if state == "deactivating":
             return BUSY, "stopping", "Stopping."
         if state == "failed":
-            return BAD, "failed", "Stopped with an error. Logs shows why."
+            return BAD, "failed", f"Stopped with an error{told}. Logs shows why."
         return IDLE, "stopped", "Installed as a service, not running."
     if s.error:
         return BAD, "unreachable", f"Does not answer: {s.error}"

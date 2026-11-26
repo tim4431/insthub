@@ -134,7 +134,7 @@ TOML reads `[devices.psu.2]` as a table `2` inside a device `psu`.
 | Key | Meaning |
 |---|---|
 | `driver` | **required.** `"module:Class"`. A `Device` subclass is used as it is; any other class is wrapped. `"package.module:Class"` works too. |
-| `path` | the folder of the driver's module, put in front of Python's search path |
+| `path` | the folder of the driver's module, put in front of Python's search path. A relative one counts from the config file's folder, wherever the server runs |
 | `lazy` | `true`: open the instrument on first use instead of when the server starts ([step 4](#4-open-it-at-start-or-on-first-use)) |
 | `description` | what this one is, in a few words, as `"the one on the optics table"`: its tile shows it, where it would show the driver's docstring (the same for every instrument of a kind). Its tile also shows where it is, taken from the constructor's arguments: `host` (with `port`), `resource`, `port`, `serial`, or GPIB's `board` and `pad` |
 | `reconnect_interval` | seconds between two attempts to open it (default 1) |
@@ -333,8 +333,12 @@ the background, install it as a service:
 The service runs the Python that installed it. Before installing, it checks
 that this Python can load every driver of the file, and that every key fits
 its driver. A warning, such as a driver that imports Qt (a service has no
-screen), is printed, and the install goes on. A service is restarted if it
-crashes, and its output is kept (`insthub service logs lab`).
+screen), is printed, and the install goes on. It then starts the service and
+waits until the server answers; if it does not, the install says so and
+prints the end of the service's log. A service is restarted if it crashes
+(5 s later, and at most 5 starts within 5 minutes), and its output is kept
+(`insthub service logs lab`; `insthub logs lab` shows its last lines from any
+computer).
 
 Start at login, or only when you start it: an instrument that is always there
 is best started at login. One you plug in now and then is better installed with
@@ -410,7 +414,11 @@ after editing the config, or Ctrl-C all end it.
 ## 8. Share it as an extension
 
 To offer the instrument to others, or to the New server dialog on your other
-computers, give its project folder a *manifest*, `insthub-extension.toml`:
+computers, give its project folder a *manifest*, `insthub-extension.toml`.
+[`examples/extension/`](../examples/extension) in insthub's repository is a
+complete extension to start from: a simulated laser with a manifest, a
+device, a panel, an app and a server file, and a README on making it your
+own. The smallest manifest:
 
 ```toml
 [extension]
@@ -449,7 +457,9 @@ panel = "mydriver_ui:make"           # or an app: run = ["-m", "mydriver_app", "
 Then `insthub open psu` opens it, and so does **Open Supply panel** on the
 device's page in the window, with the folder's Python. Its Qt belongs in that
 environment (in a packaged extension, in its `gui` extra), never in the
-driver. More in [extensions](guide.md#extensions) and in the
+driver. The panel need not draw every setting itself:
+`insthub.controls.Controls(device, exclude=[...])` shows the rest, as the
+device's page does. More in [extensions](guide.md#extensions) and in the
 [design](design.md#extensions).
 
 ## When something is wrong
@@ -458,7 +468,7 @@ driver. More in [extensions](guide.md#extensions) and in the
 |---|---|---|
 | `cannot load driver 'mydriver:PowerSupply': No module named 'mydriver' (this is .../python; is it the Python environment that has the driver's dependencies?)` | the server runs a Python that does not have the driver, or `path` is wrong | run the `insthub` of the driver's `.venv` ([step 3](#3-try-it)); check `path` |
 | `No module named 'serial'` (or another package the driver imports) | the same: that Python lacks the driver's own packages | install them into that environment, or use the one that has them |
-| The tile says **not connected: PermissionError: [Errno 13] Permission denied: '/dev/ttyUSB0'** (with pyserial: **SerialException: [Errno 13] could not open port /dev/ttyUSB0**) | your account may not open the port | `sudo usermod -aG dialout $USER`, or a udev rule. The new group reaches only programs started after a new login, and on a desktop everything (terminals, `insthub gui`, the servers it starts, services) descends from your user's service manager, which keeps running across a logout while another session of yours is open or lingering is on: then only a reboot gives it to them. To try it before that: stop the running server (`insthub service stop lab`, or **Stop** on its page), log in again where the new group applies (`ssh localhost`, or a text console), and there run `cd ~/Code/mydriver && .venv/bin/insthub serve lab.toml` (the `cd` matters: a relative `path` in the file counts from that folder). This belongs to the driver's project ([who sets up what](running-servers.md#who-sets-up-what)) |
+| The tile says **not connected: PermissionError: [Errno 13] Permission denied: '/dev/ttyUSB0'** (with pyserial: **SerialException: [Errno 13] could not open port /dev/ttyUSB0**) | your account may not open the port | `sudo usermod -aG dialout $USER`, or a udev rule. The new group reaches only programs started after a new login, and on a desktop everything (terminals, `insthub gui`, the servers it starts, services) descends from your user's service manager, which keeps running across a logout while another session of yours is open or lingering is on: then only a reboot gives it to them. To try it before that: stop the running server (`insthub service stop lab`, or **Stop** on its page), log in again where the new group applies (`ssh localhost`, or a text console), and there run `~/Code/mydriver/.venv/bin/insthub serve ~/Code/mydriver/lab.toml`. This belongs to the driver's project ([who sets up what](running-servers.md#who-sets-up-what)) |
 | `[devices.psu] bauds: not a parameter of mydriver:PowerSupply(port, baud=9600); did you mean 'baud'?` (or `missing a required argument: 'port'`) | a key of the file is misspelled, or a constructor argument is missing: every key insthub does not read itself goes to the constructor | fix the file and start the server again |
 | `[devices.psu] lazy: should be true or false, not "yes"` | one of insthub's own keys has the wrong kind of value | write it as [every key](#every-key) says |
 | `a module named 'bus_server' is loaded already, from .../hp_8562a_gpib/bus_server.py, so .../windfreak_sythHDprov2/bus_server.py cannot be loaded too` | two devices of one server come from folders that each have a module of that name, and Python keeps one module per name | host them in separate servers, or move one into a package with a name of its own ([rules inside an extension](design.md#rules-inside-an-extension)) |
@@ -466,6 +476,9 @@ driver. More in [extensions](guide.md#extensions) and in the
 | `[devices.psu] mydriver:PowerSupply(path, baud=9600): missing a required argument: 'path'; path is one of insthub's own keys and never reaches it` (from `insthub service install`, for an optional one: `warning: [devices.psu] mydriver:PowerSupply(port, log=None, lazy=False) has a parameter 'lazy', but lazy is one of insthub's own keys and never reaches it`) | the constructor has an argument named like one of insthub's keys | give it under `kwargs` ([every key](#every-key)) |
 | `[devices.psu] link_errors: cannot load 'pyvisa.errors:VisaIOErorr': module 'pyvisa.errors' has no attribute 'VisaIOErorr'` | a class in `link_errors` is misspelled, or is not in the module the name says | write it as `"module:Class"`, as `"pyvisa.errors:VisaIOError"` |
 | `warning: [devices.psu] driver mydriver:PowerSupply imports PyQt6; servers often run without a screen` | the driver's module imports Qt, which a service without a screen may lack | keep window code out of the driver's module |
+| `insthub service install`: `installed .../insthub-lab.service, but insthub-lab stopped with an error. The end of its log (insthub service logs lab):` and the lines below it | the service started, and its server failed; the lines under the message say why | fix what they name, then `insthub service restart lab` |
+| `insthub service list` says `failed` and, under it, `restarted 4 times, gave up: too many restarts` | the server crashed again each time systemd restarted it, so after 5 starts within 5 minutes systemd stopped trying | `insthub service logs lab` says why; once it is fixed, `insthub service start lab` (or **Start** in the window) starts it again |
+| `insthub logs lab`: `lab runs an older insthub, which keeps no log for others to read` | that server's insthub is older than `insthub logs` | update insthub in its environment and restart it; until then read its output where it runs (its terminal, or `insthub service logs lab` on that computer) |
 | `insthub check`: `it has no Python: make a virtualenv (.venv) in ~/Code/mydriver or the folder above` | an extension's code runs in its own Python, and there is none in its folder | `uv venv` (or `python -m venv .venv`) there and install the driver's packages, or name one in `[extension]` as `python = "..."` |
 | `insthub check`: `[devices.psu] path: not for a manifest to say: insthub writes the manifest's folder` (or `extension`, `extension_version`) | the manifest gives a key that the server file gets from insthub | remove it from the manifest |
 | `insthub ext list`: `hidden by .../insthub-extension.toml` | two folders have an extension with one `id` (say, a copy) and the first one found that can be used is used | remove the other from your list, or give it another `id` |
@@ -473,6 +486,8 @@ driver. More in [extensions](guide.md#extensions) and in the
 | `insthub open psu`: `its extension, My power supply, has no UI for it` | the manifest has no `[ui.NAME]`, or its `types` leave this device's type out | add one, or the type `insthub info psu` shows |
 | `cannot load the panel 'mydriver_ui:make': No module named 'PyQt6'` (or `pyqtgraph`), in the window's message or `insthub open`'s output | the extension's Python lacks the libraries of its UI | install them there: `uv sync --extra gui` for a packaged extension, else `uv pip install --python .venv/bin/python PyQt6 pyqtgraph` |
 | a UI's log ends with `invalid choice: 'panel'` | the extension's Python has an insthub older than `insthub panel` | update insthub in that environment |
+| a panel's log ends with `No module named 'insthub.controls'` (or `module 'insthub.qt' has no attribute 'start'`, or `'coalesce'`) | the extension's Python has an insthub older than the helpers the panel uses | update insthub in that environment |
+| `insthub check` or `insthub ext list`: `every user may change ~/Code/mydriver (chmod o-w ~/Code/mydriver): insthub runs nothing it names` (or `the users of group lab may change ...`, `... belongs to another user`) | insthub starts an extension's UIs only when no one but you (or root) may change its manifest and its folder | `chmod go-w` the folder and its `insthub-extension.toml`; for another user's folder, use a copy of your own |
 | `[devices.psu] psu: dangerous names 'outptu', which is none of its commands and properties; did you mean 'output'?` (or the same from `poll` or `meta`) | a name in `dangerous`, `poll` or `meta` is misspelled, or names a method that `include`/`exclude` leave out | write the command's or property's name as `insthub info psu` lists it |
 | `[devices.psu] psu: dangerous names 'current', a property that cannot be written` | only writing a property can be dangerous, and this one is read-only | leave it out, or name the command that changes it |
 | `[devices.psu] meta: power: 'units' is not one of unit, min, max, step, choices; did you mean 'unit'?` | a word of the metadata is misspelled | use `unit`, `min`, `max`, `step` or `choices` |
@@ -481,7 +496,7 @@ driver. More in [extensions](guide.md#extensions) and in the
 | a traceback that ends in `DriverError: [devices.psu]: mydriver:PowerSupply(...) failed: ...` (or `cannot load driver 'mydriver:PowerSupply': SyntaxError: ...`) | the driver's own code failed while the server made the device, or imported its module: not a problem of the file | the traceback above it shows where, in the driver |
 | **not connected:** and an error from the driver | the instrument is off, unplugged or at another address | fix it, then **Connect now** (or just use it) |
 | `a server named 'lab' is already running` | two servers with one name | stop the other one, or rename one (`name` in `[server]`) |
-| `insthub.device("psu")` says the name is ambiguous | two servers each have a device `psu` | device names must be unique on a computer: rename one table |
+| `insthub.device("psu")` says the name is ambiguous (and `insthub states` gives `psu` an error) | two servers each have a device `psu` | device names must be unique on a computer: rename one table |
 | A method of the driver is not a command | its name starts with `_`, it is the driver's `close` method, or `include`/`exclude` leave it out | rename it, or adjust `include` / `exclude` |
-| It works with `insthub serve` but not as a service | the service runs another Python, or in another folder | `insthub service logs lab`; install it with the `insthub` of the right `.venv`. A relative `path` counts from the folder the server runs in (a service's: the file's folder), so write it as `~/...` or in full |
+| It works with `insthub serve` but not as a service | the service runs another Python, or in another folder (the file's) | `insthub service logs lab`; install it with the `insthub` of the right `.venv`. Give a driver that is not installed in that Python its `path` (without one, a service finds its module only in the file's folder) |
 | A script gets `DevicePaused` | somebody paused the device | Resume it (window, `insthub resume psu`), or ask who paused it: the window says |

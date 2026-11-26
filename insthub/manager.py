@@ -54,7 +54,7 @@ import numpy as np
 
 from . import extensions, forms, launcher, pages, registry, service
 from . import widgets as ui
-from .client import PROCESS_TOKEN
+from .client import PROCESS_TOKEN, log_text
 from .device import busy_with
 from .inventory import (
     BAD,
@@ -149,8 +149,11 @@ class Manager(QtWidgets.QMainWindow):
         self._closed = False
         self._systemd = False
         self._remote_error: str | None = None  # devices.toml cannot be read
+        self._local_ids: set[tuple] = set()  # registry.identity() of the servers here, at the last scan
+        self._here: dict[str, tuple] = {}  # address in devices.toml -> identity of the server here it reached
         self._spawned: list = []  # programs this window started: servers, windows for devices (inventory.Launched)
-        self._uis: dict[tuple, tuple] = {}  # (address, device, extension) -> (device_uis(), when it was asked)
+        self._uis: dict[str, tuple] = {}  # server address -> what its devices can open here (see _look_up_uis)
+        self._uis_asking: set[str] = set()  # server addresses whose devices' UIs a worker is finding out
         self._logs: dict[str, pages.LogDialog] = {}
         self._detail: tuple | None = None  # ("device", key, name) or ("server", key) while one is shown
         self.login_pending: dict[str, bool] = {}  # service -> the Starts at login asked, until it is done
@@ -275,7 +278,7 @@ class Manager(QtWidgets.QMainWindow):
         self.toast.show_message(text, ms)
 
     def _report(self, exc) -> None:
-        self.say(pages.error_text(exc), 8000)
+        self.say(ui.error_text(exc), 8000)
 
     def act(self, doing: str, fn, done, after=None) -> None:
         """A user's action: say what is happening, then what came of it.  `done` is the
@@ -298,12 +301,7 @@ class Manager(QtWidgets.QMainWindow):
         self.submit(self.actions, fn, ok, failed)
 
     def confirm(self, title: str, text: str, action: str) -> bool:
-        box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Icon.Question, title, text,
-                                    QtWidgets.QMessageBox.StandardButton.Cancel, self)
-        yes = box.addButton(action, QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.Cancel)
-        box.exec()
-        return box.clickedButton() is yes
+        return ui.confirm(self, title, text, action)
 
     def copy(self, text: str) -> None:
         QtWidgets.QApplication.clipboard().setText(text)
@@ -350,25 +348,23 @@ class Manager(QtWidgets.QMainWindow):
                 taken.add(s.service["name"])
             fresh[key] = s
             local_addresses.update(s.addresses)
+        self._local_ids = {registry.identity(info) for info in found["servers"]}
         for u in units or ():
             if u["name"] not in taken:
                 key = f"service:{u['name']}"
                 s = self.servers.get(key) or Server(key, u["name"], "service")
                 s.service = u
                 fresh[key] = s
-        grouped: dict[str, list] = {}
-        for name, address in found["remote"].items():
-            grouped.setdefault(address, []).append(name)
-        for address, names in grouped.items():
-            if address in local_addresses:
-                continue
+        for address, names in found["remote"].items():
+            if address in local_addresses or self._here.get(address) in self._local_ids:
+                continue  # a server of this computer, which has its card (devices.toml may name it by an IP of ours)
             key = f"remote:{address}"
             s = self.servers.get(key) or Server(key, address.partition("://")[2], "remote", [address])
             s.declared = sorted(names)
             fresh[key] = s
         for key, old in self.servers.items():
             if old.address and (key not in fresh or fresh[key].address != old.address):
-                self.submit(self.actions, lambda a=old.address: self.backend.forget(a), lambda _: None)
+                self._forget_address(old.address)
         self.servers = fresh
         self.add_service.setEnabled(self._systemd)
         self.add_sim.setEnabled(not any(s.name == "sim" for s in fresh.values() if s.origin == "local"))
@@ -378,6 +374,11 @@ class Manager(QtWidgets.QMainWindow):
             if s.address and not s.probing and s.origin != "service":
                 self._probe(s)
 
+    def _forget_address(self, address: str) -> None:
+        """Close the connection to an address no card shows any more, and forget its devices' UIs."""
+        self.submit(self.actions, lambda: self.backend.forget(address), lambda _: None)
+        self._uis.pop(address, None)
+
     def _probe(self, s: Server) -> None:
         s.probing = True
         address = s.address
@@ -385,6 +386,12 @@ class Manager(QtWidgets.QMainWindow):
         def done(result):
             s.probing = False
             if self.servers.get(s.key) is not s:
+                return
+            if s.origin == "remote" and registry.identity(result["info"]) in self._local_ids:
+                self._here[address] = registry.identity(result["info"])  # a server of this computer after all
+                self.servers.pop(s.key)
+                self._forget_address(address)
+                self.render()
                 return
             if s.probe is not None and self.tray is not None:  # an agent that arrived since the last look
                 before = {c["pid"] for c in s.probe["clients"] or () if c["agent"]}
@@ -404,8 +411,7 @@ class Manager(QtWidgets.QMainWindow):
             s.probe, s.probed_at, s.error = result, now, None
             if s.origin == "remote":
                 s.name = result["info"].get("server") or s.name
-            for dev in result["devices"]:  # its UIs found out before a right-click on its tile asks for them
-                self.device_uis(s, dev)
+            self._look_up_uis(s)  # its devices' UIs found out before a right-click on a tile asks for them
             self._fetch_previews(s)
             self._changed(s)
 
@@ -526,7 +532,8 @@ class Manager(QtWidgets.QMainWindow):
         if s is None:
             return
         self._follow = None
-        self._uis = {k: (v[0], -math.inf) if k[1] == name else v for k, v in self._uis.items()}  # ask again
+        if s.address in self._uis:  # its UIs looked up again (manifests and your list of extensions change)
+            self._uis[s.address] = -math.inf, *self._uis[s.address][1:]
         from_server = self.pages.currentWidget() is self.server_page
         self._back = ("server", key) if from_server else "devices"
         self._detail = ("device", key, name)
@@ -604,7 +611,7 @@ class Manager(QtWidgets.QMainWindow):
         open_ok, why = self.can_open(s)
         for ui_ in uis:
             item("window", f"Open {ui_.title}", lambda ui_=ui_: self.open_ui(s, name, ext, ui_), open_ok,
-                 why or f"Its extension's {'panel' if ui_.panel else 'app'}, in a window of its own")
+                 why or f"Its extension's {ui_.kind}, in a window of its own")
         menu.addSeparator()
         can_pause, why = self.can_pause(d)
         if paused:
@@ -637,7 +644,7 @@ class Manager(QtWidgets.QMainWindow):
             menu.addAction(ui.icon("stop"), "Stop").triggered.connect(lambda *_: self.service_action(s, "stop"))
         elif running and s.pid and s.pid != os.getpid():
             menu.addAction(ui.icon("stop"), "Stop").triggered.connect(lambda *_: self.stop_server(s))
-        if u or (running and server_log(s.name).is_file()):
+        if self.log_source(s):
             menu.addAction(ui.icon("logs"), "Logs").triggered.connect(lambda *_: self.show_logs(s))
         config = server_file(s)
         if config is not None and config.suffix == ".toml":
@@ -735,28 +742,49 @@ class Manager(QtWidgets.QMainWindow):
     def live_view(self, s: Server, device: str) -> None:
         command = [sys.executable, "-m", "insthub", "-a", s.address, "view", device]
         self._start(f"the live view of {device}",
-                    lambda: spawn(command, ui_log(device, "view"), f"The live view of {device}"))
+                    lambda: spawn(command, ui_log(device), f"The live view of {device}"))
 
     def device_uis(self, s: Server, device: str) -> tuple | None:
         """What a device can open here, as extensions.device_uis() says: (its extension, its UIs, why
-        it has none); None until a worker has found out (it reads manifests, and may ask systemd),
-        after which the window renders again.  Asked again after UIS_FRESH seconds, and when the
-        device's page opens, since manifests and your list of extensions change."""
+        it has none); None until a worker has found out (see _look_up_uis)."""
         d = s.device(device)
-        if d is None or not d.get("extension") or not s.address:
+        wanted = d.get("extension") if d else None
+        if not isinstance(wanted, str) or not wanted or not s.address:  # (it came over the network)
             return None, [], None
-        key, address = (s.address, device, d["extension"]), s.address
-        known, asked = self._uis.get(key, (None, -math.inf))
-        if time.monotonic() - asked > UIS_FRESH:
-            self._uis[key] = known, time.monotonic()  # (what was known stays on show meanwhile)
+        self._look_up_uis(s)
+        _, extension_of, found = self._uis.get(s.address, (None, {}, {}))
+        return found.get(device) if extension_of.get(device) == wanted else None
 
-            def found(result):
-                self._uis[key] = result, self._uis.get(key, (None, 0.0))[1]
+    @staticmethod
+    def _with_extensions(s: Server) -> dict[str, dict]:
+        """The devices of a server that name an extension (name -> what it said about itself)."""
+        devices = s.probe["devices"] if s.probe else {}
+        return {name: d for name, d in devices.items() if isinstance(d.get("extension"), str) and d["extension"]}
+
+    def _look_up_uis(self, s: Server) -> None:
+        """Find out on a worker what the devices of a server that name an extension can open here
+        (extensions.server_uis: it reads manifests and the registry, and may ask systemd), for all of
+        them at once: unless that was found out for the same devices and extensions less than
+        UIS_FRESH seconds ago (manifests and your list of extensions change), or is under way.
+        What was known stays on show meanwhile; the window renders again if anything changed."""
+        address, devices = s.address, self._with_extensions(s)
+        extension_of = {name: d["extension"] for name, d in devices.items()}
+        asked, known, _ = self._uis.get(address, (-math.inf, None, {}))
+        if not devices or address in self._uis_asking or (
+                known == extension_of and time.monotonic() - asked <= UIS_FRESH):
+            return
+        self._uis_asking.add(address)
+        asked = time.monotonic()
+
+        def found(result):
+            self._uis_asking.discard(address)
+            before = self._uis.get(address)
+            self._uis[address] = asked, extension_of, result
+            if before is None or before[1:] != (extension_of, result):
                 self.render()
 
-            self.submit(self.actions, lambda: extensions.device_uis(d, address), found,
-                        lambda exc: found((None, [], pages.error_text(exc))))
-        return known
+        self.submit(self.probes, lambda: extensions.server_uis(devices, address), found,
+                    lambda exc: found(dict.fromkeys(devices, (None, [], ui.error_text(exc)))))
 
     def open_ui(self, s: Server, device: str, ext, ui_) -> None:
         """Start a UI of a device's extension (extensions.launch), with the extension's Python."""
@@ -811,13 +839,28 @@ class Manager(QtWidgets.QMainWindow):
         self.act("Editing devices.toml", lambda: registry.edit_static_devices(remove=names),
                  lambda path: f"removed from {path}")
 
-    def show_logs(self, s: Server) -> None:
+    def log_source(self, s: Server) -> tuple | None:
+        """Where a server's log is, as (key, title, load: what reads it, on a worker thread): its
+        service's journal, else the output of a server this window started, else what the server
+        keeps of its own log (the server call "logs": for one started in a terminal, a program that
+        hosts its own, one on another computer).  None for a server whose insthub is too old for it."""
         if s.service:
             name = s.service["name"]
-            key, title, load = name, f"{service.PREFIX}{name}: log", lambda: service.journal(name, 500)
-        else:
-            path = server_log(s.name)
-            key, title, load = str(path), f"{s.name}: output", lambda: tail(path)
+            return name, f"{service.PREFIX}{name}: log", lambda: service.journal(name, 500)
+        path = server_log(s.name)
+        if s.origin == "local" and path.is_file():
+            return str(path), f"{s.name}: output", lambda: tail(path)
+        address = s.address
+        if address and "logs" in ((s.probe or {}).get("info") or {}).get("features", ()):
+            return (f"logs:{address}", f"{s.name}: log",
+                    lambda: log_text(self.backend.client(address).logs(500)))
+        return None
+
+    def show_logs(self, s: Server) -> None:
+        source = self.log_source(s)
+        if source is None:
+            return
+        key, title, load = source
         dialog = self._logs.get(key)
         if dialog is None:
             dialog = self._logs[key] = pages.LogDialog(self, title, load)
@@ -890,7 +933,7 @@ class Manager(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(800, self.refresh)
 
         def failed(exc):
-            self.say(f"Cannot restart {name}: {pages.error_text(exc)}", 8000)
+            self.say(f"Cannot restart {name}: {ui.error_text(exc)}", 8000)
             over()
 
         self.say(f"Restarting {name}...", 0)

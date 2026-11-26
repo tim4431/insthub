@@ -3,8 +3,10 @@
 A server started in a terminal stops when the terminal closes.  This module
 registers it as a systemd *user* service instead: started when you log in (or
 at boot, see `linger_hint`) unless it is told not to (`login=False`, `disable`),
-restarted if it crashes, its output kept in the journal.  Nothing here needs
-root.
+restarted if it crashes (but not forever: see unit_text), its output kept in the
+journal.  Installing, starting and restarting wait until its server has
+announced itself, and say why it did not, with the journal's last lines.
+Nothing here needs root.
 
 There is one convention for every server, whatever instrument it drives:
 
@@ -31,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import warnings
 from pathlib import Path
 
@@ -39,6 +42,7 @@ from .config import ConfigWarning
 from .errors import BusError
 
 PREFIX = "insthub-"
+WAIT = 60.0  #: seconds install, start and restart wait for the server to announce itself
 
 
 def unit_dir() -> Path:
@@ -167,20 +171,24 @@ def check_python(target: str | Path, python: str) -> list[str]:
 
 
 def unit_text(name: str, target: str | Path, python: str | None = None) -> str:
-    """The systemd unit that keeps the server of `target` running."""
+    """The systemd unit that keeps the server of `target` running: restarted 5 s after it crashes,
+    but no more than 5 starts in 5 minutes, so that a server that cannot start (a broken config,
+    an instrument it cannot do without) ends up "failed" instead of restarting forever."""
     registry.check_name(name, "service name")
     target = Path(target).expanduser().resolve()
     command = " ".join(_quote(part) for part in command_for(target, python))
     return f"""# Written by `insthub service install`.  Remove it with:  insthub service remove {name}
 [Unit]
 Description=insthub server {name}
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 ExecStart={command}
 WorkingDirectory={str(target.parent).replace("%", "%%")}
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 TimeoutStopSec=20
 
 [Install]
@@ -199,9 +207,9 @@ def _systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
 
 
 def install(target: str | Path, name: str | None = None, start: bool = True, python: str | None = None,
-            login: bool | None = None) -> Path:
-    """Register the server of `target` as the service insthub-NAME and start it.
-    Installing again under the same name replaces the old definition.
+            login: bool | None = None, wait: float | None = None) -> Path:
+    """Register the server of `target` as the service insthub-NAME and start it (and wait for
+    it, as start() does).  Installing again under the same name replaces the old definition.
     `python`: the interpreter the service runs (default: this one).
     `login`: start it at every login (default: as `start`); False: only when started by hand."""
     target = Path(target).expanduser().resolve()
@@ -234,7 +242,10 @@ def install(target: str | Path, name: str | None = None, start: bool = True, pyt
     elif existed:  # a new definition: the new choice holds
         _systemctl("disable", path.name, check=False)
     if start:
-        _systemctl("restart" if existed else "start", path.name)
+        try:
+            _begin("restart" if existed else "start", name, wait)
+        except BusError as e:
+            raise BusError(f"installed {path}, but {e}") from None
     return path
 
 
@@ -254,8 +265,11 @@ def remove(name: str) -> None:
     _systemctl("reset-failed", path.name, check=False)
 
 
-def start(name: str) -> None:
-    _systemctl("start", _unit(name))
+def start(name: str, wait: float | None = None) -> int | None:
+    """Start it (also one that gave up after too many restarts), and wait up to `wait` seconds
+    (default WAIT; 0: not at all) until its server has announced itself (_wait_up).  Returns that
+    server's pid."""
+    return _begin("start", name, wait)
 
 
 def stop(name: str) -> None:
@@ -273,19 +287,54 @@ def disable(name: str) -> None:
     _systemctl("disable", _unit(name))
 
 
-def restart(name: str) -> None:
-    """Restart, e.g. after changing the server's code or config."""
-    _systemctl("restart", _unit(name))
+def restart(name: str, wait: float | None = None) -> int | None:
+    """Restart, e.g. after changing the server's code or config, and wait as start() does."""
+    return _begin("restart", name, wait)
 
 
-def units() -> list[dict]:
-    """The installed services: name, state ("active", "failed", "inactive", "activating", ...), sub
-    (systemd's detail, e.g. "auto-restart" while it waits to restart a crashed server), enabled,
-    pid (of the running server, else None) and command."""
-    paths = sorted(unit_dir().glob(f"{PREFIX}*.service"))
+def _begin(what: str, name: str, wait: float | None) -> int | None:
+    unit = _unit(name)
+    _systemctl("reset-failed", unit, check=False)  # what failed before (or gave up) starts again by hand
+    _systemctl(what, unit)
+    return _wait_up(name, WAIT if wait is None else wait)
+
+
+def _wait_up(name: str, wait: float) -> int | None:
+    """Wait up to `wait` seconds (0: not at all) until the process of insthub-NAME has announced
+    its server (a registry entry with its pid), and return that pid.  Raises BusError, with the last
+    lines of its journal, if it ends or waits to be restarted (it crashed) before that, or if it
+    takes longer."""
+    if not wait:
+        return None
+    end = time.monotonic() + wait
+    while True:
+        u = units(name)[0]
+        if u["pid"] and any(entry.get("pid") == u["pid"] for entry in registry.servers()):
+            return u["pid"]
+        if u["state"] in ("failed", "inactive") or u["sub"] == "auto-restart":
+            why = "ended" if u["state"] == "inactive" else "stopped with an error"
+            break
+        if time.monotonic() > end:
+            why = f"has announced no insthub server after {wait:g} s"
+            break
+        time.sleep(0.25)
+    try:
+        said = journal(name, 20).rstrip() or "(nothing)"
+    except BusError as e:
+        said = str(e)
+    raise BusError(f"{PREFIX}{name} {why}. The end of its log (insthub service logs {name}):\n{said}")
+
+
+def units(name: str | None = None) -> list[dict]:
+    """The installed services (or the one called `name`): name, state ("active", "failed",
+    "inactive", "activating", ...), sub (systemd's detail, e.g. "auto-restart" while it waits to
+    restart a crashed server), enabled, pid (of the running server, else None), restarts (how often
+    systemd restarted it since it was started), result (how it last ended: "success", "exit-code",
+    "start-limit-hit" once it gave up, ...) and command."""
+    paths = [unit_dir() / _unit(name)] if name else sorted(unit_dir().glob(f"{PREFIX}*.service"))
     if not paths:
         return []
-    out = _systemctl("show", "--property=Id,ActiveState,SubState,UnitFileState,MainPID",
+    out = _systemctl("show", "--property=Id,ActiveState,SubState,UnitFileState,MainPID,NRestarts,Result",
                      *(path.name for path in paths), check=False).stdout
     shown = {}
     for block in out.split("\n\n"):
@@ -300,8 +349,18 @@ def units() -> list[dict]:
         pid = int(props.get("MainPID") or 0)
         found.append({"name": path.stem[len(PREFIX):], "state": props.get("ActiveState") or "unknown",
                       "sub": props.get("SubState", ""), "enabled": props.get("UnitFileState") == "enabled",
-                      "pid": pid or None, "command": command, "unit": str(path)})
+                      "pid": pid or None, "restarts": int(props.get("NRestarts") or 0),
+                      "result": props.get("Result", ""), "command": command, "unit": str(path)})
     return found
+
+
+def restarts_text(unit: dict) -> str:
+    """"restarted 3 times" (since it was started), and "gave up" when systemd did; else ""."""
+    n = unit.get("restarts") or 0
+    told = [f"restarted {n} time{'s' * (n != 1)}"] if n else []
+    if unit.get("result") == "start-limit-hit":
+        told.append("gave up: too many restarts")
+    return ", ".join(told)
 
 
 def journal(name: str, lines: int = 200) -> str:

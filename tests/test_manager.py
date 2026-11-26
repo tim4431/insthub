@@ -1,5 +1,7 @@
 """The manager window (`insthub gui`) and its launcher, run without a display."""
 import json
+import logging
+import math
 import os
 import shutil
 import subprocess
@@ -304,6 +306,7 @@ def test_commands_are_run_from_their_tab(window):
         window.open_device("local:t", "loopback")
         commands = window.device_page.commands
         assert not commands.run_button.isEnabled()
+        assert commands.styleSheet() == window.device_page.props.styleSheet() == ""  # the window's look, not their own
         commands.choose("echo")
         assert commands.run_button.isEnabled() and "echo" in commands.chosen.text()
         commands.args.setText('value=[1, "two"]')
@@ -318,6 +321,16 @@ def test_commands_are_run_from_their_tab(window):
         commands.args.setText("'unclosed")
         commands.run()
         assert commands.result.toPlainText().startswith("Cannot read the arguments")
+        commands.choose("sleep")
+        commands.args.setText("0.3")
+        commands.run()
+        s, page = window.servers["local:t"], window.device_page
+        probe, s.probe = s.probe, None                                       # one probe fails while it runs ...
+        page.show_device(s, "loopback")
+        s.probe = probe
+        page.show_device(s, "loopback")
+        assert commands.current() == "sleep" and commands.args.text() == "0.3"  # ... it is the same device
+        assert spin(3, lambda: commands.took.text().startswith("loopback.sleep:"))  # and its result is shown
 
 
 def test_previews_show_the_last_frame_without_subscribing(window, monkeypatch):
@@ -407,12 +420,13 @@ def test_other_programs_and_stopping_a_server(window, spawned, monkeypatch):
 
 
 def test_services_and_remote_devices(monkeypatch, tmp_path):
-    (tmp_path / "devices.toml").write_text('[devices]\nawg = "tcp://127.0.0.1:1"\n')
+    (tmp_path / "devices.toml").write_text('[devices]\nawg = "tcp://127.0.0.1:1"\n\n[servers]\nrig = "tcp://127.0.0.1:2"\n')
     monkeypatch.setenv("INSTHUB_DEVICES", str(tmp_path / "devices.toml"))
     unit = {"enabled": True, "command": '"python" "-m" "insthub" "serve" "t.toml"', "unit": "u"}
     monkeypatch.setattr(service, "units", lambda: [
-        {**unit, "name": "t", "state": "active", "sub": "running", "pid": os.getpid()},
-        {**unit, "name": "lab", "state": "failed", "sub": "failed", "pid": None}])
+        {**unit, "name": "t", "state": "active", "sub": "running", "pid": os.getpid(), "restarts": 2},
+        {**unit, "name": "lab", "state": "failed", "sub": "failed", "pid": None, "restarts": 5,
+         "result": "start-limit-hit"}])
     calls = []
     for action in ("start", "stop", "restart", "remove"):
         monkeypatch.setattr(service, action, lambda name, action=action: calls.append((action, name)))
@@ -425,17 +439,19 @@ def test_services_and_remote_devices(monkeypatch, tmp_path):
                         and word(window, "server", "remote:tcp://127.0.0.1:1") == "unreachable"
                         and word(window, "device", "local:t", "loopback") == "connected")
             assert word(window, "device", "remote:tcp://127.0.0.1:1", "awg") == "unknown"
+            assert spin(5, lambda: word(window, "server", "remote:tcp://127.0.0.1:2") == "unreachable")  # [servers]
             awg = pages.device_view(window.servers["remote:tcp://127.0.0.1:1"], "awg")
             assert awg.message.startswith("Its server does not answer")
             assert window.servers["local:t"].service["name"] == "t"          # matched by pid
             assert window.add_service.isEnabled()
             lab = window.devices_page.sections["service:lab"]
             assert spin(3, lambda: not lab.start.isHidden() and "Logs shows why" in lab.note.text())
-            assert window.sidebar.nav["servers"].count() == "3"
+            assert "(restarted 5 times, gave up: too many restarts)" in lab.note.text()
+            assert window.sidebar.nav["servers"].count() == "4"
 
             window.open_server("local:t")
             page = window.server_page
-            assert "insthub-t · active" in page.service.text() and page.login.isChecked()
+            assert "insthub-t · active · restarted 2 times" in page.service.text() and page.login.isChecked()
             assert page.start.isHidden() and not page.restart.isHidden()
             page.restart.click()
             page.stop.click()                                                 # a service is stopped by systemd
@@ -445,6 +461,8 @@ def test_services_and_remote_devices(monkeypatch, tmp_path):
             assert spin(5, lambda: len(calls) == 3)
             assert calls == [("restart", "t"), ("stop", "t"), ("start", "lab")]
 
+            window.open_server("remote:tcp://127.0.0.1:2")
+            assert not page.forget.isVisible()                               # [servers]: nothing it may remove
             window.open_server("remote:tcp://127.0.0.1:1")
             assert "Does not answer" in page.state.text() and "devices.toml" in page.header.subtitle.text()
             assert page.forget.isVisible() or not page.more.isHidden()
@@ -454,6 +472,16 @@ def test_services_and_remote_devices(monkeypatch, tmp_path):
         finally:
             window.close()
             spin(0.1)
+
+
+def test_a_server_here_that_devices_toml_names_by_another_address_has_one_card(window):
+    with insthub.Server("lan", [sim.Loopback()], tcp=0) as srv:
+        key = f"remote:tcp://localhost:{srv.addresses[-1].rpartition(':')[2]}"   # an address it does not announce
+        registry.devices_file().write_text(f'[servers]\nlabpc = "{key[7:]}"\n')
+        assert spin(5, lambda: word(window, "device", "local:lan", "loopback") == "connected"
+                    and key[7:] in window._here and key not in window.servers)       # it was asked, and is ours
+        assert not spin(1, lambda: key in window.servers)                            # not shown again by a scan
+        assert [k for k in window.servers if k.startswith("remote:")] == []
 
 
 class Flaky(insthub.Device):
@@ -778,7 +806,8 @@ def menu_of(window, monkeypatch, key, name) -> list[str]:
 def test_a_device_opens_the_uis_of_its_extension(window, monkeypatch):
     """Open runs a UI of the device's extension as a program of its own, with the extension's Python
     (insthub's own panel for its scope: this Python); the window imports none of it."""
-    imported = "insthub.sim_ui" in sys.modules
+    monkeypatch.delitem(sys.modules, "insthub.sim_ui", raising=False)   # (an earlier test may have imported it)
+    monkeypatch.delattr(insthub, "sim_ui", raising=False)
     with insthub.Server("t", [sim.SimScope(), sim.SimSynth()]) as server:
         assert spin(5, lambda: word(window, "device", "local:t", "scope") == "connected")
         assert spin(5, lambda: "Open Scope panel" in menu_of(window, monkeypatch, "local:t", "scope"))
@@ -800,7 +829,7 @@ def test_a_device_opens_the_uis_of_its_extension(window, monkeypatch):
         finally:
             panel.process.terminate()
             panel.process.wait(10)
-    assert ("insthub.sim_ui" in sys.modules) == imported
+    assert "insthub.sim_ui" not in sys.modules
 
 
 def test_a_window_opened_for_a_device_says_why_it_failed(window, monkeypatch, tmp_path):
@@ -809,7 +838,7 @@ def test_a_window_opened_for_a_device_says_why_it_failed(window, monkeypatch, tm
     gone = inventory.Server("local:gone", "gone", "local", ["tcp://127.0.0.1:9"])  # nothing answers there
     window.live_view(gone, "scope")                                      # its output goes to a log, which says why
     assert spin(20, lambda: any(t.startswith("The live view of scope ended with an error: ") for t in said)), said
-    assert inventory.ui_log("scope", "view").read_text().strip() and str(inventory.ui_log("scope", "view")) in said[-1]
+    assert inventory.ui_log("scope").read_text().strip() and str(inventory.ui_log("scope")) in said[-1]
     folder = tmp_path / "hp"
     folder.mkdir()
     (folder / "insthub-extension.toml").write_text(
@@ -823,6 +852,39 @@ def test_a_window_opened_for_a_device_says_why_it_failed(window, monkeypatch, tm
     monkeypatch.setattr(qt.QtWidgets.QMessageBox, "warning", lambda *a: warned.append(a[2]))
     window.open_ui(gone, "../sa", ext, ext.ui["quick"])                   # a name that must not fill a placeholder
     assert warned and warned[0].startswith("Cannot open Quick look for ../sa.\n\nbad device name '../sa'")
+    window.live_view(gone, "../../../x")                                 # nor name a log elsewhere
+    assert warned[1].startswith("Cannot open the live view of ../../../x.\n\nbad device name '../../../x'")
+    assert not (registry.runtime_dir().parent / "x-view.log").exists()
+
+
+def test_the_uis_of_a_server_s_devices_are_looked_up_at_once(window, monkeypatch):
+    """One worker job finds out what each device of a server can open (for a server elsewhere: with
+    one discovery for all), asked again only after a while; what came over the network is only compared."""
+    window._timer.stop()                                                 # (no scans: nothing else renders)
+    calls, renders = [], []
+    real = extensions.discover
+    monkeypatch.setattr(extensions, "discover", lambda: calls.append(1) or real())
+    s = inventory.Server("remote:x", "x", "remote", ["tcp://127.0.0.1:9"])
+    scope = {"type": "SimScope", "extension": "insthub-sim", "status": {}, "streams": {}}
+    s.probe = {"devices": {"scope": scope, "scope2": scope, "synth": {**scope, "type": "SimSynth"},
+                           "box": {**scope, "extension": ["a", "list"]}, "lamp": {**scope, "extension": "lamps"}}}
+    assert window.device_uis(s, "box") == (None, [], None)              # not text: no extension, and no crash
+    assert window.device_uis(s, "scope") is None                          # being found out ...
+    assert spin(5, lambda: window.device_uis(s, "scope") is not None) and calls == [1]  # ... all, in one discovery
+    own = extensions.load(extensions.OWN, "insthub")
+    assert window.device_uis(s, "scope") == window.device_uis(s, "scope2") == (own, [own.ui["scope"]], None)
+    assert window.device_uis(s, "synth") == (own, [], None)
+    missing = "extension lamps is not installed on this computer: insthub ext add FOLDER"
+    assert window.device_uis(s, "lamp") == (None, [], missing)
+    spin(0.3)
+    assert calls == [1]                                                  # asked once, however often it is shown
+    monkeypatch.setattr(window, "render", lambda: renders.append(1))
+    window._uis[s.address] = (-math.inf, *window._uis[s.address][1:])    # a while later: asked again ...
+    window.device_uis(s, "scope")
+    assert spin(5, lambda: len(calls) == 2) and not spin(0.3, lambda: renders)  # ... and nothing new: nothing to show
+    s.probe["devices"]["lamp"] = {**scope, "extension": "insthub-sim"}   # a device that says something new: at once
+    assert window.device_uis(s, "lamp") is None and spin(5, lambda: renders) and len(calls) == 3
+    assert window.device_uis(s, "lamp") == (own, [own.ui["scope"]], None)
 
 
 def test_pause_and_resume_from_the_window(window):
@@ -1559,6 +1621,24 @@ def test_launcher(tmp_path, monkeypatch, capsys):
         assert result.returncode == 0, result.stdout + result.stderr
     assert cli.main(["gui", "--uninstall"]) == 0
     assert not menu.exists() and not shortcut.exists() and not icon.exists() and not autostart.exists()
+
+
+def test_the_log_of_a_server_without_a_journal_or_a_log_file(window, monkeypatch):
+    with insthub.Server("t", [sim.Loopback()], tcp=0):                     # started by hand: no log file here
+        assert spin(5, lambda: word(window, "server", "local:t") == "running")
+        logging.getLogger("insthub.loopback").warning("something to read in the window")
+        window.open_server("local:t")
+        page = window.server_page
+        assert spin(3, lambda: not page.logs.isHidden())
+        page.logs.click()
+        dialog = window._logs["logs:" + window.servers["local:t"].address]
+        assert spin(5, lambda: "WARNING insthub.loopback: something to read in the window" in dialog.text.toPlainText())
+        dialog.hide()
+    monkeypatch.setattr(insthub.server, "FEATURES", insthub.server.FEATURES - {"logs"})   # an older insthub
+    with insthub.Server("old", [sim.Loopback()], tcp=0):
+        assert spin(5, lambda: word(window, "server", "local:old") == "running")
+        window.open_server("local:old")
+        assert spin(3, lambda: window.server_page.server.probe is not None) and window.server_page.logs.isHidden()
 
 
 def test_a_server_started_here_that_fails_says_why(window, monkeypatch):

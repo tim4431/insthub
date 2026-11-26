@@ -33,7 +33,7 @@ from pathlib import Path
 
 from . import cli, config, extensions, registry, service, tomlfile
 from . import widgets as ui
-from .client import _SocketTransport
+from .client import connect
 from .inventory import find_python, server_python
 from .qt import QtCore, QtGui, QtWidgets
 
@@ -252,19 +252,15 @@ def _gone(old: dict, new: dict, path: tuple = ()) -> list[str]:
     for k, v in old.items():
         if k not in new:
             if isinstance(v, dict):
-                out.append(f"<code>{_esc(tomlfile.header((*path, k)))}</code>")
+                out.append(f"<code>{ui.esc(tomlfile.header((*path, k)))}</code>")
             else:
                 line = f"{tomlfile.key(k)} = {tomlfile.value(v)}"
                 line = line if len(line) <= 60 else line[:57] + "..."
-                out.append(f"<code>{_esc(line)}</code>" + (f" in <code>{_esc(tomlfile.header(path))}</code>"
-                                                            if path else ""))
+                out.append(f"<code>{ui.esc(line)}</code>" + (f" in <code>{ui.esc(tomlfile.header(path))}</code>"
+                                                              if path else ""))
         elif isinstance(v, dict) and isinstance(new[k], dict):
             out += _gone(v, new[k], (*path, k))
     return out
-
-
-def _esc(text) -> str:
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def read_config(text: str, base: str | Path | None = None) -> tuple[dict, list[DeviceSpec]]:
@@ -1026,7 +1022,7 @@ class ServerDialog(QtWidgets.QDialog):
         old, new = tomllib.loads(self._original), tomllib.loads(text)
         before = old.get("devices", {})
         names = {d.was: d.name for d in self.devices if d.was is not None}
-        gone = [f"<code>{_esc(tomlfile.header(('devices', n)))}</code>" for n in before if n not in names]
+        gone = [f"<code>{ui.esc(tomlfile.header(('devices', n)))}</code>" for n in before if n not in names]
         if "devices" in old:
             old["devices"] = {names[n]: table for n, table in before.items() if n in names}
             if not old["devices"] and "devices" not in new:
@@ -1254,13 +1250,8 @@ class ServiceDialog(QtWidgets.QDialog):
 # ---------------------------------------------------------------- devices on another computer
 def ask_server(address: str, timeout: float = 4.0) -> tuple[dict, dict]:
     """(its info, its devices) from the server at a tcp:// address."""
-    transport = _SocketTransport(address, connect_timeout=timeout)
-    try:
-        info = transport.request("", "info", (), {}).result(timeout)
-        devices = transport.request("", "devices", (), {}).result(timeout)
-    finally:
-        transport.close()
-    return info, devices
+    with connect(address, timeout=timeout, connect_timeout=timeout) as client:
+        return client.info(), client.describe()
 
 
 def tcp_address(text: str) -> str:

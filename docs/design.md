@@ -70,8 +70,8 @@ flowchart TB
         drv["driver<br/>plain Python + vendor library"]
     end
     subgraph opt["Optional parts of insthub: loaded only by the programs that use them"]
-        gui["qt, viewer, sim_ui, manager, pages,<br/>forms, widgets, inventory"]
-        rest["cli, config, service, launcher, sim, bench,<br/>mcp, render, extensions"]
+        gui["qt, controls, viewer, sim_ui, manager,<br/>pages, forms, widgets, inventory"]
+        rest["cli, config, tomlfile, service, launcher, sim,<br/>bench, mcp, render, extensions"]
     end
     subgraph core["The core: what import insthub loads"]
         c["device, server, client, codec,<br/>wire, registry, errors<br/>needs only numpy and msgpack"]
@@ -100,9 +100,11 @@ extensions, `insthub ext` and `insthub check`, the folders in the servers'
 `.json` files and the New server dialog's list are step 7
 (`insthub/extensions.py`). Starting an extension's UIs (`insthub open`,
 `insthub panel`, `qt.device_window`, the device page's **Open** buttons) is
-step 8. The reference extension (step 9) is still to come. Examples are the
-lab's own instrument projects, folders beside insthub: `hp_8562a_gpib`,
-`windfreak_sythHDprov2`, `m8195a_ripa` and `oscilloscopes`.*
+step 8. A complete extension to copy, `examples/extension/` (a simulated
+laser with a panel and an app, which runs without hardware), is step 9. The
+lab's own instrument projects, folders beside insthub, are the real ones:
+`hp_8562a_gpib` (which has its manifest), `windfreak_sythHDprov2`,
+`m8195a_ripa` and `oscilloscopes`.*
 
 ### What an extension is
 
@@ -137,6 +139,11 @@ hp8562a/                          the project folder, with its own .venv
             panel.py              the panel: make(device, parent=None) -> QWidget
     pyproject.toml                optional (rule 5 below)
 ```
+
+`examples/extension/` in insthub's repository is laid out this way: a
+simulated laser (`demolaser.py`, `demolaser_insthub/`) with a panel, an app
+and a server file. It runs without hardware, the tests run it from `insthub
+check` to `insthub open`, and its README says how to make it your own.
 
 ### Two halves, each where its libraries are
 
@@ -237,8 +244,16 @@ the module search path. An app or panel starts with that folder as its
 working directory and on `PYTHONPATH`, so an extension works as a plain
 folder, without being installed. `{device}` and `{address}` in `run` are
 replaced by the device's name and its server's address; another `{...}` is
-left as it is. Its output goes to `ui/DEVICE-NAME.log` in insthub's runtime
+left as it is. Its output goes to `ui/DEVICE/NAME.log` in insthub's runtime
 folder.
+
+insthub runs nothing of an extension that another user may change: its
+manifest, which says what is run, and its folder, whose modules come first,
+must belong to you (or root) and be writable by no one else. A group of
+your own alone counts as you, since a umask of 002 makes files writable for
+it. This matters because a manifest is also looked for in the folders above
+a device's code, and one of them, such as `/tmp`, may be anyone's. An
+extension that fails this check says why in its error, and offers no UI.
 
 A driver class wrapped from a manifest keeps its safety options in its
 table. For example, the Windfreak synthesizer's raw protocol methods must
@@ -414,10 +429,13 @@ means importing it in the program that needs it.
 
 ### Writing the UI half
 
-*Status: implemented (step 8): `qt.device_window`, `insthub panel`, `insthub
-open`, and insthub's own panel for its simulated scope, `insthub/sim_ui.py`,
-which is the example to copy. [Writing a panel](guide.md#writing-a-panel)
-in the guide is the how-to.*
+*Status: implemented: `qt.device_window`, `insthub panel`, `insthub open`
+(step 8), `qt.start`, `qt.coalesce` and the controls a panel can embed,
+`insthub.controls` (step 11). Examples to copy: insthub's own panel for its
+simulated scope, `insthub/sim_ui.py`, which uses them all, and the panel and
+the app of the reference extension, `examples/extension/demolaser_insthub/ui/`
+(step 9). [Writing a panel](guide.md#writing-a-panel) in the guide is the
+how-to.*
 
 A panel is one function:
 
@@ -427,9 +445,20 @@ def make(device, parent=None) -> QWidget:
 ```
 
 `device` is an ordinary proxy, the same thing `insthub.device(name)` returns.
-The panel uses `qt.watch` for streams and `qt.deliver` for results, so it
-never blocks the GUI thread. It stops its watchers in its widget's
-`closeEvent`, which the window around it sends when it closes. It talks only
+The panel uses `qt.watch` for streams, `qt.start` to start calls and
+`qt.deliver` for results, so it never blocks the GUI thread, not even while
+the proxy reconnects to a server that has gone away. A setting that changes
+faster than the instrument takes it (a slider, a spin box's arrows held down)
+goes out through `qt.coalesce`: one call on its way at a time, and the values
+sent meanwhile merged into the next one, the newest value of each key winning
+(or as a `merge` function says, for keys that go together, such as a center
+and a span), so the instrument never works through a backlog. What the panel does
+not show in a way of its own, `controls.Controls(device, include, exclude)`
+shows: the settings and commands of any device, made from its `describe()`,
+the same widgets as the window's device page (see [a generic
+UI](#a-generic-ui-good-enough-for-most-devices)). It stops its watchers in
+its widget's `closeEvent`, which the window around it sends when it closes.
+It talks only
 through commands, properties and streams, so everything it does can also be
 done from a script or by an agent. qudi has the same rule: a GUI adds
 nothing that the logic's API cannot do.
@@ -523,7 +552,7 @@ there is no version number to name.)
 |---|---|
 | the manifest's format | `api = 1`. insthub refuses a manifest with a higher number and accepts lower ones until one is deliberately dropped. |
 | the extension's code | `version` in the manifest, `extension_version` on the device. When the device states one, the window can say "running 0.3, the folder has 0.4: restart", as LabRAD's node does. The New server dialog never writes `extension_version` into a `.toml`, because it would freeze there, and `insthub check` warns when a class's `extension_version` (read from its source, without running it) differs from its manifest's `version`. |
-| the bus between two programs | Every connection starts with the bytes `INSTHUB1`, so a program that speaks another protocol is refused. The server's first message about itself, the *hello*, carries `protocol`, insthub's `version` and a list of `features` (`server.FEATURES`, today `["dangerous", "meta", "pause"]`), so that a client can ask (`client.supports("pause")`) before it relies on something newer. Both sides skip kinds of message they do not know instead of closing the connection. Together these let a feature arrive without everyone upgrading at once. |
+| the bus between two programs | Every connection starts with the bytes `INSTHUB1`, so a program that speaks another protocol is refused. The server's first message about itself, the *hello*, carries `protocol`, insthub's `version` and a list of `features` (`server.FEATURES`, today `["dangerous", "logs", "meta", "pause"]`), so that a client can ask (`client.supports("pause")`) before it relies on something newer. Both sides skip kinds of message they do not know instead of closing the connection. Together these let a feature arrive without everyone upgrading at once. |
 | `describe()` | Keys are only ever added, and they are optional, so older programs ignore them. |
 
 Servers started before a `git pull`, other computers, and projects that
@@ -546,14 +575,16 @@ one.
 
 | Project | Becomes |
 |---|---|
-| `hp_8562a_gpib` | The reference extension. First, with today's files: a manifest with `driver = "bus_server:SpectrumAnalyzer"`, its simulator, and `[ui.analyzer] run = ["-m", "hp8562a_gui", "--name", "{device}"]`; `SpectrumAnalyzer` gets `extension = "hp8562a"` and `self.simulated = sim`; `hp8562a_gui` learns `--address` and then only attaches. Later, `SpectrumAnalyzer` and the GUI move into `hp8562a_insthub/` (with `bus_server.py` kept as a two-line shim, so services and tests keep working), the GUI matches its device by `extension` instead of `REQUIRED_COMMANDS`, and a panel is offered. |
+| `hp_8562a_gpib` | The first real one, converted in its own repository. The first step, with today's files, is done there: a manifest that `insthub check` passes, with `driver = "bus_server:SpectrumAnalyzer"`, its simulator, and `[ui.analyzer] run = ["-m", "hp8562a_gui", "--address", "{address}", "--name", "{device}"]`; `SpectrumAnalyzer` says `extension = "hp8562a"` and `self.simulated = sim`; `hp8562a_gui` takes `--address` and then only attaches, and knows its device by `extension` (by `REQUIRED_COMMANDS` only on a server older than that). Still to do there: `bus_server.py`, a generic module name (rule 4), moves with `SpectrumAnalyzer` into `hp8562a_insthub/`, and is kept as a two-line shim, so services and tests keep working; a panel may be offered. `examples/extension/` shows each of these parts. |
 | `windfreak_sythHDprov2` | A manifest with one device and no UI. The `Synth` class moves into a package of its own (`bus_server.py` stays as a shim). Its settings are per-channel methods (`frequency(ch)`, `set_frequency(ch, mhz)`), not properties, so the generic page serves it through its commands, with units and ranges once command parameters carry metadata. |
 | `m8195a_ripa` | Two manifests, one per instrument: `m8195a` in the project folder and `redpitaya` in `tools/redpitaya/`. Each device in `bus.toml` gets its `extension` key. `accessors = true` turns the AWG driver's ~40 argument-free `get_X`/`set_X` pairs into properties; its ~30 per-channel pairs stay commands. Its raw I/O methods are excluded or marked dangerous. |
 | `oscilloscopes` | Already a package. It ships its manifest inside the installed package and is the first candidate for finding extensions through entry points. |
 
 ## A generic UI good enough for most devices
 
-*Status: implemented (plan steps 5 and 6), as described below.*
+*Status: implemented (plan steps 5 and 6), as described below. Its controls
+are a widget of their own, `insthub.controls` (step 11): the window's device
+page and any panel use the same ones.*
 
 The cheapest extension UI is the one nobody has to write. If devices describe
 themselves well enough, the generic device page and the AI agent tools cover
@@ -624,7 +655,7 @@ What `import insthub` may load:
 
 What it must not load: Qt in any binding, pyqtgraph, matplotlib,
 `importlib.metadata`, `asyncio`, or any of insthub's optional modules
-(`config`, `extensions`, `qt`, `viewer`, `sim_ui`, `manager`, `pages`,
+(`config`, `extensions`, `qt`, `controls`, `viewer`, `sim_ui`, `manager`, `pages`,
 `forms`, `widgets`, `inventory`, `render`, `mcp`, `sim`, `bench`, `service`,
 `launcher`, `cli`, `tomlfile`). It must not write a file or open a connection
 either.
@@ -633,7 +664,7 @@ either.
 about 40 ms on the lab PC, half of that numpy. About 6 ms of it was
 `asyncio`, which only the asynchronous paths of `client.py` use: `await` on a
 call, `aio()`, `aget()` and `async for` on a subscription. That import now
-happens in them, and `import insthub` adds about 175 modules.
+happens in them, and `import insthub` adds about 170 modules.
 
 **A test makes this a rule, not a habit.** `tests/test_footprint.py` imports
 insthub in a fresh Python, with its runtime and config folders pointed at an
@@ -660,10 +691,10 @@ More rules:
   anyway, so it would save about a millisecond and make the package harder to
   read.
 - The window and the MCP server should use only insthub's public API, so they
-  could move to a separate package one day. Today `forms.py` and
-  `inventory.py` reach into `client._SocketTransport` because `connect()`
-  takes no connect timeout; a public `insthub.connect(address, timeout=...)`
-  removes that.
+  could move to a separate package one day. They connect through
+  `insthub.connect(address, connect_timeout=...)`, which gives the window the
+  short wait it needs, and no longer through `client._SocketTransport`, and
+  take a server's address from the `"address"` of its `discover()` entry.
 - Extensions carry the rule on: their driver and device modules do not import
   Qt (see [rules inside an extension](#rules-inside-an-extension)).
 
@@ -682,9 +713,9 @@ so they are built on guard rails.
 | 6 | **Done.** Dangerous commands: `@command(dangerous=True)`, also for a whole wrapped driver at once. The MCP tools refuse them, including through `$set`, and a seventh tool, `call_dangerous`, runs them, so an agent can be allowed everything else without asking. The window asks before running one. A config file can only add marks, and an accessor pair is marked as a whole. | `device.py`, `mcp.py`, `pages.py` | small |
 | 7 | **Done.** Extension manifests: `insthub/extensions.py` (no Qt, never imported by `import insthub`); `insthub ext list`, `add` and `remove`, and the same on the window's Settings page, with what is wrong with each; `insthub check PATH [--import]` (with `--import`, a manifest's drivers are imported in the extension's Python, and a server file gets the check of `insthub service install`); insthub's own manifest for its simulators; each device's folders and the server's Python in the server's `.json` file (not in the hello); the New server dialog offers the manifests' devices, fills in their keys and runs them with the extension's Python | new module, `cli.py`, `server.py`, `forms.py` | medium |
 | 8 | **Done.** Starting UIs: `extensions.launch` (an app or a panel, in the extension's folder and Python) and `device_uis` (a device's UIs, from its own folders when its server runs here, or why there are none); `insthub open`, `insthub panel`, `qt.device_window`; the device page's **Open** buttons and its tile's menu, and the hint for an extension not installed here; `types` in a `[ui.NAME]` table; insthub's own scope panel (`sim_ui.py`); everything the window starts (servers, live views, UIs) writes a log file through one helper (`inventory.spawn`), and the window shows its last lines when one ends with an error; a stop asked before a Qt program's event loop runs is no longer lost | `extensions.py`, `cli.py`, `qt.py`, `manager.py`, `pages.py`, `inventory.py` | medium |
-| 9 | The reference extension: a skeleton in `examples/extension/`, and `hp_8562a_gpib` converted | `examples/`, the project | medium |
-| 10 | Operations: a server keeps its last log lines, and `insthub logs SERVER` shows them from any computer; `service install` waits until the server answers, and shows the journal if it does not; a limit on restart loops; `insthub.states()` collects every device's state for saving next to a data file; remote addresses in one place for `locate`, `list`, the window and MCP; a public `insthub.connect(address, timeout=...)` | `server.py`, `service.py`, `client.py`, `registry.py` | small each |
-| 11 | Qt helpers for panels: `qt.coalesce` (one request in flight, later values merged into it), and the device page's settings as a widget a panel can embed | `qt.py`, `pages.py` | medium |
+| 9 | **Done** for insthub's part. The reference extension, `examples/extension/`: a simulated laser that runs without hardware, with a manifest; a driver with a module name of its own and no insthub in it; a `Wrapped` device that says its extension and version, that it is simulated, the units and limits of its settings, what it polls and what is dangerous, and keeps its raw protocol off the bus; a panel made of `qt.coalesce`, `qt.watch` and `Controls`; an app that only attaches when it is given an address, and else hosts a laser itself if none runs; a server file; and a README on trying it and making it your own. The tests run it from `insthub check --import` to `insthub open`. Converting `hp_8562a_gpib` belongs to that project, and its first step is done there (see [existing projects](#existing-projects-become-extensions)) | `examples/extension/` | medium |
+| 10 | **Done.** Operations: a server's process keeps its last 1000 log records (`server.keep_logs`; all of them, and exceptions nothing caught, for `insthub serve`, `insthub sim` and `serve()`; insthub's own for a program that hosts a server, from before its devices start, and still printed where they were: Python's last resort for a program that leaves logging alone), and the server call `logs` (the feature `"logs"`) gives them to `Client.logs()`, `insthub logs SERVER [-f]` and the window's **Logs** for a server with no journal or log file; an older server says it keeps none; `service install`, `start` and `restart` wait until the service's process has announced its server, and show the journal's last lines if it does not; a limit on restart loops (5 s apart, 5 starts in 5 minutes; `start` resets it), and the restart count in `insthub service list` and the window; `insthub.states()` and `insthub states` collect every device's state at once for saving next to a data file (each name read where `locate` finds it, so a name two servers have is an error, not a guess; `address=` / `-a` for one server; exit code 1 when what was asked for is missing); remote addresses in one place, `registry.remote_addresses()` (`devices.toml`'s `[devices]` and a new `[servers]` table), for `locate` (which asks those servers for their devices on a miss, cached for 5 s or until `devices.toml` changes), `discover(remote=True)`, `insthub list`, the window and MCP, each server once however many addresses reach it (`registry.identity`: name, pid and start time), and a `devices.toml` that cannot be read named instead of stopping them; looking at a server elsewhere keeps no connection open to it; every `discover()` entry has the `"address"` to use; `insthub logs NAME` looks at this computer first; `insthub.connect(address, connect_timeout=...)` | `server.py`, `service.py`, `client.py`, `registry.py` | small each |
+| 11 | **Done.** Qt helpers for panels: `qt.start` (a call started off the GUI thread, in order per connection, so a server that has gone away never freezes the window); `qt.coalesce` (one call on its way at a time, later values merged into the next one; `send.busy` says whether one is on its way); `qt.deliver(..., owner=widget)` hands nothing to a widget that was deleted; the device page's settings and commands as widgets of their own, `insthub.controls` (`Controls`, `Settings`, `Commands`, with `include` and `exclude`), which the window's device page is made of (it replaces how they reach the device, through its workers) and insthub's scope panel embeds | `qt.py`, `controls.py`, `pages.py`, `sim_ui.py` | medium |
 
 Only when a real need shows up:
 
