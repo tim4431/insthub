@@ -6,6 +6,7 @@ import shlex
 import stat
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -330,6 +331,202 @@ def test_a_server_says_where_its_devices_code_is_on_this_computer_only(tmp_path)
             assert "folders" not in c.info() and "python" not in c.info()
     found = extensions.for_device({"extension": "hp8562a"}, entry["folders"]["dev"])
     assert found.id == "hp8562a" and found.source == "device" and found.folder == folder
+
+
+def edited(path):
+    """Make a file look edited: a modification time one second later."""
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+
+def entry_of(name: str) -> dict:
+    """A server's registry entry, as its file has it (what another program on this computer reads)."""
+    return json.loads((insthub.registry.runtime_dir() / f"{name}.json").read_text())
+
+
+def test_a_server_lists_the_files_of_its_code_on_this_computer_only(tmp_path, monkeypatch):
+    """insthub's own modules and those in its devices' folders, with their times; not the libraries of a
+    Python environment inside such a folder (a project's .venv), and nothing the network hears."""
+    folder = tmp_path / "proj"
+    for lib, name in ((folder / ".venv" / "lib" / "python3" / "site-packages", "codevenvlib"),
+                      (folder / "vendor" / "dist-packages", "codedistlib")):
+        lib.mkdir(parents=True)
+        (lib / f"{name}.py").write_text("X = 1\n")
+        monkeypatch.syspath_prepend(str(lib))
+    extension(folder, HP, python=False, codedev="import insthub, codevenvlib, codedistlib\n\n"
+                                                "class Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("codedev:Dev", str(folder))
+    with insthub.Server("coded", [dev("dev")], tcp=0) as server:
+        code = entry_of("coded")["code"]
+        assert code[str(folder / "codedev.py")] == (folder / "codedev.py").stat().st_mtime_ns
+        assert code[insthub.server.__file__] == os.stat(insthub.server.__file__).st_mtime_ns  # insthub's own
+        assert not any("codevenvlib" in path or "codedistlib" in path or "numpy" in path for path in code)
+        with insthub.connect(server.addresses[-1]) as c:
+            assert "code" not in c.info()
+    assert extensions.outdated({"code": code}) == []
+
+
+def test_a_server_whose_code_changed_since_it_started_is_out_of_date(tmp_path):
+    folder = extension(tmp_path / "proj", HP, python=False, chghelper="X = 1\n", chggone="Y = 1\n",
+                       chgdev="import insthub, chghelper, chggone\n\nclass Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("chgdev:Dev", str(folder))
+    with insthub.Server("chg", [dev("dev")]) as server:
+        assert extensions.outdated(entry_of("chg")) == []                    # up to date
+        edited(folder / "chgdev.py")                                       # a driver edited, its helper not
+        assert extensions.outdated(entry_of("chg")) == ["proj/chgdev.py changed since it started"]
+        (folder / "chggone.py").unlink()
+        changed = ["proj/chgdev.py changed since it started", "proj/chggone.py was deleted since it started"]
+        assert extensions.outdated(entry_of("chg")) == changed
+        server.add(sim.Loopback())                                         # its entry written again ...
+        assert "loopback" in entry_of("chg")["devices"] and extensions.outdated(entry_of("chg")) == changed  # ... still
+        here = next(s for s in insthub.discover() if s["server"] == "chg")  # in this process: the same
+        assert extensions.outdated(here) == changed
+    own = {insthub.server.__file__: 0, insthub.client.__file__: 0}           # insthub updated (a git pull)
+    assert extensions.outdated({"code": own}) == ["insthub/client.py and insthub/server.py changed since it started"]
+    many = {str(tmp_path / "proj" / f"f{n}.py"): 0 for n in range(5)}
+    said = "proj/f0.py, proj/f1.py, proj/f2.py and 2 more were deleted since it started"  # (the first few)
+    assert extensions.outdated({"code": many}) == [said]
+
+
+def test_a_file_loaded_twice_stays_changed(tmp_path, monkeypatch):
+    """A script run as __main__ that is also imported by name is two modules of one file: an edit shows,
+    however often the entry is written."""
+    import importlib.util
+
+    folder = extension(tmp_path / "proj", HP, python=False,
+                       twicedev="import insthub\n\nclass Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("twicedev:Dev", str(folder))
+    spec = importlib.util.spec_from_file_location("twicedev_again", folder / "twicedev.py")
+    again = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(again)
+    monkeypatch.setitem(sys.modules, "twicedev_again", again)
+    with insthub.Server("twice", [dev("dev")]) as server:
+        edited(folder / "twicedev.py")
+        server.add(sim.Loopback())                                         # its entry written again
+        assert extensions.outdated(entry_of("twice")) == ["proj/twicedev.py changed since it started"]
+
+
+def test_a_module_reloaded_is_code_loaded_anew(tmp_path):
+    """importlib.reload (IPython's %autoreload) runs a module's code again, in the same module: a server started after
+    it runs the edited code, so it is not out of date.  Without it, the module still has the code loaded before."""
+    import importlib
+
+    folder = extension(tmp_path / "proj", HP, python=False, reldev="import insthub\n\nclass Dev(insthub.Device):\n"
+                                                                   "    pass\n")
+    module = sys.modules[config.load_object("reldev:Dev", str(folder)).__module__]
+    changed = ["proj/reldev.py changed since it started"]
+    with insthub.Server("rel", [module.Dev("dev")]):
+        edited(folder / "reldev.py")
+        assert extensions.outdated(entry_of("rel")) == changed
+    with insthub.Server("rel", [module.Dev("dev")]):                       # started again in this process: ...
+        assert extensions.outdated(entry_of("rel")) == changed               # ... the code loaded before, still
+    importlib.reload(module)
+    with insthub.Server("rel", [module.Dev("dev")]):
+        assert extensions.outdated(entry_of("rel")) == []
+
+
+def until(seconds, done):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end and not done():
+        time.sleep(0.02)
+    return done()
+
+
+def test_a_module_imported_after_it_started_is_listed_too(tmp_path):
+    """A helper that a driver imports inside a command (or when it connects): its server writes its entry again within
+    about a second, so an edit of the helper shows too."""
+    folder = extension(tmp_path / "proj", HP, python=False, latehelper="X = 'hi'\n",
+                       latedev="import insthub\n\nclass Dev(insthub.Device):\n    @insthub.command\n"
+                               "    def hello(self):\n        from latehelper import X\n        return X\n")
+    dev = config.load_object("latedev:Dev", str(folder))
+    helper = str(folder / "latehelper.py")
+    with insthub.Server("late", [dev("box")]) as server:
+        assert helper not in entry_of("late")["code"]
+        assert server.device("box").hello() == "hi"                         # imports it
+        assert until(5, lambda: helper in entry_of("late")["code"])
+        edited(folder / "latehelper.py")
+        assert extensions.outdated(entry_of("late")) == ["proj/latehelper.py changed since it started"]
+
+
+def test_listing_its_code_never_stops_a_server(tmp_path, monkeypatch):
+    """A module that importlib.util.LazyLoader put in sys.modules loads when one of its attributes is read, and may fail
+    to (an optional dependency missing): listing the code reads none, so the server starts and the module stays as it
+    was.  A list that cannot be made is left out of the entry: a notice is never a reason not to start."""
+    import importlib.util
+    import types
+
+    folder = extension(tmp_path / "proj", HP, python=False, lazyopt="raise ImportError('a dependency is missing')\n",
+                       lazydev="import insthub\n\nclass Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("lazydev:Dev", str(folder))
+    spec = importlib.util.spec_from_file_location("lazyopt", folder / "lazyopt.py")
+    spec.loader = importlib.util.LazyLoader(spec.loader)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setitem(sys.modules, "lazyopt", module)
+    with insthub.Server("lazy", [dev("dev")]):
+        assert str(folder / "lazyopt.py") in entry_of("lazy")["code"]       # listed (in its device's folder) ...
+        assert type(module) is not types.ModuleType                         # ... and not loaded
+
+    def broken(folders):
+        raise RuntimeError("cannot be listed")
+
+    monkeypatch.setattr(insthub.server, "_code", broken)
+    with insthub.Server("nocode", [dev("dev")]):
+        entry = entry_of("nocode")
+        assert "code" not in entry and extensions.outdated(entry) == []
+        assert any(s["server"] == "nocode" for s in insthub.discover())
+
+
+def test_insthub_list_says_which_server_is_out_of_date(tmp_path, capsys):
+    folder = extension(tmp_path / "proj", HP, python=False,
+                       lstdev="import insthub\n\nclass Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("lstdev:Dev", str(folder))
+    with insthub.Server("lst", [dev("box")]):
+        assert cli.main(["list"]) == 0
+        assert "out of date" not in capsys.readouterr().out                 # nothing while it is up to date
+        edited(folder / "lstdev.py")
+        assert cli.main(["list"]) == 0
+        lines = capsys.readouterr().out.splitlines()                       # under the server, above its devices
+        assert lines[0].startswith("lst  (pid ") and lines[2].split()[:2] == ["box", "Dev"]
+        assert lines[1] == "    out of date: proj/lstdev.py changed since it started; a restart loads the new code"
+
+
+def test_what_cannot_be_judged_is_never_out_of_date(tmp_path):
+    """A server on another computer (no registry entry here), one of an older insthub (no "code"), and an
+    entry whose code is not what insthub writes."""
+    file = tmp_path / "gone.py"
+    folders = {"sa": [str(extension(tmp_path / "hp", HP))]}
+    versioned = {"sa": {"type": "Analyzer", "extension": "hp8562a", "extension_version": "0.1"}}
+    assert extensions.outdated(None, versioned) == []                         # elsewhere: never judged
+    assert extensions.outdated({"server": "old", "pid": 1}) == []           # an older insthub's entry
+    assert extensions.outdated({"server": "odd", "code": [str(file)]}) == []
+    assert extensions.outdated({"server": "odd", "code": {"gone.py": 0, str(file): "0", str(tmp_path): None}}) == []
+    assert extensions.outdated({"server": "old", "started": 0, "folders": folders}, versioned) == [  # versions: told
+        "the folder has hp8562a 0.3, it runs 0.1"]
+    assert extensions.outdated({"server": "old", "folders": folders}, versioned) == []  # (without its start time: not)
+
+
+def test_a_device_that_runs_another_version_than_its_folder_holds(home, tmp_path):
+    """Its manifest's version raised since the server started (a git pull): a restart loads the new code.  A class and
+    its manifest that disagree on disk already when it starts are `insthub check`'s business: a restart would not make
+    them agree, so it is never told to."""
+    folder = extension(tmp_path / "hp", HP, verdev="import insthub\n\nclass Analyzer(insthub.Device):\n"
+                                                   "    extension = 'hp8562a'\n    extension_version = '0.2'\n")
+    dev = config.load_object("verdev:Analyzer", str(folder))
+    with insthub.Server("ver", [dev("sa"), sim.Loopback()]) as server:
+        entry = entry_of("ver")
+        devices = {name: d._rt.describe() for name, d in server.devices.items()}
+        assert extensions.outdated(entry, devices) == []                     # 0.2 and 0.3 from the start: not older code
+        later = int(entry["started"] * 1e9) + 1000                          # the manifest changed after it started
+        os.utime(folder / extensions.MANIFEST, ns=(later, later))
+        assert extensions.outdated(entry, devices) == ["the folder has hp8562a 0.3, it runs 0.2"]
+        assert extensions.outdated(entry) == []                              # its devices are not known
+        assert extensions.outdated(entry, {"sa": {**devices["sa"], "extension_version": "0.3"}}) == []
+        extensions.add_folder(extension(tmp_path / "copy", HP))              # another copy, which it does not run
+        assert extensions.outdated({**entry, "folders": {"sa": [str(tmp_path)]}}, devices) == []
+    with insthub.Server("ver", [dev("sa")]) as server:                       # restarted: its class still says 0.2, ...
+        entry, devices = entry_of("ver"), {"sa": server.devices["sa"]._rt.describe()}
+        assert devices["sa"]["extension_version"] == "0.2" and extensions.outdated(entry, devices) == []  # ... no notice
 
 
 def test_a_device_s_extension(home, tmp_path):

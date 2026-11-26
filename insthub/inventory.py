@@ -450,6 +450,7 @@ class Server:
     declared: list = dataclasses.field(default_factory=list)  #: device names known before asking the server
     service: dict | None = None
     python: str | None = None  #: the Python it runs in, as its registry file says (a server running here)
+    entry: dict | None = None  #: its registry entry (a server running here): what its probes judge its code by
     probe: dict | None = None
     probed_at: float = 0.0
     error: str | None = None
@@ -477,6 +478,12 @@ class Server:
 
     def device_names(self) -> list[str]:
         return list(self.probe["devices"]) if self.probe else list(self.declared)
+
+    @property
+    def outdated(self) -> list[str]:
+        """Why it runs older code than its folders hold, as its last probe found out (see
+        extensions.outdated); none if it does not, or that is not known."""
+        return (self.probe or {}).get("outdated") or []
 
     def forget_live_data(self) -> None:
         self.probe, self.error, self.rates = None, None, {}

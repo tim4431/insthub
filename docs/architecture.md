@@ -228,11 +228,21 @@ account made it or may write to it):
       rf.json                                                   ["synth", "sa"]
 ```
 
-The `.json` file also says two things that only programs on this computer
-need, so the server never sends them over the network: the Python it runs in,
-and for each device the folders its code comes from. From those folders, the
-window and `insthub ext list` find the device's
-[extension](design.md#how-a-device-finds-its-extension).
+The `.json` file also says three things that only programs on this computer
+need, so the server never sends them over the network:
+
+| Key | What it holds | Who reads it |
+|---|---|---|
+| `python` | the Python the server runs in | the window, to say when a device added to it needs another Python |
+| `folders` | for each device, the folders its code comes from | the window and `insthub ext list`, to find the device's [extension](design.md#how-a-device-finds-its-extension); the window and `insthub list`, to compare the version the device states with its extension's (see the `code` row) |
+| `code` | the files of the code the server loaded, each with its modification time (`st_mtime_ns`) when the server first listed it (again after `importlib.reload`): insthub's own modules, and those in its devices' folders but not in a Python environment there (a project's `.venv`) | the window and `insthub list`, to tell that the server runs older code than the disk holds (see [versions](design.md#versions)) |
+
+The other keys are those of the server's hello (see [what travels on a
+connection](#what-travels-on-a-connection)): its name, pid, start time,
+addresses, devices, protocol, version and features. The server writes the
+file when it starts, again when a device is added, and again within about a
+second when its process has loaded more modules (a helper that a driver
+imports inside a command), so that `code` lists them too.
 
 `insthub.device("synth")` looks, in this order:
 
@@ -416,7 +426,8 @@ sequenceDiagram
         G->>W: probe()
         W->>S: info, devices, $state of each device
         S-->>W: answers
-        W-->>G: what it said, and how fast it answered
+        W->>W: its code on disk, its manifests: out of date?
+        W-->>G: what it said, how fast it answered, and whether it is out of date
     end
     opt a stream has a new frame (and the window is open)
         G->>W: latest()
@@ -450,6 +461,14 @@ sequenceDiagram
   (`extensions.server_uis`, from the folders in its server's `.json` file
   when the server runs here), after a probe or when the page opens, at most
   every 30 seconds unless the devices or their extensions change.
+- **Out of date**: with each probe of a server on this computer, the worker
+  thread also compares the files in the server's `.json` file with the disk,
+  and the versions its devices state with their manifests, where a manifest
+  changed since the server started (`extensions.outdated`, the rule `insthub
+  list` follows too). A server that
+  runs older code than its folders hold gets an OUT OF DATE mark on its card
+  and above its devices, and its page says what changed and how to restart
+  it.
 - **What the window starts** (servers, the live view, UIs) runs in a session
   of its own, so it outlives the window, and writes its output to a log file
   in the runtime folder (`inventory.spawn`). When one of them ends with an

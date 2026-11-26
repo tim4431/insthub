@@ -119,6 +119,48 @@ system's own autostart mechanism.
 your desktop session, so start it from a launcher or the desktop's autostart,
 not as a service.
 
+## After changing code
+
+A server loads its code once, when it starts. After you edit a driver, pull a
+new version of an extension or update insthub, the servers that were running
+still run the old code. insthub says which ones:
+
+- `insthub list` adds a line under such a server:
+
+  ```
+  lab  (pid 4242)  ipc:///run/user/1000/insthub/lab.sock
+      out of date: hp8562a_insthub/device.py changed since it started; a restart loads the new code
+      analyzer         SpectrumAnalyzer connected; ...
+  ```
+
+- the window marks it **OUT OF DATE** on its card and above its devices, and
+  its page says what changed and how to restart it.
+
+Restart the servers marked so: a service with `insthub service restart NAME`
+(or **Restart** on its page in the window), a server you started in a
+terminal where you started it. Programs using it get an error for calls under
+way, then reconnect by themselves.
+
+How it knows: a server writes into its `.json` file in the runtime folder
+the files of the code it loaded, and when each was last changed at that
+time. Those are insthub's own modules and the modules in its devices'
+folders, but not the libraries of a virtualenv in such a folder (a project's
+`.venv`). A module that a driver imports later, inside a command say, is
+added within about a second. A file changed or deleted since then is code
+the server does not run. It compares times, not contents, so a file saved
+without a change counts too.
+
+When the manifest of a device's extension changed after the server started
+(a `git pull`), the `version` it holds is also compared with the
+`extension_version` the device states ("the folder has demo-laser 0.2, it
+runs 0.1"). Versions that disagreed already when the server started are not
+a sign of old code, since a restart would not change them: `insthub check`
+warns about a class and a manifest that disagree.
+
+Only servers on this computer are judged: one on another computer, or one
+started by an older insthub, which writes no such list, is never marked for
+its files.
+
 ## Reading a server's log
 
 Every server keeps the last 1000 lines it logged, and `insthub logs` shows
@@ -197,7 +239,9 @@ in every folder without activating anything, and AI agents can start it by
 name (see [AI agents](agents.md#setting-it-up)). `--editable` makes it run the
 code of your checkout, like the projects that installed insthub with `-e`.
 After a `git pull` every program runs the same version. Servers started
-before the pull still run the old one until they restart; that works, since
+before the pull still run the old one until they restart (`insthub list` and
+the window mark them: see [after changing code](#after-changing-code)); that
+works, since
 each server says which version it runs and what it supports, and skips
 messages it does not know ([what travels on a
 connection](architecture.md#what-travels-on-a-connection)). An older server

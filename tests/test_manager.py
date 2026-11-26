@@ -914,6 +914,44 @@ def test_what_a_device_says_of_its_extension_is_shown_as_text(window):
         assert "extension &lt;b&gt;x&lt;/b&gt; is not installed" in hint and "<b>x" not in hint
 
 
+def test_the_window_says_which_server_runs_older_code(window, monkeypatch, tmp_path):
+    """Its card, its section of the Devices page, its page (with Restart, where the window can restart it)
+    and its devices' pages say that it runs older code than its folders hold, and why; nothing while it
+    does not."""
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    (folder / "olddev.py").write_text("import insthub\n\nclass Dev(insthub.Device):\n    pass\n")
+    dev = config.load_object("olddev:Dev", str(folder))
+    with insthub.Server("t", [dev("box")]):
+        assert spin(5, lambda: "local:t" in window.servers and window.servers["local:t"].probe)
+        s = window.servers["local:t"]
+        window.open_server("local:t")
+        page = window.server_page
+        assert s.outdated == [] and page.code.isHidden() and pages.server_view(s).badge == ""   # up to date
+        st = (folder / "olddev.py").stat()
+        os.utime(folder / "olddev.py", ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))   # the driver edited
+        why = "Out of date: proj/olddev.py changed since it started."
+        assert spin(5, lambda: why in page.code.text()) and not page.code.isHidden()
+        assert "Restart it where you started it to load the new code." in page.code.text()   # (started by hand)
+        view = pages.server_view(s)
+        assert view.badge == pages.OUTDATED and why in view.tip
+        monkeypatch.setattr(window, "started_here", lambda pid: True)        # one the window can restart
+        restarted = []
+        monkeypatch.setattr(window, "restart_server", lambda s, ask=False, **_: restarted.append((s.name, ask)))
+        assert spin(5, lambda: "<a href='restart'>Restart</a> loads the new code." in page.code.text())
+        page.code.linkActivated.emit("restart")
+        assert restarted == [("t", True)]                                    # as its Restart button does
+        window.show_page("devices")
+        tag = window.devices_page.sections["local:t"].outdated
+        assert not tag.isHidden() and why in tag.toolTip()
+        window.open_device("local:t", "box")
+        assert spin(5, lambda: why in window.device_page.via.text())
+        os.utime(folder / "olddev.py", ns=(st.st_atime_ns, st.st_mtime_ns))  # as it was: up to date again
+        assert spin(5, lambda: why not in window.device_page.via.text()) and s.outdated == []
+        window.show_page("devices")
+        assert tag.isHidden()
+
+
 def test_a_program_that_ends_between_two_looks_is_still_reported(window, monkeypatch, tmp_path):
     said = []
     monkeypatch.setattr(window, "say", lambda text, ms=5000: said.append(text))

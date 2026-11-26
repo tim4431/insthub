@@ -78,8 +78,10 @@ flowchart LR
   runs without hardware.
 - **Looked after.** `insthub logs SERVER` shows what any server logged, from
   any computer. A service waits until its server answers, shows why it did
-  not, and stops restarting one that cannot start. `insthub.states()` saves
-  what every instrument was set to, next to your data.
+  not, and stops restarting one that cannot start. After you edit a driver or
+  update insthub, `insthub list` and the window say which servers still run
+  the old code and need a restart. `insthub.states()` saves what every
+  instrument was set to, next to your data.
 - **AI agents, in plain sight.** Claude Code or any agent that speaks MCP can
   read your instruments' documentation and use them, and the window shows
   when one does.
@@ -196,7 +198,7 @@ you list:
   stays off the instrument until you resume it, while you use it by hand.
 - **Servers**: start, stop and restart them, read their logs, choose whether
   each starts at login, edit their config, and see which programs are
-  connected.
+  connected, and which servers run older code than their folders hold.
 - **Add**: write the config of a new server by picking its drivers (or the
   devices your extensions offer), keep a server running in the background, or
   add the devices of another computer.
@@ -236,7 +238,7 @@ gui` does this setup with a click and shows which agents are connected. See
 
 ## Status
 
-- 488 tests cover calls, streams, device lifecycle, finding servers,
+- 499 tests cover calls, streams, device lifecycle, finding servers,
   reconnecting, mixed insthub versions, the command line, config files,
   services, extensions (the reference extension among them), the GUIs, the
   agent interface, and how little `import insthub` loads. Run them with

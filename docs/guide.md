@@ -627,8 +627,14 @@ one ends with an error, the window shows its last lines.
 
 **Servers** shows a card per server. Open one to see its process, its
 addresses, its service, its config file, its devices and the programs
-connected to it. A service can be started, stopped, restarted and removed
-there, and **Starts at login** switched on or off; its page says how often
+connected to it. A server that runs older code than its folders hold (you
+edited a driver or updated insthub after it started) is marked **OUT OF
+DATE** on its card and above its devices. Its page says what changed, with a
+**Restart** link when the window can restart it (a service, or a server the
+window started), and its devices' pages say it too (see [after changing
+code](running-servers.md#after-changing-code)). A service can be started,
+stopped, restarted and removed there, and **Starts at login** switched on or
+off; its page says how often
 systemd restarted it after a crash. A server started by hand can be
 stopped. **Logs** shows what a server logged: a service's journal, the
 output of a server the window started, or, for any other server (one
@@ -774,7 +780,7 @@ seconds and, if it ended with an error by then, prints the log's last lines.
 
 ```
 insthub list                                   servers and devices on this computer, and on the computers
-                                               devices.toml names
+                                               devices.toml names; which servers here run older code
 insthub states [DEVICE ...] [--json]           what every device is like now (to save next to a data file);
                                                with -a, one server's; exit code 1 if what you asked for is missing
 insthub logs SERVER [-n N] [--level L] [-f]    what a server logged, from any computer; -f follows it
