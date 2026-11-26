@@ -82,6 +82,12 @@ flowchart LR
   update insthub, `insthub list` and the window say which servers still run
   the old code and need a restart. `insthub.states()` saves what every
   instrument was set to, next to your data.
+- **Updated in one step.** `insthub service update` restarts the services
+  that run older code and writes anew the units an older insthub wrote, with
+  the same Python, never starting one that is stopped; `--check` tells a
+  script whether anything needs doing, and `--json` says it as data. In the
+  window it is **Update** on a server, or **Update all**. The window and an
+  agent's `insthub mcp` say when they run older code themselves.
 - **AI agents, in plain sight.** Claude Code or any agent that speaks MCP can
   read your instruments' documentation and use them, and the window shows
   when one does.
@@ -198,7 +204,8 @@ you list:
   stays off the instrument until you resume it, while you use it by hand.
 - **Servers**: start, stop and restart them, read their logs, choose whether
   each starts at login, edit their config, and see which programs are
-  connected, and which servers run older code than their folders hold.
+  connected, and which servers run older code than their folders hold;
+  **Update** (or **Update all**) loads the new code.
 - **Add**: write the config of a new server by picking its drivers (or the
   devices your extensions offer), keep a server running in the background, or
   add the devices of another computer.
@@ -238,7 +245,7 @@ gui` does this setup with a click and shows which agents are connected. See
 
 ## Status
 
-- 499 tests cover calls, streams, device lifecycle, finding servers,
+- 513 tests cover calls, streams, device lifecycle, finding servers,
   reconnecting, mixed insthub versions, the command line, config files,
   services, extensions (the reference extension among them), the GUIs, the
   agent interface, and how little `import insthub` loads. Run them with
@@ -265,7 +272,7 @@ insthub/
   wire.py       the layout of a message on a connection
   registry.py   finding servers by name         errors.py   the exceptions a call can raise
   config.py     servers from a TOML file        tomlfile.py changing one in place, comments kept
-  service.py    insthub service: background services
+  service.py    insthub service: background services, and bringing them up to date
   extensions.py finding, checking and starting extensions (insthub ext, check, open)
   qt.py         helpers for Qt GUIs             viewer.py   the generic live viewer
   controls.py   a device's settings and commands, for the window and for panels

@@ -65,6 +65,13 @@ claude mcp add --scope user insthub -- insthub mcp
 
 - **Check it.** `claude mcp list` shows whether it connects, and `/mcp`
   inside a session shows its tools.
+- **After an update.** The agent starts `insthub mcp` once per session, so
+  after a `git pull` it still runs the old code. `list_devices` then adds a
+  note ("this insthub mcp runs older insthub code than the disk holds
+  (insthub/mcp.py changed since it started): ask the user to reconnect it"),
+  and the agent can ask you to reconnect it: in Claude Code, `/mcp`, then
+  reconnect insthub. The servers themselves are brought up to date as
+  [updating](running-servers.md#updating) says.
 
 Other MCP clients (Claude Desktop, other agents) take the same command and
 arguments in their own configuration.
@@ -360,6 +367,10 @@ There are two ways:
   Code asks before each tool call unless you allow the tools: allow the
   read-only ones (`list_devices`, `describe`, `get`, `snapshot`), or every
   tool except `call_dangerous`.
+- **It does not restart servers or services.** A restart drops an
+  instrument for a few seconds, for every program that uses it, so no tool
+  does it. An agent that has a shell can run `insthub service update`, as
+  you can, when you ask it to.
 - **It cannot stop a command once it has started.** If a call outlasts its
   timeout, the agent is told the command may still be running, and later
   calls to that device wait behind it (see

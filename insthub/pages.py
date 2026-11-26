@@ -8,11 +8,12 @@ a server: anything it asks for goes through the window's workers.
                    periodic tasks, state and commands (to run); Pause and Resume; an Open
                    button for each UI of its extension.  Its Settings and Commands tabs are
                    the controls a panel can embed too (controls.py)
-    ServersPage    a card per server
+    ServersPage    a card per server; Update all, when a server can be updated
     ServerPage     a server: its process, addresses, service (and whether it starts at
-                   login), devices and clients
+                   login, and whether its unit is out of date), devices and clients
     AgentsPage     giving AI agents the instruments (insthub mcp); which are connected
-    SettingsPage   how the window looks and behaves; the files insthub uses
+    SettingsPage   how the window looks and behaves; the files insthub uses; whether the
+                   window itself runs older code
     LogDialog      a server's output, followed live
 
 device_view() and server_view() say what a tile shows; widgets.py draws it.
@@ -64,7 +65,7 @@ RESUME_TIP = "End the pause: its commands run again, and it reconnects if it was
 RELEASE_TIP = ("Close the instrument session for other software for a moment; the next command, or the next run "
                "of a periodic task, opens it again (Pause keeps it closed)")
 SIM_TIP = "Simulated: it talks to a simulator, not to an instrument, so its data is not a measurement."
-OUTDATED = "OUT OF DATE"  #: the mark of a server that runs older code than its folders hold
+OUTDATED = "OUT OF DATE"  #: the mark of a server that runs older code than its folders hold (or whose unit is old)
 
 
 def open_path(path: str | Path) -> bool:
@@ -81,6 +82,12 @@ def outdated_text(s: Server, restart: str = "A restart loads the new code.") -> 
     """Why a server runs older code than its folders hold, in a sentence, then `restart`: what
     loads the new code ("" when it runs what they hold)."""
     return f"Out of date: {'; '.join(s.outdated)}. {restart}".rstrip() if s.outdated else ""
+
+
+def stale_text(s: Server) -> str:
+    """What is old about the unit of a server's service, in a sentence ("" when nothing is)."""
+    stale = (s.service or {}).get("stale")
+    return f"Its unit is out of date: {stale}." if stale else ""
 
 
 # ---------------------------------------------------------------- what tiles show
@@ -183,8 +190,10 @@ def server_view(s: Server) -> ui.TileView:
     via = routes(s) if s.origin == "local" else ""
     view = ui.TileView(title=s.name, subtitle=f"{where} · {via}" if via else where,
                        icon="globe" if s.origin == "remote" else "servers", status=status, word=word, tip=sentence)
-    if s.outdated:
-        view.badge, view.tip = OUTDATED, f"{sentence}\n{outdated_text(s)}"
+    stale = (s.service or {}).get("stale")
+    if s.outdated or stale:
+        view.badge = OUTDATED
+        view.tip = "\n".join(x for x in (sentence, outdated_text(s), stale_text(s)) if x)
     if s.probe:
         devices = list(s.probe["devices"].values())
         connected = sum(1 for d in devices if d["status"]["connected"])
@@ -525,6 +534,10 @@ class ServersPage(_Page):
     def __init__(self, window: Manager):
         super().__init__("Servers")
         self.window = window
+        self.update_all = ui.button("Update all", "up", tip="Load new code where a server runs older code, and "
+                                    "write service units of an older insthub anew (it asks first, and says what "
+                                    "restarts)", slot=lambda: window.update_servers(window._ordered()))
+        self.header.actions.addWidget(self.update_all)
         self.header.actions.addWidget(window.add_button())
         self.grid_host = QtWidgets.QWidget()
         self.grid = ui.GridFlow(self.grid_host, min_width=300)
@@ -548,6 +561,7 @@ class ServersPage(_Page):
                 tile.menu_requested.connect(lambda pos, key=s.key: self.window.server_menu(key, pos))
             tile.set_view(server_view(s))
         self.grid.set_order([self.tiles[k] for k in keys])
+        self.update_all.setVisible(any(self.window.update_plan(s) for s in servers))
         self.note.setText("" if servers or not scanned else
                           "No server is running, none is installed as a service, and devices.toml lists none. "
                           "Add sets one up.")
@@ -572,6 +586,7 @@ class ServerPage(_Page):
                                slot=lambda: window.service_action(self.server, "start"))
         self.restart = ui.button("Restart", "refresh", tip="Stop and start again, e.g. after changing its code or "
                                  "config", slot=self._restart)
+        self.update_button = ui.button("Update", "up", slot=lambda: window.update_servers([self.server]))
         self.stop = ui.button("Stop", "stop", tip="Stop the server; its devices close their instruments",
                               slot=self._stop)
         self.logs = ui.button("Logs", "logs", tip="What the server printed", slot=lambda: window.show_logs(self.server))
@@ -593,7 +608,7 @@ class ServerPage(_Page):
         self.forget = menu.addAction(ui.icon("trash"), "Remove from devices.toml...")
         self.forget.triggered.connect(lambda *_: window.forget_remote(self.server))
         self.more.setMenu(menu)
-        for button in (self.start, self.restart, self.stop, self.logs, self.more):
+        for button in (self.start, self.restart, self.update_button, self.stop, self.logs, self.more):
             self.header.actions.addWidget(button)
 
         self.facts = _Facts()
@@ -601,11 +616,16 @@ class ServerPage(_Page):
         self.code = self.facts.row("Code")  #: shown while it runs older code than its folders hold
         self.code.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
                                           | Qt.TextInteractionFlag.LinksAccessibleByMouse)
-        self.code.linkActivated.connect(lambda *_: self._restart())
+        self.code.linkActivated.connect(lambda link: window.update_servers([self.server]) if link == "update"
+                                        else self._restart())
         self.process = self.facts.row("Process")
         self.reach = self.facts.row("Reached at")
         self.latency = self.facts.row("Answers in")
         self.service = self.facts.row("Service")
+        self.unit = self.facts.row("Unit")  #: shown while its service's unit is out of date, or was not checked
+        self.unit.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
+                                          | Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.unit.linkActivated.connect(lambda *_: window.update_servers([self.server]))
         self.login = ui.Switch()
         self.login.toggled.connect(lambda on: window.set_login(self.server, bool(on)))
         self.login_row = self.facts.control_row("Starts at login", self.login)
@@ -719,8 +739,22 @@ class ServerPage(_Page):
         self.start.setVisible(bool(u) and not running)
         self.stop.setVisible((bool(u) and running) or (running and not u and bool(s.pid) and not mine))
         self.restart.setVisible(restartable)
+        steps = self.window.update_plan(s)
+        self.update_button.setVisible(bool(steps))
+        self.update_button.setToolTip(f"{service.plan_text(steps).capitalize()} (it asks first)" if steps else "")
+        if stale_text(s):
+            f.show_row(self.unit, _badge(BUSY, stale_text(s)) + " <a href='update'>Update</a> writes it anew, with the "
+                       "same file and Python" + (", and restarts it." if "restart" in steps else
+                                                 "; it does not run, so it is not started."))
+        else:  # (not judged: Update leaves it as it is)
+            unchecked = (u or {}).get("unchecked")
+            f.show_row(self.unit, ui.muted(ui.esc(f"Not checked: {unchecked}, so Update leaves it as it is."))
+                       if unchecked else None)
         if not s.outdated:
             f.show_row(self.code, None)
+        elif "rewrite" in steps:  # (one Update does both, with one restart)
+            f.show_row(self.code, _badge(BUSY, outdated_text(s, "")) + " <a href='update'>Update</a> loads the new "
+                       "code and writes its unit anew.")
         elif restartable:  # (the link restarts it, as Restart above does)
             f.show_row(self.code, _badge(BUSY, outdated_text(s, "")) + " <a href='restart'>Restart</a> loads the new code.")
         else:
@@ -1169,6 +1203,13 @@ class SettingsPage(_Page):
         settings = window.settings
         self.header.subtitle.setText("How this window looks and behaves. Your servers are not affected.")
 
+        self.outdated_card, box0 = ui.card()  #: first on the page, shown while this window runs older code
+        self.outdated = ui.label("", wrap=True, select=True)
+        self.outdated.setTextFormat(Qt.TextFormat.RichText)
+        box0.addWidget(self.outdated)
+        self.outdated_card.hide()
+        self.outdated.hide()
+
         look, box = ui.card()
         box.addWidget(ui.label("Appearance", "h2"))
         self.theme = QtWidgets.QComboBox()
@@ -1234,9 +1275,24 @@ class SettingsPage(_Page):
         box4.addWidget(ui.label(f"insthub {__version__} · Python {sys.version.split()[0]} "
                                 f"(<code>{ui.esc(sys.executable)}</code>) · {BINDING} on Qt {version}", "small",
                                 wrap=True, select=True))
-        for widget in (look, tray, files, exts, about):
+        for widget in (self.outdated_card, look, tray, files, exts, about):
             self.body.addWidget(widget)
         self.body.addStretch(1)
+
+    def show_outdated(self, reasons: list[str]) -> None:
+        """Say that this window runs older insthub code than the disk holds, and why (extensions.outdated_here),
+        or nothing when it does not."""
+        quit_how = "Quit in its tray menu" if self.window.tray is not None else "close it"
+        self.outdated.setText(_badge(BUSY, f"This window runs older insthub code: {'; '.join(reasons)}.") +
+                              f" To load the new code, quit it ({quit_how}) and start it again; your servers "
+                              "keep running." if reasons else "")
+        self.outdated.setVisible(bool(reasons))
+        self.outdated_card.setVisible(bool(reasons))
+
+    def show_notice(self) -> None:
+        """Show this page at its top, where it says that this window runs older code (the sidebar's link)."""
+        self.window.show_page("settings")
+        self.scroll.verticalScrollBar().setValue(0)
 
     def _theme_chosen(self) -> None:
         self.window.settings.setValue("theme", self.theme.currentData())
@@ -1351,6 +1407,8 @@ class Sidebar(QtWidgets.QWidget):
             button.clicked.connect(lambda *_, name=name: window.show_page(name))
         self.summary = ui.label("", "small", wrap=True)
         self.summary.setTextFormat(Qt.TextFormat.RichText)
+        self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.summary.linkActivated.connect(lambda *_: window.settings_page.show_notice())  # (this window is out of date)
         box = QtWidgets.QVBoxLayout(self)
         box.setContentsMargins(14, 18, 14, 14)
         box.setSpacing(2)
@@ -1366,7 +1424,8 @@ class Sidebar(QtWidgets.QWidget):
     def select(self, name: str) -> None:
         self.nav[name].setChecked(True)
 
-    def sync(self, servers: list[Server], agents: int, scanned: bool) -> None:
+    def sync(self, servers: list[Server], agents: int, scanned: bool, outdated: list[str] = ()) -> None:
+        """Show the counts and what is wrong; `outdated`: why this window runs older code, if it does."""
         total = sum(len(s.device_names()) for s in servers)
         broken_devices = sum(1 for s in servers if s.probe for d in s.probe["devices"].values()
                              if device_state(d)[0] == BAD)
@@ -1385,6 +1444,9 @@ class Sidebar(QtWidgets.QWidget):
             lines.append(_badge(BAD, f"{broken_devices} not connected"))
         if broken_servers:
             lines.append(_badge(BAD, f"{_count(broken_servers, 'server')} in trouble"))
+        if outdated:
+            lines.append(f"<span style='color:{ui.STATUS[BUSY]}'>&#9679;</span>&nbsp;"
+                         "<a href='settings'>This window runs older code</a>")
         self.summary.setText("<br>".join(lines))
 
 

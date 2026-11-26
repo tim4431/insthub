@@ -468,7 +468,12 @@ sequenceDiagram
   list` follows too). A server that
   runs older code than its folders hold gets an OUT OF DATE mark on its card
   and above its devices, and its page says what changed and how to restart
-  it.
+  it. **Update** on its page or card, and **Update all** on the Servers
+  page, bring servers up to date: a service through `service.update` on a
+  worker thread (the same function as `insthub service update`, which also
+  writes anew a unit an older insthub wrote), a server the window started by
+  restarting it. With each scan, the worker also asks whether the window's
+  own insthub code changed since it started (`extensions.outdated_here`).
 - **What the window starts** (servers, the live view, UIs) runs in a session
   of its own, so it outlives the window, and writes its output to a log file
   in the runtime folder (`inventory.spawn`). When one of them ends with an

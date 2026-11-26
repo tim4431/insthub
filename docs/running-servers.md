@@ -64,9 +64,10 @@ login** switch on the server's page in the window.
 |---|---|
 | `insthub service install TARGET [--name NAME] [--python PATH]` | register and start, now and at every login; run it again to replace the definition |
 | `... install TARGET --no-login` | register and start now, but not at login |
-| `insthub service list` | what is installed, whether it is running, whether it starts at login ("at login") or only when started ("by hand"), and how often it was restarted after a crash |
+| `insthub service list` | what is installed, whether it is running, whether it starts at login ("at login") or only when started ("by hand"), how often it was restarted after a crash, and what is out of date: its unit, or the code its server runs |
 | `insthub service logs NAME [-f]` | its output; `-f` follows it live |
 | `insthub service restart NAME` | restart, after changing code or config, and wait until it answers |
+| `insthub service update [NAME ...] [--check] [--json]` | after a `git pull` or an edited driver: write the units of an older insthub anew, and restart the services that run older code (see [updating](#updating)) |
 | `insthub service stop NAME` | stop it; it starts again with `start`, or, if it starts at login, the next time your user's services start (a login after all your sessions ended, or a boot with lingering on) |
 | `insthub service start NAME` | start it again, also one that gave up after too many restarts, and wait until it answers |
 | `insthub service enable NAME` / `disable NAME` | start it at every login from now on, or no longer |
@@ -136,10 +137,9 @@ still run the old code. insthub says which ones:
 - the window marks it **OUT OF DATE** on its card and above its devices, and
   its page says what changed and how to restart it.
 
-Restart the servers marked so: a service with `insthub service restart NAME`
-(or **Restart** on its page in the window), a server you started in a
-terminal where you started it. Programs using it get an error for calls under
-way, then reconnect by themselves.
+Restart the servers marked so: [updating](#updating) says what each kind
+needs (for services, `insthub service update` does it). Programs using a
+server get an error for calls under way, then reconnect by themselves.
 
 How it knows: a server writes into its `.json` file in the runtime folder
 the files of the code it loaded, and when each was last changed at that
@@ -160,6 +160,93 @@ warns about a class and a manifest that disagree.
 Only servers on this computer are judged: one on another computer, or one
 started by an older insthub, which writes no such list, is never marked for
 its files.
+
+## Updating
+
+After a `git pull` of insthub or of an extension, or after you edit a
+driver, the servers that were running still run the old code. What each kind
+of server needs:
+
+| The server is | It needs | How |
+|---|---|---|
+| a service | a restart, if it runs older code; its unit written anew, if an older insthub wrote it | `insthub service update`, or **Update** in the window |
+| a server the window started | a restart | **Update** (or **Restart**) on its page in the window |
+| a server you started in a terminal | a restart | Ctrl-C, then start it again there |
+| a server on another computer | what that computer's setup needs | update it there |
+
+```bash
+insthub service update            # every service
+insthub service update lab rf     # only these
+insthub service update --check    # only say what it would do
+```
+
+For each service, `update` does what is needed and nothing more:
+
+- **Its unit is out of date** when an older insthub wrote it, for example one
+  from before the limit on restart loops (`RestartSec=2, now 5; without
+  StartLimitIntervalSec=300, StartLimitBurst=5`). It is written anew for the
+  same server file and the same Python, never another one, and systemd
+  reloads it. Whether it starts at login stays as it was. If that Python is
+  gone (a virtualenv deleted, or made anew elsewhere), `update` says so and
+  leaves the service as it is: install it again with `--python`, as the
+  command it prints says (that command keeps the service stopped, or not
+  starting at login, if it was).
+- **Its unit is not checked** when insthub did not write it, when it was
+  changed by hand, or when a newer insthub wrote it. Changed by hand means a
+  setting insthub does not write, or one of insthub's settings with a value
+  that no insthub wrote, such as a longer `TimeoutStopSec` for an instrument
+  that is slow to close. Such a unit is never written anew, so `update` never
+  undoes what you chose. It says so ("its unit was not checked: it was
+  changed by hand (TimeoutStopSec=90, insthub writes 20)"), and never calls
+  it up to date. The first line of a unit says which format of unit it is
+  (`(unit format 2)`), so an older insthub leaves a newer one's units alone.
+- **It runs**, and its unit was written anew or its server runs older code
+  (what `insthub list` marks out of date): it is restarted, and `update` waits
+  until it answers, as `insthub service restart` does. Each service is looked
+  at again just before its turn, and the restart only restarts a service that
+  still runs (systemd's `try-restart`), so one you stopped meanwhile stays
+  stopped.
+- **It does not run**: it is not started. Its next start uses the new unit.
+- **It is up to date**: it is left alone.
+
+One service that fails does not stop the others. `update` prints what it
+found and did for each service, and ends with exit code 1 if one failed.
+With `--json` it prints a record per service instead: `name`, `state`,
+`stale` (what is old about its unit), `unchecked` (why its unit was not
+checked), `outdated` (why its server runs older code), `plan` (`"rewrite"`,
+`"restart"`), `done`, `pid` (after a restart), `error` and `check`.
+
+**For scripts**, `--check` only looks: it prints what it would do, and ends
+with exit code 1 when anything would change (or something is wrong, such as
+a Python that is gone), else 0. `insthub service list` says what is out of
+date under each service, and `insthub list --json` gives the `outdated`
+reasons of every server on this computer, services or not.
+
+**In the window**, a server that can be updated gets **Update**: on its page
+next to **Restart**, and in the menu of its card (right-click). For a service
+it does what `insthub service update NAME` does; for a server the window
+started, it restarts it, as **Restart** does. A server started in a terminal
+gets no Update: its page says to restart it where you started it. When at
+least one server can be updated, the **Servers** page shows **Update all**,
+which asks once, listing what each server gets (which ones restart, and what
+is old about each unit it writes anew). A service's page says what is old
+about its unit, in a **Unit** row, even when its code is current, or why its
+unit was not checked. When both its unit and its code are old, the page's
+links offer **Update**, which does both with one restart.
+
+**The window and agents** run insthub's own code too, so after an update
+they also run the old code until they start again. Their connections to the
+servers are not the problem: a restarted server is reconnected by itself.
+
+- The window says so in its sidebar ("This window runs older code") and on
+  its **Settings** page, with what changed. Quit it (**Quit** in its tray
+  menu, or close it when it has no tray icon) and start it again; your
+  servers keep running.
+- An agent's `insthub mcp` adds a note to `list_devices` when its own code
+  changed since it started, so that the agent can ask you to reconnect it
+  (in Claude Code: `/mcp`). No MCP tool restarts a server or a service,
+  because a restart drops an instrument for a few seconds; an agent that has
+  a shell can run `insthub service update` when you ask it to.
 
 ## Reading a server's log
 

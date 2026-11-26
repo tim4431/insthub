@@ -21,6 +21,11 @@ describe themselves:
 `call_dangerous` runs it, so a user can let an agent use every other tool
 without being asked, and still be asked before anything dangerous.
 
+`list_devices` notes it when this program's own code changed since it started
+(extensions.outdated_here), so that the agent can ask its user to reconnect it.
+No tool restarts a server or a service: that drops an instrument for a few
+seconds, and an agent with a shell has `insthub service update`.
+
 Results are JSON. Bulk data goes to files (see render.py). The protocol part is
 the stdio subset of MCP that tools need, written out here so that insthub needs
 no extra packages.  See docs/agents.md.
@@ -42,7 +47,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import __version__, client, registry
+from . import __version__, client, extensions, registry
 from .device import ABOUT, busy_with
 from .errors import BusError, DevicePaused, RemoteError
 from .render import Renderer
@@ -189,6 +194,7 @@ class Tools:
         self.timeout = float(timeout)
         self._clients: dict[str, client.Client] = {}
         self._lock = threading.Lock()
+        extensions.outdated_here()  # notes the times of the code it runs, so list_devices can tell they changed
 
     def run(self, name: str, arguments: dict) -> Reply:
         fn = getattr(self, name, None) if name in {t["name"] for t in TOOLS} else None
@@ -279,6 +285,10 @@ class Tools:
             devices[name] = _brief(chosen[0], chosen[2])
         if not servers:
             notes.append("no insthub server is running on this computer, and none is listed in devices.toml")
+        behind = extensions.outdated_here()
+        if behind:
+            notes.append(f"this insthub mcp runs older insthub code than the disk holds ({'; '.join(behind)}): ask "
+                         "the user to reconnect it, which starts it anew (in Claude Code: /mcp)")
         out = {"devices": devices}
         if notes:
             out["notes"] = notes

@@ -489,6 +489,26 @@ def test_insthub_list_says_which_server_is_out_of_date(tmp_path, capsys):
         lines = capsys.readouterr().out.splitlines()                       # under the server, above its devices
         assert lines[0].startswith("lst  (pid ") and lines[2].split()[:2] == ["box", "Dev"]
         assert lines[1] == "    out of date: proj/lstdev.py changed since it started; a restart loads the new code"
+        assert cli.main(["list", "--json"]) == 0                           # for programs: the same, as JSON
+        [listed] = json.loads(capsys.readouterr().out)
+        assert listed["server"] == "lst" and listed["outdated"] == ["proj/lstdev.py changed since it started"]
+        assert listed["devices"]["box"]["type"] == "Dev" and "connected" in listed["devices"]["box"]["status"]
+
+
+def test_a_program_knows_when_its_own_insthub_code_changed(tmp_path, monkeypatch):
+    """outdated_here: the files of insthub's own modules in this process, as a server lists its own (here
+    a folder that stands in for insthub's, with a module of it loaded)."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "selfmod.py").write_text("X = 1\n")
+    monkeypatch.setattr(insthub.server, "_PACKAGE", str(package))
+    monkeypatch.syspath_prepend(str(package))
+    import selfmod  # noqa: F401
+
+    assert extensions.outdated_here() == []                                # at the start: what it loaded
+    edited(package / "selfmod.py")
+    assert extensions.outdated_here() == ["pkg/selfmod.py changed since it started"]
+    monkeypatch.delitem(sys.modules, "selfmod")
 
 
 def test_what_cannot_be_judged_is_never_out_of_date(tmp_path):
