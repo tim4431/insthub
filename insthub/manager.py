@@ -94,6 +94,11 @@ QAction = getattr(QtGui, "QAction", None) or QtWidgets.QAction  # QtWidgets in Q
 Qt = QtCore.Qt
 
 
+def _preview_limit(s: Server) -> int:
+    """The most elements a frame of the server's may have to be previewed."""
+    return PREVIEW_LIMIT // 8 if (s.address or "").startswith("tcp://") else PREVIEW_LIMIT
+
+
 def _qimage(a: np.ndarray) -> QtGui.QImage:
     h, w = a.shape[:2]
     if a.ndim == 2:
@@ -244,6 +249,50 @@ class Manager(QtWidgets.QMainWindow):
     @property
     def previews_on(self) -> bool:
         return self.settings.value("previews", True, type=bool)
+
+    def preview_choice(self, name: str) -> str | None:
+        """The stream the preview of device `name` was told to show (see add_preview_choices); None: one
+        picked by inventory.preview_stream."""
+        return str(self.settings.value(f"preview-stream/{name}", "")) or None
+
+    def choose_preview(self, s: Server, name: str, stream: str | None) -> None:
+        if stream:
+            self.settings.setValue(f"preview-stream/{name}", stream)
+        else:
+            self.settings.remove(f"preview-stream/{name}")
+        self._fetch_previews(s)  # the new stream's last frame now, not at the next probe
+
+    def add_preview_choices(self, menu: QtWidgets.QMenu, s: Server, name: str) -> None:
+        """Items of `menu` that choose the stream the device's preview shows, on its tile and its page."""
+        d = s.device(name)
+        streams = {n: st for n, st in d["streams"].items() if n != "state"} if d else {}
+        chosen = self.preview_choice(name)
+        shown = preview_stream(d, chosen, s.shown.get(name, (None,))[0]) if d else None
+        menu.setToolTipsVisible(True)
+
+        def item(text, stream, checked, enabled=True, tip=""):
+            action = menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(checked)
+            action.setEnabled(enabled)
+            action.setToolTip(tip)
+            action.triggered.connect(lambda *_: self.choose_preview(s, name, stream))
+
+        item("Automatic", None, chosen is None, tip="A stream that is publishing now; if none is, the one "
+             "already shown")
+        menu.addSeparator()
+        for n, st in streams.items():
+            big = elements(st["kind"]) > _preview_limit(s)
+            item(f"{n}\t{st['kind'] or 'nothing yet'}", n, chosen is not None and n == shown,
+                 st["time"] is not None and not big,
+                 "Too large a frame to preview" if big else st["doc"] or "")
+
+    def preview_menu(self, s: Server, name: str, pos) -> None:
+        if s is None or not self.previews_on:
+            return
+        menu = QtWidgets.QMenu(self)
+        self.add_preview_choices(menu, s, name)
+        menu.exec(pos)
 
     def _desktop_switched(self, *_) -> None:
         if not self._closed and self.settings.value("theme", "system") == "system":
@@ -448,9 +497,9 @@ class Manager(QtWidgets.QMainWindow):
         """Fetch the last frame of each device's first stream, where a new one was published."""
         if not self.previews_on or not self.isVisible() or not s.address or not s.probe:
             return
-        limit = PREVIEW_LIMIT // 8 if s.address.startswith("tcp://") else PREVIEW_LIMIT
+        limit = _preview_limit(s)
         for name, d in s.probe["devices"].items():
-            stream = preview_stream(d)
+            stream = preview_stream(d, self.preview_choice(name), s.shown.get(name, (None,))[0])
             if stream is None:
                 s.previews.pop(name, None)
                 continue
@@ -632,6 +681,8 @@ class Manager(QtWidgets.QMainWindow):
         for ui_ in uis:
             item("window", f"Open {ui_.title}", lambda ui_=ui_: self.open_ui(s, name, ext, ui_), open_ok,
                  why or f"Its extension's {ui_.kind}, in a window of its own")
+        if self.previews_on and d and sum(n != "state" for n in d["streams"]) > 1:
+            self.add_preview_choices(menu.addMenu(ui.icon("live"), "Preview shows"), s, name)
         menu.addSeparator()
         can_pause, why = self.can_pause(d)
         if paused:

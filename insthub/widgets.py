@@ -495,6 +495,7 @@ def button(text: str, icon_name: str | None = None, kind: str | None = None, tip
     if slot is not None:
         widget.clicked.connect(lambda *_: slot())
     widget.setCursor(Qt.CursorShape.PointingHandCursor)
+    widget.setFocusPolicy(Qt.FocusPolicy.TabFocus)  # a click leaves no accent ring on it: only Tab does, as on tiles
     return widget
 
 
