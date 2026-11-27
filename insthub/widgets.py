@@ -9,12 +9,14 @@ Nothing here knows about servers or devices; manager.py fills these widgets in.
                             small widgets and the text they show
     Pill                    a status: a coloured dot and a word, on a tint of the colour
     Tag                     a word in a box beside a title, such as SIM
+    paint_chips()           short texts in quiet boxes, in a row (a recipe's parameters)
+    wrapped_lines()         text broken into the lines that fit, the last cut short with "..."
     Switch                  an on/off toggle
     NumberBox               a spin box for a number with a unit and limits, shown as typed
     NavButton               an entry of the sidebar, with a count beside it
     GridFlow                a layout of equal columns, as many as fit the width
-    Tile, TileView          a card painted from a description: icon, title, a preview
-                            or a few figures, a status and a caption
+    Tile, TileView          a card painted from a description: icon, title, a preview,
+                            a message or a few figures, chips, a status and a caption
     Preview, PreviewView    what a stream looks like, small: a trace, an image, a number
     Toast                   a message floating over the bottom of the window for a while
 
@@ -166,6 +168,14 @@ _MEDIUM = QtGui.QFont.Weight.Medium
 
 
 # ---------------------------------------------------------------- the stylesheet
+def _tint(ink: str, t: Theme, alpha: float) -> str:
+    """`ink` laid over the window's colour at `alpha`, as an opaque colour ("#rrggbb")."""
+    a, b = QtGui.QColor(ink), QtGui.QColor(t.window)
+    mix = [round(x * alpha + y * (1 - alpha)) for x, y in ((a.red(), b.red()), (a.green(), b.green()),
+                                                         (a.blue(), b.blue()))]
+    return "#" + "".join(f"{v:02x}" for v in mix)
+
+
 def role_stylesheet(t: Theme, pt: float) -> str:
     """The look of the widgets that say what they are (`role`, `card`, `kind`): muted and small
     text, an error in red, a card, the line between rows, code, the button of the main action
@@ -177,6 +187,8 @@ QLabel[role="muted"] {{ color: {t.muted}; }}
 QLabel[role="small"] {{ color: {t.muted}; font-size: {pt * 0.9:.1f}pt; }}
 QLabel[role="error"] {{ color: {STATUS['bad']}; }}
 QFrame[card="true"] {{ background: {t.surface}; border: 1px solid {t.border}; border-radius: 12px; }}
+QFrame[notice="bad"] {{ background: {_tint(STATUS['bad'], t, 0.12 if t.dark else 0.07)};
+                        border: 1px solid {_tint(STATUS['bad'], t, 0.45 if t.dark else 0.3)}; border-radius: 10px; }}
 QFrame[role="rule"] {{ background: {t.border}; border: none; }}
 QPlainTextEdit[role="code"], QLineEdit[role="code"] {{ font-family: monospace; }}
 QPushButton[kind="primary"] {{ background: {t.accent}; border: 1px solid {t.accent}; border-radius: 8px;
@@ -225,6 +237,8 @@ QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
     background: {t.surface}; border: 1px solid {t.strong}; border-radius: 8px; padding: 5px 8px;
     selection-background-color: {t.accent}; selection-color: {t.on_accent}; }}
 QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QAbstractSpinBox:focus {{ border-color: {t.accent}; }}
+QLineEdit[invalid="true"], QComboBox[invalid="true"], QAbstractSpinBox[invalid="true"] {{
+    border-color: {STATUS['bad']}; }}
 QLineEdit:read-only {{ background: {t.inset}; }}
 QLineEdit:disabled, QComboBox:disabled, QAbstractSpinBox:disabled {{ color: {t.muted}; background: {t.inset}; }}
 QPlainTextEdit[role="code"], QLineEdit[role="code"] {{ font-family: monospace; background: {t.inset}; }}
@@ -377,6 +391,21 @@ def _i_bolt(p) -> None:
                                    _pt(8.5, 7)]))
 
 
+def _i_recipe(p) -> None:
+    """A flask: what a recipe is made in."""
+    path = QtGui.QPainterPath(_pt(6.4, 2))
+    path.lineTo(6.4, 6.2)
+    path.lineTo(2.6, 12.3)
+    path.quadTo(2.0, 14, 3.9, 14)
+    path.lineTo(12.1, 14)
+    path.quadTo(14.0, 14, 13.4, 12.3)
+    path.lineTo(9.6, 6.2)
+    path.lineTo(9.6, 2)
+    p.drawPath(path)
+    p.drawLine(_pt(5.2, 2), _pt(10.8, 2))
+    p.drawLine(_pt(4.4, 10.2), _pt(11.6, 10.2))
+
+
 _ICONS = {
     "devices": lambda p: [_rect(p, x, y, 5, 5, 1.3) for x, y in ((2, 2), (9, 2), (2, 9), (9, 9))],
     "servers": lambda p: (_rect(p, 2, 2.5, 12, 4.5, 1.5), _rect(p, 2, 9, 12, 4.5, 1.5),
@@ -419,6 +448,7 @@ _ICONS = {
     "spectrum": lambda p: [p.drawLine(_pt(x, 13.5), _pt(x, 13.5 - h)) for x, h in ((3, 4), (6, 9), (9, 6), (12, 11))],
     "bolt": _i_bolt,
     "chip": _i_chip,
+    "recipe": _i_recipe,
 }
 
 
@@ -695,6 +725,12 @@ class Tag(QtWidgets.QWidget):
     def text(self) -> str:
         return self._text
 
+    def set_text(self, text: str) -> None:
+        if text != self._text:
+            self._text = text
+            self.updateGeometry()
+            self.update()
+
     def _font(self) -> QtGui.QFont:
         return scaled(self.font(), 0.8, _SEMIBOLD)
 
@@ -705,6 +741,62 @@ class Tag(QtWidgets.QWidget):
         p = QtGui.QPainter(self)
         paint_tag(p, 1, (self.height() - 18) / 2, self._text, self._font())
         p.end()
+
+
+def chip_width(font: QtGui.QFont, text: str) -> float:
+    return QtGui.QFontMetricsF(font).horizontalAdvance(text) + 14
+
+
+def paint_chip(p: QtGui.QPainter, x: float, y: float, text: str, font: QtGui.QFont, height: float = 20) -> float:
+    """A short text in a quiet box (a parameter of a recipe: freq=1e3 Hz), with its left edge at x;
+    returns its width.  Quieter than a tag: it lists what something has, not what it is."""
+    t = _current
+    width = chip_width(font, text)
+    rect = QtCore.QRectF(x, y, width, height)
+    p.save()
+    p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    p.setPen(QtGui.QPen(QtGui.QColor(t.border), 1))
+    p.setBrush(QtGui.QColor(t.inset))
+    p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
+    p.setPen(QtGui.QColor(t.ink2))
+    p.setFont(font)
+    p.drawText(rect, _flags(Qt.AlignmentFlag.AlignCenter), text)
+    p.restore()
+    return width
+
+
+def paint_chips(p: QtGui.QPainter, rect: QtCore.QRectF, chips, font: QtGui.QFont) -> None:
+    """Chips in a row along the left of `rect`, as many as fit; "+3" says how many more there are."""
+    x, gap, height = rect.left(), 6, rect.height()
+    for index, text in enumerate(chips):
+        rest = len(chips) - index - 1
+        more = chip_width(font, f"+{rest}") + gap if rest else 0  # (room kept for the "+N" after it)
+        if x + chip_width(font, text) + more > rect.right():
+            if x + chip_width(font, f"+{rest + 1}") <= rect.right():
+                paint_chip(p, x, rect.top(), f"+{rest + 1}", font, height)
+            return
+        x += paint_chip(p, x, rect.top(), text, font, height) + gap
+
+
+def wrapped_lines(text: str, metrics: QtGui.QFontMetricsF, width: float, most: int) -> list[str]:
+    """`text` broken at spaces into lines no wider than `width`, `most` of them at most: the last
+    one shown ends in "..." if there is more."""
+    words, lines, line = text.split(), [], ""
+    for index, word in enumerate(words):
+        trial = f"{line} {word}" if line else word
+        if metrics.horizontalAdvance(trial) <= width or not line:
+            line = trial
+            continue
+        lines.append(line)
+        line = word
+        if len(lines) == most:
+            line = ""
+            lines[-1] = metrics.elidedText(" ".join([lines[-1], *words[index:]]), Qt.TextElideMode.ElideRight,
+                                           width)
+            break
+    if line:
+        lines.append(line)
+    return [metrics.elidedText(x, Qt.TextElideMode.ElideRight, width) for x in lines[:most]]
 
 
 class Switch(_Ring, QtWidgets.QAbstractButton):
@@ -1055,6 +1147,7 @@ class TileView:
     caption: str = ""
     tip: str = ""
     badge: str = ""  #: a word in a box beside the title, such as SIM
+    chips: tuple = ()  #: short texts in a row under the message (a recipe's parameters)
 
 
 class Tile(_Ring, QtWidgets.QWidget):
@@ -1164,15 +1257,22 @@ class Tile(_Ring, QtWidgets.QWidget):
             draw_icon(p, more.adjusted(5, 5, -5, -5), "more", t.ink2)
 
         body = QtCore.QRectF(pad, badge.bottom() + 12, self.width() - 2 * pad, 78)
+        chips = QtCore.QRectF(body.left(), body.bottom() - 20, body.width(), 20) \
+            if v.chips and v.preview is None else None
         if v.preview is not None:
             paint_preview(p, body, v.preview, small, v.stale)
-        elif v.message:
+        elif v.message:  # as many whole lines as there is room for, the last one cut short with "..."
             p.setFont(small)
             p.setPen(QtGui.QColor(t.ink2))
-            p.drawText(body.adjusted(0, 4, 0, 0), _flags(Qt.AlignmentFlag.AlignLeft, Qt.AlignmentFlag.AlignTop,
-                                                        Qt.TextFlag.TextWordWrap), v.message)
+            top, step = body.top() + 4, fs.lineSpacing()
+            room = (chips.top() - 6 if chips is not None else body.bottom()) - top
+            for index, line in enumerate(wrapped_lines(v.message, fs, body.width(), max(1, int(room // step)))):
+                p.drawText(QtCore.QRectF(body.left(), top + index * step, body.width(), fs.height()), _flags(*_LEFT),
+                           line)
         elif v.figures:
             self._figures(p, body, v.figures, small)
+        if chips is not None:
+            paint_chips(p, chips, v.chips, scaled(self.font(), 0.85))
 
         y = self.height() - pad - 22
         word = scaled(self.font(), 0.92, _MEDIUM)

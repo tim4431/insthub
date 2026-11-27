@@ -394,31 +394,48 @@ def test_the_recipes_that_use_a_device_are_checked_then_run_in_a_process_of_thei
         window.open_device("local:t", "synth")
         page, tab = window.device_page, window.device_page.recipes
         assert spin(5, lambda: [r.name for r in tab._recipes] == ["tune", "broken", "typo"])  # not nap, not snap
-        assert page.tabs.tabText(5) == "Recipes (3)" and not tab.run_button.isEnabled()
-        row = [tab.table.item(0, c).text() for c in range(4)]
-        assert row == ["tune", "mhz=1000, dbm=0", "lab.py", "Tune the synth."]
-        assert tab.table.item(0, 0).toolTip() == "lab.tune" and "your recipes" in tab.table.item(0, 2).toolTip()
-        tab.choose("tune")
+        assert page.tabs.tabText(5) == "Recipes (3)" and not tab.is_open() and not tab.run_button.isEnabled()
+        tune = tab.tiles["tune"].view                                        # a tile each: what it is and does
+        assert (tune.title, tune.subtitle, tune.message, tune.chips) == ("tune", "synth", "Tune the synth.",
+                                                                          ("mhz=1000", "dbm=0"))
+        assert (tune.icon, tune.status, tune.word, tune.caption) == ("recipe", "idle", "ready", "")
+        assert tune.tip.startswith("lab.tune · your recipes · lab.py, line 7\nTune the synth.\nIt says where")
+        tab.choose("tune")                                                   # (as a click on its tile does)
+        assert tab.is_open() and tab.head.title.text() == "tune" and tab.head.pill.text() == "ready"
         assert tab.run_button.isEnabled() and not tab.stop_button.isEnabled() and tab.open_button.isEnabled()
-        assert "Tune the synth." in tab.title.text() and "It says where it is." in tab.title.text()
+        assert tab.head.subtitle.text() == "Tune the synth." and tab.title.text() == "It says where it is."
+        assert tab.head.back.text() == "Recipes that use synth"
         assert "<b>synth</b>: frequency = ..., power = ..." in tab.about.text()
         assert tab.code.toPlainText().startswith("def tune(mhz: float = 1000")
         assert "lab.py, line 7" in tab.code_caption.text()
-        assert tab.params.placeholderText().startswith("mhz=1000 dbm=0")
-        tab.params.setText("mhz=2500")
+        mhz = tab.params.control("mhz")                                      # a control for each parameter
+        assert isinstance(mhz, ui.NumberBox) and mhz.value() == 1000 and tab.params.values() == {}
+        mhz.setValue(2500)
+        assert tab.params.values() == {"mhz": 2500.0}                        # (only what differs from its default)
         tab.run()
         assert spin(20, lambda: "done in" in tab.status.text()), tab.output.toPlainText()
         printed, _, result = tab.output.toPlainText().partition("\n\nResult:")
-        assert printed == "tuned to 2500 MHz" and json.loads(result) == {"mhz": 2500.0, "dbm": 0.0}
+        assert printed == "tuned to 2500.0 MHz" and json.loads(result) == {"mhz": 2500.0, "dbm": 0.0}  # (a float)
         assert server.devices["synth"]._freq == 2500.0 and "simulated: synth" in tab.status.text()
+        assert tab.head.pill.text() == "done" and tab.tiles["tune"].view.word == "done"  # its tile says so too
+        took, _, when = tab.tiles["tune"].view.caption.partition(" · ")      # how long it took, and when
+        assert took.startswith("in ") and took.endswith(" s") and when == "just now"
+        window.recipe_ends[pages._key(tab.current())] = ("good", "done", 1.5, time.time() - 125)
+        assert pages.recipe_state(window, tab.current()) == ("good", "done", "in 1.50 s · 2 min ago")
 
         tab.choose("broken")                                                 # it fails: why, and where
+        assert tab.output.toPlainText() == "" and tab.status.text() == ""   # (what tune printed was tune's)
         tab.run()
         assert spin(20, lambda: "failed after" in tab.status.text()), tab.output.toPlainText()
         said = tab.output.toPlainText()
         assert 'lab.py", line 21, in broken' in said
         assert said.endswith("\n\nrecipe broken failed: RuntimeError: no lock")
         assert tab.status.property("role") == "error" and tab.run_button.isEnabled()
+        assert (tab.tiles["broken"].view.status, tab.tiles["broken"].view.word) == ("bad", "failed")
+        tab.close_recipe()                                                   # back to the tiles; again, as it was
+        assert not tab.is_open() and tab.tiles["tune"].view.word == "done"
+        tab.choose("broken")
+        assert tab.output.toPlainText() == said and tab.params.control("message").text() == "no lock"
 
         ran = len(window._runs)
         tab.choose("typo")                                                   # its devices are asked first
@@ -427,15 +444,9 @@ def test_the_recipes_that_use_a_device_are_checked_then_run_in_a_process_of_thei
         assert tab.output.toPlainText() == (
             "Nothing ran. insthub asked its devices first:\n"
             "  line 26: synth has no property 'frequncy'; did you mean 'frequency'?")
-        tab.choose("tune")
-        for typed, said in (("mhzz=3", "Nothing ran: recipe tune has no parameter 'mhzz'; did you mean 'mhz'?"),
-                            ("3000", "Cannot read the parameters: give each as NAME=VALUE: 3000 has no name"),
-                            ("mhz='open", "Cannot read the parameters: a ' is not closed")):
-            tab.params.setText(typed)
-            tab.params.returnPressed.emit()
-            assert tab.output.toPlainText() == said
+        assert tab.tiles["typo"].view.word == "ready"                        # (it did not run)
         spin(0.2)
-        assert len(window._runs) == ran and server.devices["synth"]._freq == 2500.0  # none of them ran
+        assert len(window._runs) == ran and server.devices["synth"]._freq == 2500.0
 
 
 def test_stop_ends_a_recipe_and_quitting_stops_those_that_run(window):
@@ -449,7 +460,13 @@ def test_stop_ends_a_recipe_and_quitting_stops_those_that_run(window):
         tab.run()
         assert spin(20, lambda: "napping" in tab.output.toPlainText()), tab.output.toPlainText()
         assert tab.stop_button.isEnabled() and not tab.run_button.isEnabled()
-        assert "nap: running" in tab.status.text()
+        assert "nap: running" in tab.status.text() and tab.head.pill.text() == "running"
+        window.show_page("recipes")                                          # its tile says so on every page
+        assert spin(5, lambda: "nap" in window.recipes_page.view.tiles)
+        nap = window.recipes_page.view.tiles["nap"].view
+        assert (nap.status, nap.word) == ("busy", "running") and nap.caption.endswith(" s")
+        window.open_device("local:t", "loopback")
+        assert tab.is_open() and tab.current().name == "nap"                 # (as it was left: it runs)
         tab.stop_button.click()
         assert spin(10, lambda: "waking" in tab.output.toPlainText())
         assert not tab.stop_button.isEnabled() and "nap: stopping" in tab.status.text()  # Stop is not offered twice
@@ -457,12 +474,14 @@ def test_stop_ends_a_recipe_and_quitting_stops_those_that_run(window):
         assert spin(10, lambda: "was stopped after" in tab.status.text()), tab.output.toPlainText()
         assert tab.output.toPlainText() == "napping\nwaking\nwoken\n\nrecipe nap was stopped"  # its finally ran
         assert tab.run_button.isEnabled() and not tab.stop_button.isEnabled()
+        assert tab.tiles["nap"].view.word == "stopped"
 
         tab.run()
         assert spin(20, lambda: "napping" in tab.output.toPlainText())
         job = tab._run
         window.open_device("local:t", "synth")                               # another page: it goes on running
         assert tab._run is job and "nap: running" in tab.status.text() and not job.done()
+        assert tab.is_open() and tab.head.title.text() == "nap"             # (and stays in sight)
         window.close()                                                       # (no tray: the window quits)
         assert spin(10, job.done) and job.output().endswith("waking\nwoken\n")
 
@@ -539,7 +558,7 @@ def test_a_command_is_saved_as_a_recipe_and_then_listed(window, monkeypatch):
         window.open_device("local:t", "loopback")
         page, tab = window.device_page, window.device_page.recipes
         assert spin(5, lambda: not tab.empty.isHidden())                    # none yet: how to make one
-        assert "No recipe uses loopback yet" in tab.empty.text() and tab.boxed.isHidden() and tab.detail.isHidden()
+        assert "No recipe uses loopback yet" in tab.empty.text() and not tab.tiles and tab.detail.isHidden()
         commands = page.commands
         commands.choose("echo")
         commands.args.setText("hello")
@@ -554,8 +573,9 @@ def test_a_command_is_saved_as_a_recipe_and_then_listed(window, monkeypatch):
         assert window.toast.text() == f"Saved the recipe greet in {path}"
         assert spin(5, lambda: [r.name for r in tab._recipes] == ["greet"])
         assert page.tabs.tabText(5) == "Recipes (1)"
+        assert tab.empty.isHidden() and list(tab.tiles) == ["greet"]
         tab.choose("greet")
-        assert not tab.params.isEnabled() and tab.params.placeholderText() == "it has no parameters"
+        assert tab.params.isHidden() and tab.params.values() == {}           # (it has no parameters)
         tab.run()
         assert spin(20, lambda: tab.output.toPlainText() == "Result: hello"), tab.output.toPlainText()
 
@@ -612,6 +632,8 @@ def test_long_output_keeps_the_line_you_read_and_what_you_selected(window):
     window.show_page("recipes")
     view = window.recipes_page.view
     assert spin(5, lambda: len(view._recipes) == 4)
+    view.choose("nap")
+    spin(0.1)
     box, bar = view.output, view.output.verticalScrollBar()
 
     def top():
@@ -658,6 +680,112 @@ def test_what_a_recipe_returned_and_uses_as_the_window_writes_them():
     assert pages._units("a\U0001f600b") == 4
 
 
+FORM_RECIPES = '''\
+from typing import Literal
+
+import insthub
+from insthub.recipes import recipe
+
+LEVEL = 3
+
+
+@recipe(params={"count": {"min": 1, "max": 100, "doc": "how many sweeps"}})
+def setup(label: str, mode: Literal["cw", "sweep"] = "cw", on: bool = True, gains: list = [1, 2], count: int = 3,
+          note: str = "hello", level=LEVEL, **more):
+    """Every kind of parameter."""
+    return [label, mode, on, gains, count, note, level, more]
+
+
+def scale(factor: float, big: float = 1e15):
+    """A number that must be given, and one no spin box holds."""
+    return factor * big
+'''
+
+
+def test_a_recipes_parameters_each_get_the_control_they_ask_for(window):
+    write_recipes("form.py", FORM_RECIPES)
+    window.show_page("recipes")
+    view = window.recipes_page.view
+    assert spin(5, lambda: [r.name for r in view._recipes] == ["setup", "scale"])
+    assert view.tiles["setup"].view.chips == ("label (required)", 'mode="cw"', "on=True", "gains=[1, 2]", "count=3",
+                                              'note="hello"', "level=LEVEL")
+    view.choose("setup")
+    form = view.params
+    controls = {name: type(form.control(name)).__name__ for name in form.controls}
+    assert controls == {"label": "QLineEdit", "mode": "QComboBox", "on": "Switch", "gains": "QLineEdit",
+                        "count": "NumberBox", "note": "QLineEdit", "level": "QLineEdit"}
+    label, mode, on, gains, count, note, level = (form.control(n) for n in form.controls)
+    assert label.text() == "" and label.placeholderText() == "required · str"
+    assert [mode.itemText(i) for i in range(mode.count())] == ["cw", "sweep"] and mode.currentText() == "cw"
+    assert on.isChecked() and gains.text() == "[1, 2]" and count.value() == 3 and count.decimals() == 0
+    assert (count.minimum(), count.maximum()) == (1, 100) and note.text() == "hello"
+    assert level.text() == "" and level.placeholderText() == "its default: LEVEL"  # (not a literal: not shown)
+    assert form.more is not None and not form.reset_button.isEnabled()
+    assert form.values() == {}                                               # only what differs from its default
+
+    view.run()                                                               # one that must be given, is not
+    assert view.output.toPlainText() == "Nothing ran: recipe setup needs label=..." and window._runs == []
+    assert label.property("invalid") is True
+    label.setText("x y")                                                     # (an edit clears the mark)
+    assert not label.property("invalid") and form.reset_button.isEnabled()
+    mode.setCurrentIndex(1)
+    on.setChecked(False)
+    gains.setText("[3, 4.5]")
+    count.setValue(7)
+    note.setText("")
+    level.setText("5")
+    assert form.values() == {"label": "x y", "mode": "sweep", "on": False, "gains": [3, 4.5], "count": 7,
+                             "note": "", "level": 5}
+    assert type(form.values()["count"]) is int
+    for typed, said in (("gain=2 loose", "give each as NAME=VALUE: loose has no name"),
+                        ("mode=cw", "mode has a field of its own"),
+                        ("x='open", "a ' is not closed")):
+        form.more.setText(typed)
+        view.run()
+        assert view.output.toPlainText() == f"Cannot read the parameters: {said}" and window._runs == []
+        assert form.more.property("invalid") is True
+    form.more.setText('gain=2 tag="a b"')
+    view.run()
+    assert spin(20, lambda: "done in" in view.status.text()), view.output.toPlainText()
+    assert json.loads(view.output.toPlainText().partition("Result:")[2]) == [
+        "x y", "sweep", False, [3, 4.5], 7, "", 5, {"gain": 2, "tag": "a b"}]
+    form.reset()
+    assert form.values() == {} and label.text() == "" and mode.currentText() == "cw" and on.isChecked()
+
+    view.choose("scale")                                                     # another recipe: its own controls
+    factor, big = view.params.control("factor"), view.params.control("big")
+    assert type(factor).__name__ == type(big).__name__ == "QLineEdit"       # (required; beyond a spin box)
+    assert big.text() == "1e15" and view.params.values() == {}
+    factor.setText("abc")
+    view.run()
+    assert view.output.toPlainText() == "Cannot read the parameters: factor takes a number: abc is not one"
+    factor.setText("2")
+    assert view.params.values() == {"factor": 2}
+
+
+def test_what_a_recipe_s_tile_shows():
+    r = recipes.Recipe("look", "lab", Path("/x/lab.py"), 4, title="Look at it.", doc="Closely.",
+                       devices=("sa", "scope"), named_later=True, dangerous=True,
+                       params={"f": recipes.Param("f", 1e3, "1e3", meta={"unit": "Hz"})})
+    view = pages.recipe_view(r)
+    assert (view.title, view.subtitle, view.message, view.chips) == (
+        "look", "sa · scope · one named when it runs", "Look at it.", ("f=1e3 Hz",))
+    assert (view.badge, view.word) == ("DANGEROUS", "ready")
+    assert view.tip == "lab.look · your recipes · lab.py, line 4\nLook at it.\nClosely."
+    plain = pages.recipe_view(recipes.Recipe("bare", "lab", Path("/x/lab.py"), 9, title="bare"))
+    assert (plain.subtitle, plain.message, plain.chips, plain.badge) == ("no device", "", (), "")  # (no docstring)
+    broken = pages.recipe_view(dataclasses.replace(r, error="it is an async def"), ("bad", "cannot be used", ""))
+    assert (broken.status, broken.message) == ("bad", "Cannot be used: it is an async def")
+    app = qt.application()
+    font = app.font()
+    metrics = qt.QtGui.QFontMetricsF(font)
+    width = metrics.horizontalAdvance("ab ab") + 1
+    assert ui.wrapped_lines("ab ab ab ab ab", metrics, width, 5) == ["ab ab", "ab ab", "ab"]
+    two = ui.wrapped_lines("ab ab ab ab ab ab", metrics, width, 2)
+    assert two[0] == "ab ab" and two[1].endswith("…") and len(two) == 2     # (the last line cut short)
+    assert ui.wrapped_lines("", metrics, width, 3) == []
+
+
 def test_the_recipes_page_lists_every_recipe_and_opens_nothing_by_itself(window, monkeypatch):
     opened = []
     monkeypatch.setattr(pages, "open_path", lambda path: opened.append(path) or True)
@@ -665,24 +793,56 @@ def test_the_recipes_page_lists_every_recipe_and_opens_nothing_by_itself(window,
     page = window.recipes_page
     assert window.pages.currentWidget() is page and window.sidebar.nav["recipes"].isChecked()
     assert spin(5, lambda: not page.view.empty.isHidden())                  # none yet: what one is, where it goes
-    assert page.view.boxed.isHidden() and page.view.empty.findChild(qt.QtWidgets.QLabel).text() == "No recipes yet"
+    assert not page.view.tiles and page.view.empty.findChild(qt.QtWidgets.QLabel).text() == "No recipes yet"
+    assert page.search.isHidden()                                            # (nothing to search)
     assert not recipes.folder().exists()                                     # (made only when you open it)
 
     write_recipes("lab.py", LAB_RECIPES)
     write_recipes("bad.py", "def oops(:\n    pass\n")
+    write_recipes("more.py", 'import insthub\n\n\ndef blink(times: int = 3):\n    """Blink."""\n'
+                             '    insthub.device("led").blink(times)\n')
     window.show_page("recipes")                                              # (read again when it opens)
-    assert spin(5, lambda: [r.full_name for r in page.view._recipes] == ["lab.tune", "lab.broken", "lab.typo",
-                                                                          "lab.nap"])
-    assert page.header.subtitle.text().startswith("4 recipes in 1 file")
-    assert not page.view.warning.isHidden() and "bad.py:1" in page.view.warning.text()  # it cannot be read
-    assert [page.view.table.item(3, c).text() for c in range(3)] == ["nap", "seconds=60", "loopback"]
-    page.view.choose("nap")
-    assert page.view.code.toPlainText().startswith("def nap(") and page.view.run_button.isEnabled()
+    view = page.view
+    assert spin(5, lambda: [r.full_name for r in view._recipes] == ["lab.tune", "lab.broken", "lab.typo", "lab.nap",
+                                                                     "more.blink"])
+    assert page.header.subtitle.text().startswith("5 recipes in 2 files")
+    assert not view.notice.isHidden() and "bad.py:1" in view.warning.text()  # it cannot be read
+    lab, more = (view.groups[recipes.folder() / name] for name in ("lab.py", "more.py"))  # a section per file
+    assert lab.name.text() == "lab.py" and lab.detail.text() == "your recipes · 4 recipes"
+    assert list(lab.tiles) == [(str(recipes.folder() / "lab.py"), n) for n in ("tune", "broken", "typo", "nap")]
+    nap = view.tiles["nap"].view
+    assert (nap.subtitle, nap.chips, nap.message) == ("loopback", ("seconds=60",), "Sleeps until it is stopped.")
+    assert view.tiles["blink"].view.chips == ("times=3",)
+
+    page.search.setText("SYNTH")                                             # a search, by its devices too
+    shown = [name for name, tile in view.tiles.items() if tile.isVisibleTo(view)]
+    assert shown == ["tune", "broken", "typo"] and more.isHidden() and view.nothing.isHidden()
+    page.search.setText("blink")
+    assert [n for n, t in view.tiles.items() if t.isVisibleTo(view)] == ["blink"] and lab.isHidden()
+    page.search.setText("nothing like it")
+    assert not view.nothing.isHidden() and "nothing like it" in view.nothing.text()
+    page.search.clear()
+    menus = []                                                               # a tile's menu
+    monkeypatch.setattr(qt.QtWidgets.QMenu, "exec",
+                        lambda menu, *a: menus.append([(x.text(), x.isEnabled()) for x in menu.actions()]))
+    view.recipe_menu(pages._key(view._recipes[0]), qt.QtCore.QPoint(0, 0))
+    assert menus == [[("Run", True), ("Open its file", True), ("Copy the command that runs it", True)]]
+
+    view.choose("nap")                                                       # opened: it takes the page
+    assert view.is_open() and page.header.isHidden() and view.head.back.text() == "All recipes"
+    assert view.head.title.property("role") == "h1" and view.listing.isHidden()
+    assert view.code.toPlainText().startswith("def nap(") and view.run_button.isEnabled()
     spin(0.3)
     assert opened == [] and window._runs == []                               # nothing opened or run by itself
-    page.view.open_button.click()
+    view.open_button.click()
+    view.head.back.click()                                                   # back to the tiles
+    assert not view.is_open() and not page.header.isHidden() and not view.listing.isHidden()
     page.folder_button.click()
-    assert opened == [recipes.folder() / "lab.py", recipes.folder()]
+    lab.name.click()                                                         # (a section's name opens its file)
+    assert opened == [recipes.folder() / "lab.py", recipes.folder(), recipes.folder() / "lab.py"]
+    view.choose("tune")
+    window.show_page("recipes")                                              # the sidebar: the tiles again
+    assert not view.is_open() and not page.header.isHidden()
 
 
 def test_previews_show_the_last_frame_without_subscribing(window, monkeypatch):

@@ -12,14 +12,15 @@ a server: anything it asks for goes through the window's workers.
     ServersPage    a card per server; Update all, when a server can be updated
     ServerPage     a server: its process, addresses, service (and whether it starts at
                    login, and whether its unit is out of date), devices and clients
-    RecipesPage    every recipe, to read and run (each in a process of its own); your
-                   recipes folder
+    RecipesPage    every recipe, a tile each in a section per file, with a search; one opened
+                   in place, to read and run (each in a process of its own): a control per
+                   parameter, its code, what it prints; your recipes folder
     AgentsPage     giving AI agents the instruments (insthub mcp); which are connected
     SettingsPage   how the window looks and behaves; the files insthub uses; whether the
                    window itself runs older code
     LogDialog      a server's output, followed live
 
-device_view() and server_view() say what a tile shows; widgets.py draws it.
+device_view(), server_view() and recipe_view() say what a tile shows; widgets.py draws it.
 """
 from __future__ import annotations
 
@@ -44,6 +45,7 @@ from .inventory import (
     BAD,
     BUSY,
     GOOD,
+    IDLE,
     PAUSED,
     STALE,
     Server,
@@ -57,7 +59,7 @@ from .inventory import (
     server_file,
     server_state,
 )
-from .qt import BINDING, QtCore, QtGui, QtWidgets
+from .qt import BINDING, QtCore, QtGui, QtWidgets, Signal
 
 if TYPE_CHECKING:
     from .manager import Manager
@@ -340,7 +342,7 @@ class _Page(QtWidgets.QWidget):
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        top = QtWidgets.QVBoxLayout()
+        self.top = top = QtWidgets.QVBoxLayout()  # (its margins: see RecipesPage)
         top.setContentsMargins(28, 22, 28, 14)
         top.addWidget(self.header)
         outer.addLayout(top)
@@ -891,8 +893,9 @@ class _Commands(_InWindow, controls.Commands):
 
 
 # ---------------------------------------------------------------- recipes
-CODE_LINES = 14  #: lines of a recipe's code shown at most, before it scrolls
+CODE_LINES = 14  #: lines of a recipe's code shown at most on a device's page, before it scrolls
 RESULT_SHOWN = 200_000  #: characters of what a recipe returned shown at most, as many as of what it printed
+SIDE_BY_SIDE = 760  #: the width from which a recipe's code and output are side by side, else one above the other
 
 
 def _result_text(result) -> str:
@@ -967,219 +970,659 @@ def _lines_high(box: QtWidgets.QPlainTextEdit, lines: int) -> int:
     return box.fontMetrics().lineSpacing() * lines + 22
 
 
+def _key(r) -> tuple | None:
+    """What a recipe is known by while it is shown: its file and name."""
+    return (str(r.file), r.name) if r is not None else None
+
+
+def recipe_state(window: Manager, r: recipes.Recipe) -> tuple[str, str, str]:
+    """(status, word, caption) of a recipe: that it cannot be used; that it runs now (started from
+    this window: Manager.recipe_run), and for how long; how its last run from here ended
+    (Manager.recipe_ends), and when; or "ready"."""
+    if r.error:
+        return BAD, "cannot be used", ""
+    run = window.recipe_run(r)
+    if run is not None:
+        return BUSY, "stopping" if run.stopping else "running", f"{run.elapsed:.1f} s"
+    ended = window.recipe_ends.get(_key(r))
+    if ended is not None:
+        status, word, took, when = ended
+        age = time.time() - when
+        return status, word, f"in {took:.2f} s · " + ("just now" if age < 10 else f"{ago(age)} ago")
+    return IDLE, "ready", ""
+
+
+def recipe_view(r: recipes.Recipe, state: tuple = (IDLE, "ready", "")) -> ui.TileView:
+    """What a recipe's tile shows: its name, the devices it uses, what it does and its parameters,
+    and its `state`, as recipe_state() says it."""
+    status, word, caption = state
+    devices = [*r.devices, *(["one named when it runs"] if r.named_later else [])]
+    where = f"{r.full_name} · {r.where()}" + (f" · {r.file.name}, line {r.line}" if r.file else "")
+    said = r.title if r.title != r.name else ""  # (a recipe without a docstring is titled by its name)
+    return ui.TileView(title=r.name, subtitle=" · ".join(devices) or "no device", icon="recipe", status=status,
+                       word=word, caption=caption, message=f"Cannot be used: {r.error}" if r.error else said,
+                       chips=tuple(p.text() for p in r.params.values()), badge="DANGEROUS" if r.dangerous else "",
+                       tip="\n".join(x for x in (where, said, r.doc) if x))
+
+
+def _found_by(r: recipes.Recipe) -> str:
+    """What a search finds a recipe by: its names, what it does, its devices and its file."""
+    return " ".join([r.full_name, r.title, *r.devices, r.file.name if r.file else ""]).lower()
+
+
+class _RecipeGroup(QtWidgets.QWidget):
+    """Recipes, a tile each, in a grid: on the Recipes page, those of a file, under its name (a
+    click opens the file) and where it is from; on a device's page (`file` None), those that use
+    the device, with no heading."""
+
+    def __init__(self, owner: _Recipes, file: Path | None):
+        super().__init__()
+        self.owner, self.file = owner, file
+        self.name = ui.button(file.name if file else "", kind="section", tip=f"Open {file} in your text editor",
+                              slot=lambda: owner.open_file(file))
+        self.detail = ui.label("", "muted")
+        self.detail.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+        head = QtWidgets.QHBoxLayout()
+        head.setSpacing(10)
+        head.addWidget(self.name)
+        head.addWidget(self.detail, 1)
+        self.grid_host = QtWidgets.QWidget()
+        self.grid = ui.GridFlow(self.grid_host)
+        box = QtWidgets.QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 6)
+        box.setSpacing(10)
+        if file is not None:
+            box.addLayout(head)
+        box.addWidget(self.grid_host)
+        self.tiles: dict[tuple, ui.Tile] = {}
+
+    def sync(self, listed: list, query: str) -> int:
+        """Show these recipes, those that match `query`; returns how many match."""
+        keys = [_key(r) for r in listed]
+        for key in [k for k in self.tiles if k not in keys]:
+            tile = self.tiles.pop(key)
+            self.grid.removeWidget(tile)
+            tile.deleteLater()
+        for key in keys:
+            if key not in self.tiles:
+                tile = self.tiles[key] = ui.Tile(parent=self.grid_host)
+                tile.clicked.connect(lambda key=key: self.owner.open_recipe(key))
+                tile.menu_requested.connect(lambda pos, key=key: self.owner.recipe_menu(key, pos))
+        self.grid.set_order([self.tiles[k] for k in keys])
+        shown = 0
+        for r in listed:
+            tile = self.tiles[_key(r)]
+            tile.set_view(recipe_view(r, recipe_state(self.owner.window, r)))
+            match = not query or query in _found_by(r)
+            tile.setVisible(match)
+            shown += match
+        if self.file is not None and listed:
+            self.detail.setText(f"{listed[0].where()} · {_count(len(listed), 'recipe')}")
+            self.detail.setToolTip(str(self.file))
+        self.grid_host.setVisible(shown > 0)
+        return shown
+
+
+# -- a recipe's parameters ---------------------------------------------------------
+def _param_kind(p: recipes.Param) -> str:
+    """The control a recipe's parameter gets: "choice" (a list of its choices), "switch" (true or
+    false), "number" (a spin box with its unit and limits), "text" (a str: taken as it is typed) or
+    "value" (read as on the command line: 2500, true, [1, 2], or else text)."""
+    annotation = p.annotation.replace(" ", "")
+    default = p.default if p.literal else None
+    if p.meta.get("choices"):
+        return "choice"
+    if isinstance(default, bool) or (annotation == "bool" and p.required):
+        return "switch"
+    if isinstance(default, (int, float)) and annotation in ("", "int", "float"):
+        return "number"
+    if isinstance(default, str) or annotation == "str":
+        return "text"
+    return "value"
+
+
+def _param_hint(p: recipes.Param) -> str:
+    """What a parameter's row says under its name: its docstring, its limits and unit, and whether
+    it must be given (its choices are in its list)."""
+    meta = {k: v for k, v in p.meta.items() if k != "choices"}
+    return " · ".join(x for x in (p.doc, meta_text(meta), "required" if p.required else "") if x)
+
+
+class _Control:
+    """The control of one parameter of a recipe (see _Params), and what it says to pass."""
+
+    def __init__(self, p: recipes.Param, changed, submitted):
+        self.p, self.kind = p, _param_kind(p)
+        annotation = p.annotation.replace(" ", "")
+        self.number_only = annotation in ("int", "float")  # (a field for one: what is typed must be a number)
+        self.integer = annotation == "int" or (not annotation and p.literal and type(p.default) is int)
+        if self.kind == "number":
+            box = ui.NumberBox()
+            box.set_meta(p.meta)
+            if self.integer:
+                box.setDecimals(0)
+                if p.meta.get("step") is None:
+                    box.setSingleStep(1)
+                    box.setStepType(QtWidgets.QAbstractSpinBox.StepType.DefaultStepType)
+            if box.fits(float(p.default)):
+                box.valueChanged.connect(lambda *_: changed())
+                box.submitted.connect(submitted)
+                self.widget: QtWidgets.QWidget = box
+            else:  # (beyond what a spin box shows: typed instead)
+                box.deleteLater()
+                self.kind = "value"
+        if self.kind == "choice":
+            self.choices = list(p.meta["choices"])
+            combo = QtWidgets.QComboBox()
+            combo.addItems([controls._edit_text(c) for c in self.choices])
+            combo.setPlaceholderText("choose one" if p.required else f"its default: {p.default_text}")
+            combo.currentIndexChanged.connect(lambda *_: changed())
+            self.widget = combo
+        elif self.kind == "switch":
+            self.widget = ui.Switch()
+            self.widget.toggled.connect(lambda *_: changed())
+        elif self.kind in ("text", "value"):
+            line = QtWidgets.QLineEdit()
+            line.setPlaceholderText("required" + (f" · {p.annotation}" if p.annotation else "") if p.required
+                                    else "(empty text)" if self.kind == "text" and isinstance(p.default, str)
+                                    else f"its default: {p.default_text}")
+            line.textChanged.connect(lambda *_: changed())
+            line.returnPressed.connect(submitted)
+            self.widget = line
+        self.widget.setAccessibleName(p.name)
+        self.reset()
+
+    def reset(self) -> None:
+        """Show its default (or nothing, for one that must be given or whose default is not a literal)."""
+        p, w = self.p, self.widget
+        blocked = w.blockSignals(True)
+        if self.kind == "number":
+            w.setValue(float(p.default))
+        elif self.kind == "choice":
+            w.setCurrentIndex(self.choices.index(p.default) if p.literal and p.default in self.choices else -1)
+        elif self.kind == "switch":
+            w.set_quietly(bool(p.default) if p.literal else False)
+        elif self.kind == "text":
+            w.setText(p.default if p.literal and isinstance(p.default, str) else "")
+        else:
+            w.setText(p.default_text if p.literal else "")
+        w.blockSignals(blocked)
+
+    def given(self) -> tuple[bool, object]:
+        """(whether to pass it, its value): only what differs from its default is passed, as `insthub
+        run` passes only what is typed.  Raises ValueError for text that is not a number in the field
+        of one that takes a number."""
+        p, w = self.p, self.widget
+        if self.kind == "number":
+            value = round(w.value()) if self.integer else w.value()
+            return value != p.default, value
+        if self.kind == "choice":
+            if w.currentIndex() < 0:
+                return False, None
+            value = self.choices[w.currentIndex()]
+            return not p.literal or value != p.default, value
+        if self.kind == "switch":
+            return not p.literal or w.isChecked() != p.default, w.isChecked()
+        text = w.text()
+        if self.kind == "text":
+            return (text != p.default if p.literal and isinstance(p.default, str) else bool(text)), text
+        text = text.strip()
+        if not text or (p.literal and text == p.default_text.strip()):
+            return False, None
+        value = cli._value(text)
+        if self.number_only and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            raise ValueError(f"{p.name} takes a number: {text} is not one")
+        return True, value
+
+
+class _Params(QtWidgets.QFrame):
+    """The parameters of a recipe, on a card, a row each: its name, what its docstring and metadata
+    say of it, and its control (see _Control).  A recipe that takes other values by name (**kwargs)
+    has a line for them too: NAME=VALUE.  values() is what to pass; Reset shows the defaults again.
+    Enter in a field emits `submitted`.  It keeps what was typed while it shows the same recipe."""
+
+    submitted = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.setProperty("card", True)
+        box = QtWidgets.QVBoxLayout(self)
+        box.setContentsMargins(18, 12, 18, 6)
+        box.setSpacing(0)
+        title = ui.label("Parameters")
+        title.setFont(ui.scaled(title.font(), 1.0, QtGui.QFont.Weight.DemiBold))
+        self.reset_button = ui.button("Reset", kind="link", tip="Show the defaults again", slot=self.reset)
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(self.reset_button)
+        box.addLayout(head)
+        box.addSpacing(2)
+        self.rows = QtWidgets.QVBoxLayout()
+        self.rows.setSpacing(0)
+        box.addLayout(self.rows)
+        self.controls: dict[str, _Control] = {}
+        self.more: QtWidgets.QLineEdit | None = None
+        self._for: tuple | None = None
+
+    def load(self, r: recipes.Recipe) -> None:
+        """Show the parameters of `r`, with their defaults, unless they are shown already."""
+        params = tuple((p.name, p.default_text, p.annotation, p.doc, repr(p.meta)) for p in r.params.values())
+        key = (_key(r), params, r.takes_more)
+        if key == self._for:
+            return
+        self._for = key
+        if self.isAncestorOf(QtWidgets.QApplication.focusWidget()):  # (not passed on as by Tab: no focus ring
+            self.setFocus(Qt.FocusReason.OtherFocusReason)          # where it lands)
+        while (item := self.rows.takeAt(0)) is not None:
+            if item.widget() is not None:
+                item.widget().hide()  # at once: deleteLater waits for the event loop
+                item.widget().deleteLater()
+        self.controls, self.more = {}, None
+        for p in r.params.values():
+            control = self.controls[p.name] = _Control(p, self._changed, self.submitted.emit)
+            self._row(p.name, _param_hint(p), control.widget, control.kind == "switch")
+        if r.takes_more:
+            self.more = QtWidgets.QLineEdit()
+            self.more.setPlaceholderText('NAME=VALUE ...   e.g.  gain=2 label="two words"')
+            self.more.setAccessibleName("Other values")
+            self.more.textChanged.connect(lambda *_: self._changed())
+            self.more.returnPressed.connect(self.submitted.emit)
+            self._row("Other values", "it takes values by name besides these: each is passed on", self.more)
+        self.setVisible(bool(self.controls) or self.more is not None)
+        self._changed()
+
+    def _row(self, name: str, hint: str, control: QtWidgets.QWidget, small: bool = False) -> None:
+        if self.rows.count():
+            line = QtWidgets.QFrame()
+            line.setFixedHeight(1)
+            line.setProperty("role", "rule")
+            self.rows.addWidget(line)
+        row = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(row)
+        grid.setContentsMargins(0, 8, 0, 8)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(2)
+        title = ui.label(name)
+        title.setFont(ui.scaled(title.font(), 1.0, QtGui.QFont.Weight.Medium))
+        grid.addWidget(title, 0, 0)
+        if hint:
+            grid.addWidget(ui.label(hint, "small", wrap=True), 1, 0)
+        align = Qt.AlignmentFlag.AlignVCenter | (Qt.AlignmentFlag.AlignLeft if small else Qt.AlignmentFlag(0))
+        grid.addWidget(control, 0, 1, 2 if hint else 1, 1, align)
+        grid.setColumnStretch(0, 3)
+        grid.setColumnStretch(1, 2)
+        self.rows.addWidget(row)
+
+    def values(self) -> dict:
+        """What to pass, by name.  Raises ValueError for what cannot be read; its `control` is the
+        control that has it."""
+        values = {}
+        for name, control in self.controls.items():
+            try:
+                passed, value = control.given()
+            except ValueError as e:
+                e.control = control.widget
+                raise
+            if passed:
+                values[name] = value
+        if self.more is not None and self.more.text().strip():
+            try:
+                positional, more = cli.parse_params(cli.split_arguments(self.more.text()))
+                if positional:
+                    raise ValueError(f"give each as NAME=VALUE: {cli._show(positional[0])} has no name")
+                if taken := [k for k in more if k in self.controls]:
+                    raise ValueError(f"{taken[0]} has a field of its own")
+            except ValueError as e:
+                e.control = self.more
+                raise
+            values.update(more)
+        return values
+
+    def control(self, name: str) -> QtWidgets.QWidget:
+        """The control of a parameter (by its name)."""
+        return self.controls[name].widget
+
+    def mark(self, widgets) -> None:
+        """Outline these controls in red, and put the cursor in the first, until something changes."""
+        for widget in widgets:
+            widget.setProperty("invalid", True)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+        if widgets:
+            widgets[0].setFocus()
+
+    def missing(self, r: recipes.Recipe, values: dict) -> list:
+        """The controls of the parameters that must be given and are not, in `values`."""
+        return [self.controls[p.name].widget for p in r.params.values()
+                if p.required and p.name not in values and p.name in self.controls]
+
+    def reset(self) -> None:
+        for control in self.controls.values():
+            control.reset()
+        if self.more is not None:
+            self.more.clear()
+        self._changed()
+
+    def _changed(self) -> None:
+        for widget in [c.widget for c in self.controls.values()] + [self.more]:
+            if widget is not None and widget.property("invalid"):
+                widget.setProperty("invalid", False)
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+        try:
+            typed = bool(self.values())
+        except ValueError:
+            typed = True
+        self.reset_button.setEnabled(typed)
+
+
+class _Panes(QtWidgets.QWidget):
+    """Boxes, each under its caption: side by side when there is room (SIDE_BY_SIDE), else one above
+    the other."""
+
+    def __init__(self, *panes):
+        super().__init__()
+        self.box = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.Direction.LeftToRight, self)
+        self.box.setContentsMargins(0, 0, 0, 0)
+        self.box.setSpacing(12)
+        self.box.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinAndMaxSize)  # (no taller than its boxes
+        for caption, widget in panes:                                                  # get: each caption on its box)
+            column = QtWidgets.QVBoxLayout()
+            column.setSpacing(4)
+            caption.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
+            column.addWidget(caption)
+            column.addWidget(widget, 1)
+            self.box.addLayout(column, 1)
+
+    def side_by_side(self) -> bool:
+        return self.box.direction() == QtWidgets.QBoxLayout.Direction.LeftToRight
+
+    def resizeEvent(self, event) -> None:
+        wide = event.size().width() >= SIDE_BY_SIDE
+        if wide != self.side_by_side():
+            self.box.setDirection(QtWidgets.QBoxLayout.Direction.LeftToRight if wide
+                                  else QtWidgets.QBoxLayout.Direction.TopToBottom)
+            self.box.setSpacing(12 if wide else 14)
+        super().resizeEvent(event)
+
+
 class _Recipes(QtWidgets.QWidget):
-    """Recipes to read and run (see recipes.py): a table of them; for the one chosen, what it is,
-    what it uses, its code and its parameters.  Run asks its devices first (recipes.check, on a
-    worker) and runs nothing if one is missing or lacks what it uses; it asks you before what is
+    """Recipes to read and run (see recipes.py): a tile each, which says whether it runs now or how
+    its last run here ended.  A click on one opens it in place: what it does and uses, a control
+    for each of its parameters, its code, and Run.  Run asks its devices first (recipes.check, on
+    a worker) and runs nothing if one is missing or lacks what it uses; it asks you before what is
     marked dangerous.  The recipe then runs in a process of its own (recipes.start): the window
     never runs its code.  What it prints comes into the output box while it runs, then what it
-    returned or why it failed; Stop ends it.  One runs at a time here.  The device page shows
-    the recipes that use its device; the Recipes page (`every`), all of them.  `empty` is what
-    is shown instead while there is none."""
+    returned or why it failed; Stop ends it.  One runs at a time here, and its tile says so on
+    every page.  The device page shows the recipes that use its device; the Recipes page
+    (`every`), all of them, a section per file.  `empty` is what is shown instead while there is
+    none.  `opened` says whether a recipe is open (True) or the tiles are shown (False)."""
+
+    opened = Signal(bool)
 
     def __init__(self, window: Manager, empty: QtWidgets.QWidget, every: bool = False):
         super().__init__()
         self.window, self.empty, self.every = window, empty, every
         self._recipes: list = []
-        self._chosen_key: tuple | None = None  # (file, name) of the recipe chosen
+        self._chosen_key: tuple | None = None  # (file, name) of the recipe open
+        self._output_for: tuple | None = None  # of the recipe whose run (or refusal) the output box shows
         self._code_for: tuple | None = None  # (recipe, its file's mtime) whose code is shown
         self._run: recipes.Run | None = None  # under way (or ended, until what it returned is read)
         self._checking = False  # asking its devices
         self._stopping = False
         self._notes = ""  # what the check said besides problems, for the status line
         self._printed = ""  # what the output box holds
+        self._query = ""  # what the tiles are searched for
+        self._scrolled = 0  # where the tiles were scrolled to when a recipe was opened
+
+        # the tiles
         self.warning = ui.label("", wrap=True, select=True)  # the files that cannot be read
         self.warning.setTextFormat(Qt.TextFormat.RichText)
-        self.warning.hide()
+        self.notice = QtWidgets.QFrame()
+        self.notice.setProperty("notice", "bad")
+        inside = QtWidgets.QVBoxLayout(self.notice)
+        inside.setContentsMargins(14, 10, 14, 10)
+        inside.addWidget(self.warning)
+        self.notice.hide()
         self.empty.hide()
-        headers = ["Recipe", "Parameters", "Devices", "From", "Description"]
-        self.table = ui.table(*(headers if every else [h for h in headers if h != "Devices"]))
-        self.table.itemSelectionChanged.connect(self._chosen)
-        self.table.itemDoubleClicked.connect(lambda *_: self.params.setFocus())
-        self._rows_shown = 8 if every else 3  # the table is as tall as this many rows at most, then scrolls
-        self.boxed = ui.boxed(self.table)
+        self.nothing = ui.label("", "muted")  # what the search found none of
+        self.nothing.hide()
+        self.groups: dict = {}  # file (None on a device's page) -> _RecipeGroup
+        self.listing = QtWidgets.QWidget()
+        self.list_box = QtWidgets.QVBoxLayout(self.listing)
+        self.list_box.setContentsMargins(0, 0, 0, 0)
+        self.list_box.setSpacing(14)
+        for widget in (self.notice, self.empty, self.nothing):
+            self.list_box.addWidget(widget)
+        self.list_box.addStretch(1)
 
-        self.title = ui.label("", wrap=True, select=True)
-        self.title.setTextFormat(Qt.TextFormat.RichText)
-        self.about = ui.label("", "small", wrap=True, select=True)  # what it uses; its parameters
-        self.about.setTextFormat(Qt.TextFormat.RichText)
-        self.params = QtWidgets.QLineEdit()
-        self.params.returnPressed.connect(self.run)
+        # the recipe open
+        self.head = _Header("", back="All recipes" if every else "Recipes", on_back=self.close_recipe)
+        self.head.title.setProperty("role", "h1" if every else "h2")
+        self.head.badge.set_text("DANGEROUS")
+        self.head.badge.setToolTip("Marked dangerous (@recipe(dangerous=True)): you are asked before it runs")
         self.run_button = ui.button("Run", "start", kind="primary", slot=self.run,
                                     tip="Ask its devices whether they have what it uses, then run it in a process "
                                         "of its own")
         self.stop_button = ui.button("Stop", "stop", slot=self.stop,
                                      tip="End it as Ctrl-C would (its finally blocks run); for good 3 s later")
         self.open_button = ui.button("Open file", "file", slot=self._open_file, tip="Its file, in your text editor")
-        line = QtWidgets.QHBoxLayout()
-        line.setSpacing(8)
-        line.addWidget(self.params, 1)
         for button in (self.run_button, self.stop_button, self.open_button):
-            line.addWidget(button)
+            self.head.actions.addWidget(button)
+        self.title = ui.label("", "muted", wrap=True, select=True)  # the rest of its docstring
+        self.title.setTextFormat(Qt.TextFormat.RichText)
+        self.about = ui.label("", "small", wrap=True, select=True)  # what it uses
+        self.about.setTextFormat(Qt.TextFormat.RichText)
+        self.params = _Params()
+        self.params.submitted.connect(self.run)
         self.code_caption = ui.label("Code", "small")
-        self.code = _code_box("The code of the recipe you choose appears here.")
+        self.code = _code_box()
+        self.output_caption = ui.label("Output", "small")
         self.output = _code_box("What it prints, then what it returns, appears here.", wrap=True)
-        for widget in (self.code, self.output):  # side by side, as tall as each other: as the room there is
-            widget.setMaximumHeight(_lines_high(widget, CODE_LINES))
+        lines = CODE_LINES * 3 // 2 if every else CODE_LINES  # (the Recipes page has the room)
+        for widget in (self.code, self.output):  # as tall as each other: as the room there is
+            widget.setMaximumHeight(_lines_high(widget, lines))
+            widget.setMinimumHeight(_lines_high(widget, 5))
             widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Ignored)
+        self.panes = _Panes((self.code_caption, self.code), (self.output_caption, self.output))
         self.status = ui.label("", "small", wrap=True, select=True)
-        output_caption = ui.label("Output", "small")
-        for caption in (self.code_caption, output_caption):  # (on top of its box, however tall the page)
-            caption.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed)
-        boxes = QtWidgets.QGridLayout()
-        boxes.setHorizontalSpacing(12)
-        boxes.setVerticalSpacing(4)
-        boxes.addWidget(self.code_caption, 0, 0)
-        boxes.addWidget(output_caption, 0, 1)
-        boxes.addWidget(self.code, 1, 0)
-        boxes.addWidget(self.output, 1, 1)
-        boxes.setColumnStretch(0, 1)
-        boxes.setColumnStretch(1, 1)
-        boxes.setRowStretch(1, 1)
         self.detail = QtWidgets.QWidget()
         inside = QtWidgets.QVBoxLayout(self.detail)
         inside.setContentsMargins(0, 0, 0, 0)
-        inside.setSpacing(8)
+        inside.setSpacing(10)
+        inside.addWidget(self.head)
         inside.addWidget(self.title)
         inside.addWidget(self.about)
-        inside.addLayout(line)
-        inside.addLayout(boxes, 1)
+        inside.addSpacing(2)
+        inside.addWidget(self.params)
+        inside.addWidget(self.panes, 1)
         inside.addWidget(self.status)
         inside.addStretch()  # (what is left once the boxes are as tall as they get)
+        self.detail.hide()
 
-        area, content = ui.scroll_page(margins=(0, 0, 0, 0), spacing=8)  # (it scrolls in a window too small for it)
-        for widget in (self.warning, self.empty, self.boxed):
-            content.addWidget(widget)
+        self.area, content = ui.scroll_page(margins=(0, 0, 0, 0), spacing=0)  # (it scrolls in a window too small)
+        content.addWidget(self.listing, 1)
         content.addWidget(self.detail, 1)
-        content.addStretch()  # (below what says that there is none)
         box = QtWidgets.QVBoxLayout(self)
         box.setContentsMargins(0, 0 if every else 12, 0, 0)
-        box.addWidget(area)
-        self.table.horizontalScrollBar().rangeChanged.connect(lambda *_: self._fit_table())
+        box.addWidget(self.area)
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(150)
         self._timer.timeout.connect(self._tick)
-        self._show_list()
-        self._chosen()
-
-    @staticmethod
-    def _key(r) -> tuple | None:
-        return (str(r.file), r.name) if r is not None else None
+        self._buttons()
 
     def busy(self) -> bool:
         """Whether a recipe is being checked or runs."""
         return self._checking or self._run is not None
 
+    def is_open(self) -> bool:
+        """Whether a recipe is open (else the tiles are shown)."""
+        return not self.detail.isHidden()
+
+    @property
+    def tiles(self) -> dict:
+        """The tiles shown, by recipe name (full name where two have the same)."""
+        tiles = {key: tile for group in self.groups.values() for key, tile in group.tiles.items()}
+        names = [r.name for r in self._recipes]
+        return {r.name if names.count(r.name) == 1 else r.full_name: tiles[_key(r)]
+                for r in self._recipes if _key(r) in tiles}
+
     def load(self, found: tuple | None, fresh: bool = False) -> int:
         """Show (recipes, the files that cannot be read) as recipes.available() or for_device() found
-        them (None: not known yet).  `fresh`: for another device than before, so the choice and what
-        was typed go, and what was shown unless a recipe runs.  Returns how many recipes there are."""
+        them (None: not known yet).  `fresh`: for another device than before, so the recipe open (and
+        what it printed) goes, unless one runs.  Returns how many recipes there are."""
         listed, problems = found if found is not None else ([], [])
-        if fresh or listed != self._recipes:
-            keep = None if fresh else self._key(self.current())
-            self._recipes = list(listed)
-            self._show_list()
-            keys = [self._key(r) for r in self._recipes]
-            blocked = self.table.blockSignals(True)
-            self.table.clearSelection()
-            if keep in keys:
-                self.table.selectRow(keys.index(keep))
-            self.table.blockSignals(blocked)
-            if fresh and not self.busy():
-                self._say("")
-                self.status.clear()
-            self._chosen()
-        else:
-            self._refresh_code()
+        if fresh and not self.busy():
+            self._say("")
+            self.status.clear()
+            self.close_recipe()
+        self._recipes = list(listed)
+        self._sync_tiles()
         self.warning.setText("<br>".join(_badge(BAD, p) for p in problems))
-        self.warning.setVisible(bool(problems))
-        empty = found is not None and not listed
-        self.empty.setVisible(empty)
-        self.boxed.setVisible(not empty)
-        self.detail.setVisible(not empty or self.busy() or bool(self._printed))  # (a run's end stays in sight)
+        self.notice.setVisible(bool(problems))
+        self.empty.setVisible(found is not None and not listed)
+        if self.is_open():
+            if self.current() is None and not self.busy() and not self._printed:
+                self.close_recipe()  # (it is gone from its file, and left nothing to read)
+            else:
+                self._chosen()
         return len(listed)
 
-    def _show_list(self) -> None:
-        rows = []
-        for r in self._recipes:
-            params = ", ".join(p.text() for p in r.params.values())
-            devices = ", ".join(r.devices) + (" (and one named when it runs)" if r.named_later else "")
-            row = [r.name, params, devices, r.file.name if r.file else "",
-                   f"Cannot be used: {r.error}" if r.error else r.title]
-            rows.append(row if self.every else [x for i, x in enumerate(row) if i != 2])
-        ui.fill(self.table, rows)
-        last = self.table.columnCount() - 1
-        for row, r in enumerate(self._recipes):
-            self.table.item(row, 0).setToolTip(r.full_name)
-            self.table.item(row, last - 1).setToolTip(f"{r.file}\n{r.where()}")
-            item = self.table.item(row, last)
-            item.setToolTip(r.error or r.doc or r.title)
-            item.setData(Qt.ItemDataRole.ForegroundRole, ui.color(ui.STATUS[BAD]) if r.error else None)
-        self._fit_table()
+    def search(self, text: str) -> None:
+        """Show only the tiles of the recipes whose names, description, devices or file have `text`."""
+        self._query = text.strip().lower()
+        self._sync_tiles()
 
-    def _fit_table(self) -> None:
-        """Make the table as tall as its rows (as _rows_shown of them at most, then it scrolls), and its
-        scroll bar when it is too narrow for its columns."""
-        bar, rows = self.table.horizontalScrollBar(), min(max(len(self._recipes), 1), self._rows_shown)
-        height = (self.table.horizontalHeader().sizeHint().height() + 4
-                  + rows * self.table.verticalHeader().defaultSectionSize()
-                  + (bar.sizeHint().height() if bar.maximum() > 0 else 0))
-        if height != self.table.height():
-            self.table.setFixedHeight(height)
+    def _sync_tiles(self) -> None:
+        groups: dict = {}
+        for r in self._recipes:
+            groups.setdefault(r.file if self.every else None, []).append(r)
+        for file in [f for f in self.groups if f not in groups]:
+            group = self.groups.pop(file)
+            self.list_box.removeWidget(group)
+            group.deleteLater()
+        shown = 0
+        for index, (file, listed) in enumerate(groups.items()):
+            group = self.groups.get(file)
+            if group is None:
+                group = self.groups[file] = _RecipeGroup(self, file)
+            if self.list_box.indexOf(group) != 2 + index:  # (after the notice and what says there is none)
+                self.list_box.removeWidget(group)
+                self.list_box.insertWidget(2 + index, group)
+            matches = group.sync(listed, self._query)
+            group.setVisible(matches > 0)
+            shown += matches
+        self.nothing.setText(f"No recipe matches “{ui.esc(self._query)}”." if self._query else "")
+        self.nothing.setVisible(bool(self._query and self._recipes) and not shown)
+
+    def _find(self, key: tuple) -> recipes.Recipe | None:
+        return next((r for r in self._recipes if _key(r) == key), None)
 
     def current(self) -> recipes.Recipe | None:
-        rows = self.table.selectionModel().selectedRows()
-        return self._recipes[rows[0].row()] if rows and rows[0].row() < len(self._recipes) else None
+        """The recipe open, as it was last read (None if none is, or it is no longer in its file)."""
+        return self._find(self._chosen_key) if self._chosen_key is not None else None
 
     def choose(self, name: str) -> None:
-        """Choose a recipe by its name (or full name), as a click on its row does."""
-        self.table.selectRow(next(i for i, r in enumerate(self._recipes) if name in (r.name, r.full_name)))
+        """Open a recipe by its name (or full name), as a click on its tile does."""
+        self.open_recipe(_key(next(r for r in self._recipes if name in (r.name, r.full_name))))
 
-    def _chosen(self) -> None:
-        r = self.current()
-        if self._key(r) != self._chosen_key:  # another recipe: what was typed was for the one before
-            self._chosen_key = self._key(r)
-            self.params.clear()
+    def open_recipe(self, key: tuple) -> None:
+        r = self._find(key)
         if r is None:
-            self.title.setText(ui.muted("Choose a recipe above, then Run.") if self._recipes else "")
-            self.about.hide()
-            self.params.setPlaceholderText("")
-            self.params.setEnabled(False)
+            return
+        if key != self._output_for and not self.busy():  # what was printed was another recipe's
+            self._notes = ""
+            self._say("")
+            self.status.clear()
+        if not self.is_open():
+            self._scrolled = self.area.verticalScrollBar().value()
+        self._chosen_key = key
+        self.listing.hide()
+        self.detail.show()
+        self._chosen(fresh=True)
+        self.area.verticalScrollBar().setValue(0)
+        self.opened.emit(True)
+
+    def close_recipe(self) -> None:
+        """Back to the tiles (a recipe that runs goes on running: its tile says so)."""
+        if not self.is_open():
+            return
+        key, self._chosen_key = self._chosen_key, None
+        focused = self.detail.isAncestorOf(QtWidgets.QApplication.focusWidget())
+        self.listing.show()
+        self._sync_tiles()
+        tile = next((g.tiles[key] for g in self.groups.values() if key in g.tiles), None)
+        if focused:  # (on its tile: not passed on as by Tab, which would ring whatever is next)
+            (tile if tile is not None and tile.isVisibleTo(self) else self).setFocus(Qt.FocusReason.OtherFocusReason)
+        self.detail.hide()
+        QtCore.QTimer.singleShot(0, lambda: self.area.verticalScrollBar().setValue(self._scrolled))
+        self.opened.emit(False)
+
+    def recipe_menu(self, key: tuple, pos) -> None:
+        """The menu of a recipe's tile: Run, its file, the command that runs it."""
+        r = self._find(key)
+        if r is None:
+            return
+        menu = QtWidgets.QMenu(self)
+        needs = any(p.required for p in r.params.values())
+        run = menu.addAction(ui.icon("start"), "Run..." if needs else "Run")
+        run.setEnabled(r.error is None and not self.busy())
+        run.setToolTip("Open it to give what it needs" if needs else "Run it with its defaults")
+        run.triggered.connect(lambda *_: self._run_from_menu(key, needs))
+        menu.addAction(ui.icon("file"), "Open its file").triggered.connect(lambda *_: self.open_file(r.file))
+        menu.addAction(ui.icon("copy"), "Copy the command that runs it").triggered.connect(
+            lambda *_: self.window.copy(f"insthub run {r.full_name}"))
+        menu.setToolTipsVisible(True)
+        menu.exec(pos)
+
+    def _run_from_menu(self, key: tuple, needs: bool) -> None:
+        self.open_recipe(key)
+        if needs:
+            first = next((c.widget for c in self.params.controls.values() if c.p.required), None)
+            if first is not None:
+                first.setFocus()
         else:
-            doc = r.doc.split("\n\n")[0].replace("\n", " ")
-            self.title.setText(f"<b>{ui.esc(r.title)}</b>" + (f" &nbsp;{ui.muted(ui.esc(doc))}" if doc else ""))
-            hints = [f"{ui.esc(p.name)}: {ui.esc(' · '.join(x for x in (p.doc, meta_text(p.meta)) if x))}"
-                     for p in r.params.values() if p.doc or p.meta]
-            if r.takes_more:
-                hints.append("it also takes other values by name")
-            self.about.setText(_uses(r) + (f"<br>{' · '.join(hints)}" if hints else "")
-                               + (f"<br><span style='color:{ui.STATUS[BAD]}'>Cannot be used: {ui.esc(r.error)}</span>"
-                                  if r.error else ""))
-            self.about.show()
-            typed = " ".join([f"{p.name}=..." for p in r.params.values() if p.required]
-                             + [f"{p.name}={p.default_text}" for p in r.params.values() if not p.required])
-            self.params.setPlaceholderText(f"{typed}   (NAME=VALUE; the others keep their defaults)" if typed else
-                                           "NAME=VALUE: it takes values by name" if r.takes_more else
-                                           "it has no parameters")
-            self.params.setEnabled((bool(r.params) or r.takes_more) and r.error is None)
-        self._refresh_code(force=True)
+            self.run()
+
+    def _chosen(self, fresh: bool = False) -> None:
+        """Show the recipe open as it is now (as it was last, if it is no longer in its file);
+        `fresh`: just opened, so its code is read again whether or not its file changed."""
+        r = self.current()
+        if r is not None:
+            h = self.head
+            h.title.setText(r.name)
+            h.badge.setVisible(r.dangerous)
+            h.pill.show()
+            said = r.title if r.title != r.name else ""
+            h.subtitle.setText(ui.esc(said) or ui.muted("It has no docstring to say what it does."))
+            paragraphs = [" ".join(x.split()) for x in r.doc.split("\n\n") if x.strip()]
+            self.title.setText("<br>".join(ui.esc(x) for x in paragraphs))
+            self.title.setVisible(bool(paragraphs))
+            self.about.setText(_uses(r) + (f"<br><span style='color:{ui.STATUS[BAD]}'>Cannot be used: "
+                                           f"{ui.esc(r.error)}</span>" if r.error else ""))
+            self.params.load(r)
+            self.params.setEnabled(r.error is None)
+        self._refresh_code(force=fresh)
         self._buttons()
 
     def _refresh_code(self, force: bool = False) -> None:
-        """Show the chosen recipe's code as its file is now (read again when the file changes)."""
+        """Show the recipe's code as its file is now (read again when the file changes)."""
         r = self.current()
+        if r is None:
+            return
         try:
-            mtime = r.file.stat().st_mtime_ns if r is not None else None
+            mtime = r.file.stat().st_mtime_ns
         except OSError:
             mtime = None
-        if not force and self._code_for == (self._key(r), mtime):
+        if not force and self._code_for == (_key(r), mtime):
             return
-        self._code_for = self._key(r), mtime
-        text = r.source() if r is not None else ""
+        self._code_for = _key(r), mtime
+        text = r.source()
         if text != self.code.toPlainText():
             self.code.setPlainText(text)
-        self.code_caption.setText(f"Code · {r.file.name}, line {r.line} · {r.where()}" if r is not None else "Code")
-        self.code_caption.setToolTip(str(r.file) if r is not None else "")
+        self.code_caption.setText(f"Code · {r.file.name}, line {r.line} · {r.where()}")
+        self.code_caption.setToolTip(str(r.file))
 
     def _buttons(self) -> None:
         r = self.current()
@@ -1190,11 +1633,17 @@ class _Recipes(QtWidgets.QWidget):
         run = self._run
         self.stop_button.setEnabled(run is not None and not run.done() and not run.stopping)  # (see stop)
         self.open_button.setEnabled(r is not None and r.file is not None)
+        if r is not None:
+            self.head.pill.set(*recipe_state(self.window, r)[:2])
+
+    def open_file(self, path: Path | None) -> None:
+        if path is not None and not open_path(path):
+            self.window.say(f"Cannot open {path}")
 
     def _open_file(self) -> None:
         r = self.current()
-        if r is not None and not open_path(r.file):
-            self.window.say(f"Cannot open {r.file}")
+        if r is not None:
+            self.open_file(r.file)
 
     def _say(self, text: str) -> None:
         """Show `text` in the output box.  If it goes on from what is there (a Run keeps only the last
@@ -1240,21 +1689,24 @@ class _Recipes(QtWidgets.QWidget):
         r = self.current()
         if r is None or r.error or self.busy():
             return
+        self._output_for = _key(r)
+        values: dict = {}
         try:
-            positional, values = cli.parse_params(cli.split_arguments(self.params.text()))
-            if positional:
-                raise ValueError(f"give each as NAME=VALUE: {cli._show(positional[0])} has no name")
+            values = self.params.values()
             recipes.check_values(r, values)
         except (ValueError, recipes.RecipeError) as e:
             self._notes = ""
             self._say(f"Nothing ran: {e}" if isinstance(e, recipes.RecipeError) else
                       f"Cannot read the parameters: {e}")
             self._status(f"{r.name}: not run", error=True)
+            self.params.mark([e.control] if getattr(e, "control", None) is not None else
+                             self.params.missing(r, values))
             return
         self._checking, self._notes = True, ""
         self._say("")
         self._status(f"{r.name}: asking {', '.join(r.devices)} first..." if r.devices else f"{r.name}: checking...")
         self._buttons()
+        self._sync_tiles()
 
         def check():  # the recipe as its file is now: it may have changed since it was listed
             found, problems = recipes.read_file(r.file, r.origin, r.python)
@@ -1305,6 +1757,7 @@ class _Recipes(QtWidgets.QWidget):
             self._timer.stop()
             return
         self._say(run.output())
+        self._sync_tiles()
         if not run.done():
             self._status(f"{run.recipe.name}: {'stopping' if self._stopping else 'running'} · {run.elapsed:.1f} s")
             self._buttons()
@@ -1325,10 +1778,14 @@ class _Recipes(QtWidgets.QWidget):
             said = str(exc) if isinstance(exc, recipes.RecipeError) else ui.error_text(exc)
             self._status(f"{name} was stopped after {took}" if self._stopping else f"{name} failed after {took}",
                          error=not self._stopping)
+            ended = (IDLE, "stopped") if self._stopping else (BAD, "failed")
         else:
             self._status(f"{name}: done in {took}")
+            ended = (GOOD, "done")
+        self.window.recipe_ends[_key(run.recipe)] = (*ended, run.elapsed, time.time())
         self._say(f"{printed}\n\n{said}" if printed else said)
         self._buttons()
+        self._sync_tiles()
 
     def stop(self) -> None:
         """End the recipe that runs (see recipes.Run.stop); returns at once.  Once: Stop is not offered
@@ -1579,6 +2036,7 @@ class DevicePage(_Page):
         self.props.load(d, (s.key, name))  # (the same device also when a probe failed: d is None)
         self.commands.load(d, (s.key, name))
         if changed:
+            self.recipes.head.back.setText(f"Recipes that use {name}")
             self.no_recipes.setText(
                 f"No recipe uses {ui.esc(name)} yet. A recipe is a Python function you keep in a .py file in "
                 f"<code>{ui.esc(recipes.folder())}</code>, to run by name; it is listed here when its code calls "
@@ -1639,22 +2097,38 @@ class _NoRecipes(QtWidgets.QFrame):
 
 
 class RecipesPage(_Page):
-    """Every recipe this computer knows of (recipes.available()), to read and run; your recipes folder."""
+    """Every recipe this computer knows of (recipes.available()), a tile each in a section per
+    file, with a search; one opened takes the whole page, under a way back to the tiles.  Your
+    recipes folder."""
 
     def __init__(self, window: Manager):
         super().__init__("Recipes", scroll=False)
         self.window = window
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText("Search recipes")
+        self.search.setClearButtonEnabled(True)
+        self.search.addAction(ui.icon("search", "muted"), QtWidgets.QLineEdit.ActionPosition.LeadingPosition)
+        self.search.setMinimumWidth(240)
         self.folder_button = ui.button("Open folder", "folder", slot=self.open_folder,
                                        tip=f"Your recipes folder, {recipes.folder()}: each .py file in it holds "
                                            "recipes")
+        self.header.actions.addWidget(self.search)
         self.header.actions.addWidget(self.folder_button)
         self.view = _Recipes(window, _NoRecipes(self), every=True)
+        self.view.opened.connect(self._opened)
+        self.search.textChanged.connect(self.view.search)
         self.body.addWidget(self.view, 1)
+
+    def _opened(self, recipe: bool) -> None:
+        """A recipe opened (its own header, with the way back, takes this one's place) or closed."""
+        self.header.setVisible(not recipe)
+        self.top.setContentsMargins(28, 18 if recipe else 22, 28, 0 if recipe else 14)
 
     def sync(self, found: tuple | None) -> None:
         """Show every recipe, as recipes.available() found them (None: not known yet)."""
         count = self.view.load(found)
         files = len({r.file for r in found[0]}) if found else 0
+        self.search.setVisible(bool(count))
         self.header.subtitle.setText(
             "Reading the recipes..." if found is None else
             "Snippets you keep as Python functions, to run by name" if not count else
@@ -2008,7 +2482,7 @@ class Sidebar(QtWidgets.QWidget):
         brand.addWidget(ui.label("insthub", "brand"))
         brand.addStretch(1)
         self.nav = {name: ui.NavButton(text, icon) for name, text, icon in (
-            ("devices", "Devices", "devices"), ("servers", "Servers", "servers"), ("recipes", "Recipes", "logs"),
+            ("devices", "Devices", "devices"), ("servers", "Servers", "servers"), ("recipes", "Recipes", "recipe"),
             ("agents", "AI agents", "agents"), ("settings", "Settings", "settings"))}
         group = QtWidgets.QButtonGroup(self)
         group.setExclusive(True)

@@ -18,7 +18,8 @@ how each one is reached, and the controls to look after them and set them up.
                  (forms.ServerDialog, which changes the file in place, comments kept).
                  Update (and Update all, on Servers) loads new code: service.update for a
                  service, a restart for a server the window started.
-    Recipes      every recipe (recipes.py): its code, what it uses; Run and Stop
+    Recipes      every recipe (recipes.py), a tile each in a section per file, with a search;
+                 one opened: a control per parameter, its code, Run and Stop, what it printed
     AI agents    giving Claude Code or another agent the instruments; which are connected
     Settings     appearance, previews, notifications, start at login, the files insthub uses,
                  your extensions (folders added and removed; what is wrong with each), and
@@ -238,6 +239,7 @@ class Manager(QtWidgets.QMainWindow):
         self._recipes_reading = False
         self._extensions: tuple = (None, -math.inf)  # (extensions.discover(), when), for the extensions' recipes
         self._runs: list[recipes.Run] = []  # recipes started from this window (see start_recipe)
+        self.recipe_ends: dict[tuple, tuple] = {}  # (file, name) -> (status, word, seconds, when) of its last run here
         self._logs: dict[str, pages.LogDialog] = {}
         self._detail: tuple | None = None  # ("device", key, name) or ("server", key) while one is shown
         self.login_pending: dict[str, bool] = {}  # service -> the Starts at login asked, until it is done
@@ -683,6 +685,7 @@ class Manager(QtWidgets.QMainWindow):
         self.sidebar.select(name)
         if name == "recipes":
             self._recipes_at = -math.inf  # (read again now: you may have just written one)
+            self.recipes_page.view.close_recipe()  # (the tiles, as Devices shows its tiles)
         elif name == "agents":
             self.agents_page.check()
         elif name == "settings":
@@ -1000,6 +1003,12 @@ class Manager(QtWidgets.QMainWindow):
         job = recipes.start(recipe, values, capture=True)
         self._runs = [other for other in self._runs if not other.done()] + [job]
         return job
+
+    def recipe_run(self, recipe: recipes.Recipe) -> recipes.Run | None:
+        """The run of a recipe started from this window that has not ended, if one has not."""
+        key = (str(recipe.file), recipe.name)
+        return next((job for job in reversed(self._runs)
+                     if not job.done() and (str(job.recipe.file), job.recipe.name) == key), None)
 
     def open_ui(self, s: Server, device: str, ext, ui_) -> None:
         """Start a UI of a device's extension (extensions.launch), with the extension's Python."""

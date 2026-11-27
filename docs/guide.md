@@ -606,10 +606,9 @@ it is doing, and which programs are watching it. Its tabs show:
   (`VPP channel=2`, `[1, 2]`), and see what it returned. The units, limits and
   choices of its parameters are shown under it. **Save as recipe...** keeps
   the command, with its arguments, as a [recipe](#recipes).
-- **Recipes**: the [recipes](#recipes) that use the device, each with its
-  code and a line for its parameters, typed as `NAME=VALUE` (their defaults,
-  units, limits and choices are shown); **Run**, **Stop**, and **Open file**
-  to edit it. What it prints appears as it runs.
+- **Recipes**: the [recipes](#recipes) that use the device, a tile each. A
+  click opens one: its code, a control for each of its parameters, **Run**,
+  **Stop**, and **Open file** to edit it. What it prints appears as it runs.
 
 Writing a property or running a command that the device marks dangerous asks
 you first. A simulated device has a SIM mark on its tile and on its page, and
@@ -986,14 +985,26 @@ function runs, and a recipe does not need it.
 
 ### Running one
 
-**In the window.** The device page's **Recipes** tab lists the recipes that
-use the device, and the **Recipes** page lists them all (**Open folder** opens
-your recipes folder). Choose one to see its code and a line for its
-parameters: type those you change as `NAME=VALUE` (their defaults, units,
-limits and choices are shown), and **Run** it. What it prints appears as it runs, then what it
-returned. **Stop** ends it, and **Open file** opens its file in your editor. A
-recipe whose check finds a problem does not run, and one that uses something
-marked dangerous asks first.
+**In the window.** The **Recipes** page shows every recipe as a tile, in a
+section for each file, with a search box (**Open folder** opens your recipes
+folder). The **Recipes** tab of a device's page shows those that use the
+device. A tile says what the recipe does, which devices it uses and its
+parameters, and whether it is running now or how its last run from the window
+ended (done, failed or stopped). Its **...** menu runs it with its defaults,
+opens its file, or copies the `insthub run` command for it.
+
+Click a tile to open the recipe. Each parameter gets a control to suit it: a
+list of its choices (`Literal[...]`), a switch for `True` or `False`, a spin
+box with its unit and limits for a number, or a text field. In a text field,
+values are read as on the command line (`2500`, `true`, `[1, 2]`), except
+for a `str` parameter, which takes the text as typed. Only the values you
+change are passed; the rest keep their defaults, and **Reset** puts them all
+back. A recipe that takes `**kwargs` also has a line for other values, typed
+as `NAME=VALUE`. **Run** it, and what it prints appears as it runs, then what
+it returned. **Stop** ends it, and **Open file** opens its file in your
+editor. A recipe whose check finds a problem does not run, and neither does
+one that is missing a value it needs; the field is outlined in red. One that
+uses something marked dangerous asks first.
 
 **From the command line.** `insthub run square freq=2e3 chan=2`. Values are
 read as JSON where possible (`2e3`, `true`, `[1, 2]`) and as text otherwise.
