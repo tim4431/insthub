@@ -2113,6 +2113,21 @@ def test_one_window_at_a_time():
         first.close()
 
 
+def test_one_window_per_screen(monkeypatch):
+    screen = manager._screen
+    assert screen("wayland", ":0") == screen("xcb", ":0") == screen("xcb", "unix:1") == screen("offscreen", "") == ""
+    assert screen("xcb", "localhost:10.0") == "-localhost_10.0"         # what `ssh -X` sets
+    qt.application()
+    here = manager._single_instance(tray_only=False)
+    try:
+        monkeypatch.setattr(manager, "_screen", lambda platform, display: "-localhost_10.0")
+        there = manager._single_instance(tray_only=False)                # shown through ssh: a window of its own
+        assert there is not None and there.isListening()
+        there.close()
+    finally:
+        here.close()
+
+
 def test_command_names():
     name = inventory.command_name
     assert name(["/venv/bin/python", "-u", "experiment.py", "--fast"]) == "experiment.py --fast"

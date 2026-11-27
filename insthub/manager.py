@@ -1506,15 +1506,25 @@ class _Tray(QtWidgets.QSystemTrayIcon):
 
 
 # ---------------------------------------------------------------- starting
+def _screen(platform: str, display: str) -> str:
+    """'' for this computer's own screen; for an X display on another computer (what
+    `ssh -X` sets: localhost:10.0), that display, as part of a file name.  So a window
+    shown elsewhere through ssh is not taken for this desktop's window, nor brings it up."""
+    if platform != "xcb" or display.partition(":")[0] in ("", "unix"):
+        return ""
+    return "-" + "".join(c if c.isalnum() or c in ".-" else "_" for c in display)
+
+
 def _single_instance(tray_only: bool):
-    """Make sure only one window runs: if one does already, bring it up (unless
-    started for the tray only) and return None; else return the listener that
-    later starts will reach."""
+    """Make sure only one window runs on a screen: if one does already, bring it
+    up (unless started for the tray only) and return None; else return the
+    listener that later starts will reach."""
     import importlib
 
     network = importlib.import_module(f"{BINDING}.QtNetwork")
-    name = f"insthub-gui-{os.environ.get('USERNAME', 'user')}" if os.name == "nt" \
-        else str(registry.runtime_dir() / ".gui.sock")  # a leading dot: never a server's socket name
+    screen = _screen(QtGui.QGuiApplication.platformName(), os.environ.get("DISPLAY", ""))
+    name = f"insthub-gui-{os.environ.get('USERNAME', 'user')}{screen}" if os.name == "nt" \
+        else str(registry.runtime_dir() / f".gui{screen}.sock")  # a leading dot: never a server's socket name
     probe = network.QLocalSocket()
     probe.connectToServer(name)
     if probe.waitForConnected(500):
