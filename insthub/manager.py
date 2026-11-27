@@ -52,10 +52,12 @@ import collections
 import importlib.util
 import math
 import os
+import queue
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent import futures
+from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
@@ -140,6 +142,67 @@ def _dot(status: str) -> QtGui.QIcon:
 
 
 # ---------------------------------------------------------------- the window
+class _Workers:
+    """Up to `size` threads that run the jobs submitted, in order; submit() returns a Future.  As a
+    ThreadPoolExecutor, but its threads are daemons: Python joins an executor's threads when the
+    program ends, so a job still running then (a property read or a command waiting on a slow
+    instrument, `claude mcp get`, a journal read) kept the program alive after Quit, for as long
+    as it took.  What must be done before the program ends is waited for by Manager.finish()."""
+
+    def __init__(self, size: int, name: str):
+        self._size, self._name = size, name
+        self._jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._threads = self._idle = 0
+        self._closed = False
+
+    def submit(self, fn) -> Future:
+        future = Future()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot schedule new work after shutdown")
+            self._jobs.put((future, fn))
+            if self._idle == 0 and self._threads < self._size:  # (a thread only when none is free)
+                self._threads += 1
+                threading.Thread(target=self._work, name=f"{self._name}_{self._threads - 1}", daemon=True).start()
+        return future
+
+    def _work(self) -> None:
+        while True:
+            with self._lock:
+                self._idle += 1
+            item = self._jobs.get()
+            with self._lock:
+                self._idle -= 1
+            if item is None:
+                return
+            future, fn = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = fn()
+            except BaseException as e:  # noqa: BLE001 - it goes to whoever waits for the future
+                future.set_exception(e)
+            else:
+                future.set_result(result)
+
+    def shutdown(self, wait: bool = False, cancel_futures: bool = True) -> None:
+        """No more jobs; those not started yet are cancelled, and each thread ends once its job does
+        (`wait` is not supported: nothing waits for them)."""
+        with self._lock:
+            self._closed = True
+            threads = self._threads
+        while True:
+            try:
+                item = self._jobs.get_nowait()
+            except queue.Empty:
+                break
+            if item is not None:
+                item[0].cancel()
+        for _ in range(threads):
+            self._jobs.put(None)
+
+
 class Manager(QtWidgets.QMainWindow):
     """The window.  With `tray=True` it also has a tray icon, and closing the
     window only hides it: it keeps watching from the tray until Quit.
@@ -156,8 +219,9 @@ class Manager(QtWidgets.QMainWindow):
         self._quitting = False
         self._health: dict[tuple, str] = {}  # what was fine and what was broken at the last look
         self._agents_told: set[int] = set()  # agents (by pid) the tray has announced
-        self.probes = ThreadPoolExecutor(8, thread_name_prefix="insthub-gui-probe")
-        self.actions = ThreadPoolExecutor(4, thread_name_prefix="insthub-gui-action")
+        self.probes = _Workers(8, "insthub-gui-probe")
+        self.actions = _Workers(4, "insthub-gui-action")
+        self._unfinished: set[Future] = set()  # what the user asked for (act()): the program ends once it is done
         self.servers: dict[str, Server] = {}
         self._scanning = False
         self._scanned = False
@@ -326,8 +390,10 @@ class Manager(QtWidgets.QMainWindow):
         self.render()
 
     # -- plumbing ------------------------------------------------------------
-    def submit(self, pool, fn, done, failed=None) -> None:
-        """Run `fn` on a worker thread; `done(result)` or `failed(exception)` then runs in the GUI thread."""
+    def submit(self, pool, fn, done, failed=None, finish: bool = False) -> None:
+        """Run `fn` on a worker thread; `done(result)` or `failed(exception)` then runs in the GUI thread.
+        A job still running when the window quits does not keep the program from ending (see _Workers),
+        unless `finish`: what the user asked to change (a service started, a server restarted) is done."""
         def ok(result):
             if not self._closed:
                 done(result)
@@ -340,7 +406,14 @@ class Manager(QtWidgets.QMainWindow):
             future = pool.submit(fn)
         except RuntimeError:  # shutting down
             return
+        if finish:
+            self._unfinished.add(future)
+            future.add_done_callback(self._unfinished.discard)
         deliver(future, ok, error)
+
+    def finish(self) -> None:
+        """Wait until what the user asked for (act(), a restart) is done; the program then ends."""
+        futures.wait(list(self._unfinished))
 
     def say(self, text: str, ms: int = 5000) -> None:
         """A short message at the bottom of the window (ms=0: until the next one)."""
@@ -367,7 +440,7 @@ class Manager(QtWidgets.QMainWindow):
             if after is not None:
                 after()
 
-        self.submit(self.actions, fn, ok, failed)
+        self.submit(self.actions, fn, ok, failed, finish=True)
 
     def confirm(self, title: str, text: str, action: str) -> bool:
         return ui.confirm(self, title, text, action)
@@ -1070,7 +1143,7 @@ class Manager(QtWidgets.QMainWindow):
             over()
 
         self.say(f"Restarting {name}...", 0)
-        self.submit(self.actions, stop_and_start, started, failed)
+        self.submit(self.actions, stop_and_start, started, failed, finish=True)
 
     def _restarting(self, s: Server) -> tuple[dict, object]:
         """Note that a server restarts: one restart at a time, and the page on show comes back once a
@@ -1484,4 +1557,6 @@ def main(tray_only: bool = False) -> int:
     listener.newConnection.connect(knocked)
     if not (tray_only and tray):
         window.show()
-    return run(app)
+    code = run(app)
+    window.finish()
+    return code

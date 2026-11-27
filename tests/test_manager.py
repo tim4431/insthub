@@ -2453,3 +2453,22 @@ def test_the_window_says_when_it_runs_older_code_itself(window, monkeypatch):
     monkeypatch.setattr(extensions, "outdated_here", list)
     assert spin(3, lambda: notice.isHidden() and "older code" not in window.sidebar.summary.text())
     assert page.outdated_card.isHidden()
+
+
+def test_quitting_waits_for_what_the_user_asked_for_but_not_for_a_read(window):
+    """Python joins an executor's threads when the program ends: a read still waiting on a slow
+    instrument kept the program alive after Quit.  The window's workers are daemons, and only what
+    the user asked to change (act()) is waited for, by finish()."""
+    reading, release, changed = threading.Event(), threading.Event(), []
+    window.submit(window.probes, lambda: (reading.set(), release.wait(30)), lambda result: None)
+    assert reading.wait(5)
+    window.act("Changing it", lambda: (time.sleep(0.3), changed.append(True)), "changed")
+    workers = [t for t in threading.enumerate() if t.name.startswith("insthub-gui-")]
+    assert workers and all(t.daemon for t in workers)  # (nothing joins them at exit)
+    window._shutdown()
+    start = time.monotonic()
+    window.finish()  # (what main() does once the event loop ends)
+    assert changed == [True] and time.monotonic() - start < 5  # the change, not the read, was waited for
+    with pytest.raises(RuntimeError):
+        window.probes.submit(lambda: None)  # (no more jobs once it is shut down)
+    release.set()
